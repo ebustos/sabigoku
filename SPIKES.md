@@ -1,4 +1,4 @@
-# sabigoku Spikes — the Rust mirror of zigoku's M0
+# sabigoku Spikes: the Rust mirror of zigoku's M0
 
 Five throwaway programs that prove sabigoku's riskiest unknowns *in isolation*.
 Each mirrors a zigoku spike one-for-one, same job, same provider, so the only
@@ -27,15 +27,15 @@ cargo run --bin spike_mpv         -- frieren      # ROD-407  full pipeline -> mp
 |---|---|---|
 | http | writer/flush dance, manual `std.http.Client`+`io`, hand-matched structs → `derive` + `.json()` | full async runtime (tokio) + rustls pulled in for a *blocking* call; ~100 crates, real first-compile cost |
 | sqlite | `@cImport` + the whole C wrapper layer (bind/col/null-ptr handling) → `params![]` + `query_map`; `bundled` kills the system-link and the macOS unbundled-sqlite segfault class | `bundled` compiles sqlite C on first build; and you *gave up* the interop the Zig spike existed to prove |
-| concurrency | hand-built `Channel(T)` on `Io.Mutex`/`Condition`, `io`-threaded locks, per-scope allocator choice → `mpsc::channel()` + `thread::spawn` + `for msg in rx` | almost none (home turf); the `drop(tx)` close idiom is a hang-footgun, and `move`/`Send` bounds force ownership thinking — but that thinking IS the race-freedom proof |
+| concurrency | hand-built `Channel(T)` on `Io.Mutex`/`Condition`, `io`-threaded locks, per-scope allocator choice → `mpsc::channel()` + `thread::spawn` + `for msg in rx` | almost none (home turf); the `drop(tx)` close idiom is a hang-footgun, and `move`/`Send` bounds force ownership thinking, but that thinking IS the race-freedom proof |
 | stream | comptime `\"`-escape gymnastics, manual nonce/tag/ct array-slicing, 6-positional-arg `decrypt` the compiler can't check → typed `Nonce`/`Key` (swap = type error), tag-at-end IS the crate's `ct‖tag` convention | RustCrypto's trait + `GenericArray` maze (`new_from_slice`, `Aead`, implicit tag-append convention you must *know*); base64 0.22 API churn (no more `base64::decode`) |
-| mpv | _tbd_ | _tbd_ |
+| mpv | `io`-threaded `spawn`/`wait`, unmanaged-ArrayList argv, tagged-union `Term` (lowercase-tag gotcha) → `Command` builder + `.status()` | ~none, but Rust gains ~none either: process spawning was already clean in Zig. Closest to a dead heat. |
 
 ---
 
 <!-- Per-spike write-ups land here as each one ships. -->
 
-## 1. spike_http — HTTP + JSON
+## 1. spike_http: HTTP + JSON
 
 The Zig original is the clearest "verbose but explicit" showcase in the whole
 project: you provide an output buffer, build an `std.http.Client` with an `io`
@@ -58,7 +58,7 @@ dependencies beyond std. And serde over borrowed data means lifetime parameters
 (`Request<'a>`) the Zig version never had to spell out. The verbosity didn't
 vanish; it moved from the call site into the build graph.
 
-## 2. spike_sqlite — SQLite
+## 2. spike_sqlite: SQLite
 
 This is the spike where the two languages argue about their whole reason to
 exist. Zig's version is a *showcase*: `@cImport("sqlite3.h")` and you drive the C
@@ -85,7 +85,7 @@ wrote the crate." That's pure win when the crate exists, like here. It's a cliff
 the day you need to bind a C library nobody has wrapped yet, which in Zig is a
 Tuesday.
 
-## 3. spike_concurrency — threads + channel
+## 3. spike_concurrency: threads + channel
 
 zigoku earned this one the hard way. Its spike builds a generic `Channel(T)` by
 hand, on `std.Io.Mutex` and `std.Io.Condition`, threading an `io` handle through
@@ -112,7 +112,7 @@ the same safety zigoku bought with a hand-written comment and a "do this in a
 scratch copy, it's instructive because it's wrong." Here the wrong version simply
 doesn't build.
 
-## 4. spike_stream — AES-256-GCM resolver
+## 4. spike_stream: AES-256-GCM resolver
 
 The reverse-engineering spike. zigoku decrypts the provider's `tobeparsed` blob:
 `key = sha256(seed)`, base64 decode, then hand-slice `[0]` prefix, `[1..13]`
@@ -140,3 +140,51 @@ if you assume separate tag handling. base64 0.22 also churned its API hard:
 explicit padding mode. Zig's `std.crypto` is one flat, explicit namespace you
 read top to bottom; RustCrypto is safer once learned but assumes you already
 speak its conventions.
+
+## 5. spike_mpv: the pipeline capstone
+
+Search, resolve, hand the stream to mpv, one binary. The resolver is already
+proven in spike_stream, so this spike stands in a libavfilter `testsrc` for the
+stream URL (deterministic, offline) and proves the one new thing: spawning mpv.
+
+This is the spike where the two languages are closest. zigoku's version is
+`std.process.spawn(io, .{ .argv = … })` + `child.wait(io)`, building argv with an
+unmanaged `ArrayList` (allocator passed to each `append`) and switching on a
+`Term` tagged union whose lowercase tags cost a compile error. Rust's is a
+`Command` builder and `.status()` returning an `ExitStatus`. Both inherit
+stdio by default so mpv just takes the terminal, and both pass user args straight
+through so one binary serves a human and a headless CI probe.
+
+**Deleted:** the `io` threading and the manual argv allocation. Small wins.
+
+**Taxed:** almost nothing, and that cuts both ways: Rust barely pulls ahead here
+because process spawning was already clean in Zig. Honest result: a near dead
+heat.
+
+---
+
+## Verdict (M0 complete)
+
+Five spikes, five commits, and the pattern is clear enough to act on:
+
+- **Rust wins big** exactly where zigoku spent the most hand-rolled effort:
+  HTTP+JSON (serde deletes the writergate ceremony) and concurrency (std's
+  channel plus a compile-time race proof replaces a hand-built `Channel(T)`).
+  These are also the two areas that turned into daily *tax* in the real app,
+  which is the whole reason this port exists.
+- **Rust wins on safety** in the crypto: typed `Nonce`/`Key` make a whole class
+  of argument-swap bug a compile error.
+- **The wins have a bill:** a heavy dependency tree and real first-compile time,
+  and an ecosystem (RustCrypto, base64 0.22, reqwest's hidden runtime) that
+  assumes you speak its conventions. The verbosity didn't disappear; some of it
+  moved from the call site into `Cargo.toml` and the type system.
+- **Rust gives up** the thing zigoku's sqlite spike was built to celebrate:
+  trivial C interop. Here a crate covered it. The day one doesn't exist, that's a
+  cliff Zig doesn't have.
+- **The mpv capstone is a wash.** Not everything is a blowout, and saying so is
+  what keeps the rest of this ledger credible.
+
+Net: for an app that is fundamentally HTTP-and-threads wearing a TUI, Rust
+removes the exact friction that made zigoku a drag, and the tax it charges back
+is mostly paid once (build graph, learning the ecosystem) rather than per-feature.
+That's the case for the port, stated in receipts instead of vibes.
