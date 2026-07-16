@@ -7,3 +7,6 @@ edition = "2024"
 # spike_http (ROD-403): HTTPS POST + typed JSON. rustls avoids a system OpenSSL dep.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
+# spike_sqlite (ROD-404): `bundled` compiles sqlite from source into the binary,
+# no system libsqlite3 to link or version-match.
+rusqlite = { version = "0.32", features = ["bundled"] }
