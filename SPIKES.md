@@ -25,7 +25,7 @@ cargo run --bin spike_mpv         -- frieren      # ROD-407  full pipeline -> mp
 
 | Spike | Ecosystem deleted | Rust taxed |
 |---|---|---|
-| http | _tbd_ | _tbd_ |
+| http | writer/flush dance, manual `std.http.Client`+`io`, hand-matched structs → `derive` + `.json()` | full async runtime (tokio) + rustls pulled in for a *blocking* call; ~100 crates, real first-compile cost |
 | sqlite | _tbd_ | _tbd_ |
 | concurrency | _tbd_ | _tbd_ |
 | stream | _tbd_ | _tbd_ |
@@ -34,3 +34,26 @@ cargo run --bin spike_mpv         -- frieren      # ROD-407  full pipeline -> mp
 ---
 
 <!-- Per-spike write-ups land here as each one ships. -->
+
+## 1. spike_http — HTTP + JSON
+
+The Zig original is the clearest "verbose but explicit" showcase in the whole
+project: you provide an output buffer, build an `std.http.Client` with an `io`
+handle, stream the response into a `Writer.Allocating`, pull `.buffered()`, then
+declare structs that `std.json.parseFromSlice` matches by name. Every allocation
+is visible; every byte of I/O is yours to flush.
+
+The Rust version does the same job in three moves: `#[derive(Serialize)]` on the
+request, `#[derive(Deserialize)]` on the response, and `.json()` on both ends of
+`reqwest`. No buffer, no flush, no allocator threading, no CA-bundle branch
+(rustls ships its own roots).
+
+**Deleted:** the writergate ceremony and manual JSON wiring, maybe 40 lines of
+Zig collapsed to ~10 of declarations.
+
+**Taxed:** dependencies. `reqwest::blocking` is a thin wrapper that still drags a
+full async runtime and a TLS stack underneath, so a synchronous one-shot call
+pulls ~100 transitive crates and a real first-compile wait. Zig's spike had zero
+dependencies beyond std. And serde over borrowed data means lifetime parameters
+(`Request<'a>`) the Zig version never had to spell out. The verbosity didn't
+vanish; it moved from the call site into the build graph.
