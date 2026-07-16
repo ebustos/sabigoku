@@ -27,7 +27,7 @@ cargo run --bin spike_mpv         -- frieren      # ROD-407  full pipeline -> mp
 |---|---|---|
 | http | writer/flush dance, manual `std.http.Client`+`io`, hand-matched structs → `derive` + `.json()` | full async runtime (tokio) + rustls pulled in for a *blocking* call; ~100 crates, real first-compile cost |
 | sqlite | `@cImport` + the whole C wrapper layer (bind/col/null-ptr handling) → `params![]` + `query_map`; `bundled` kills the system-link and the macOS unbundled-sqlite segfault class | `bundled` compiles sqlite C on first build; and you *gave up* the interop the Zig spike existed to prove |
-| concurrency | _tbd_ | _tbd_ |
+| concurrency | hand-built `Channel(T)` on `Io.Mutex`/`Condition`, `io`-threaded locks, per-scope allocator choice → `mpsc::channel()` + `thread::spawn` + `for msg in rx` | almost none (home turf); the `drop(tx)` close idiom is a hang-footgun, and `move`/`Send` bounds force ownership thinking — but that thinking IS the race-freedom proof |
 | stream | _tbd_ | _tbd_ |
 | mpv | _tbd_ | _tbd_ |
 
@@ -84,3 +84,30 @@ Rust can do C FFI, but it walls it behind `unsafe` and defers to "someone alread
 wrote the crate." That's pure win when the crate exists, like here. It's a cliff
 the day you need to bind a C library nobody has wrapped yet, which in Zig is a
 Tuesday.
+
+## 3. spike_concurrency — threads + channel
+
+zigoku earned this one the hard way. Its spike builds a generic `Channel(T)` by
+hand, on `std.Io.Mutex` and `std.Io.Condition`, threading an `io` handle through
+`lockUncancelable(io)` / `waitUncancelable(io, ...)` on every call, and choosing a
+thread-safe `page_allocator` for cross-thread data versus a per-worker arena for
+scratch. The spike's own comments warn that removing a `dupe` turns a returned
+slice into a use-after-free the moment a worker's arena deinits.
+
+The Rust version is `let (tx, rx) = mpsc::channel();`, `thread::spawn(move || …)`,
+and `for msg in rx`. The channel is in std, generic, and typed. And the exact
+use-after-free zigoku had to warn about in a comment is now a *compile error*:
+the `move` closure transfers ownership into the worker, and `Send` bounds mean
+the compiler refuses to let one thread read memory another owns.
+
+**Deleted:** the entire hand-rolled channel, the mutex/condvar plumbing, the
+`io` threading, and the per-scope allocator reasoning.
+
+**Taxed:** this is Rust's home turf, so barely anything, but be fair about two
+things. The `drop(tx)` that closes the channel is an invisible-footgun idiom:
+forget it and `for msg in rx` blocks forever because a live sender still exists.
+And the `move` / `'static` bounds on a spawned closure force you to think about
+who owns what before it compiles. That second one isn't really a tax though, it's
+the same safety zigoku bought with a hand-written comment and a "do this in a
+scratch copy, it's instructive because it's wrong." Here the wrong version simply
+doesn't build.
