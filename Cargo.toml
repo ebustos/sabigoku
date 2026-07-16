@@ -12,3 +12,7 @@ serde_json = "1"
 # spike_sqlite (ROD-404): `bundled` compiles sqlite from source into the binary,
 # no system libsqlite3 to link or version-match.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# spike_stream (ROD-406): the stream-resolution crypto.
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"

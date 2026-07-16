@@ -28,7 +28,7 @@ cargo run --bin spike_mpv         -- frieren      # ROD-407  full pipeline -> mp
 | http | writer/flush dance, manual `std.http.Client`+`io`, hand-matched structs → `derive` + `.json()` | full async runtime (tokio) + rustls pulled in for a *blocking* call; ~100 crates, real first-compile cost |
 | sqlite | `@cImport` + the whole C wrapper layer (bind/col/null-ptr handling) → `params![]` + `query_map`; `bundled` kills the system-link and the macOS unbundled-sqlite segfault class | `bundled` compiles sqlite C on first build; and you *gave up* the interop the Zig spike existed to prove |
 | concurrency | hand-built `Channel(T)` on `Io.Mutex`/`Condition`, `io`-threaded locks, per-scope allocator choice → `mpsc::channel()` + `thread::spawn` + `for msg in rx` | almost none (home turf); the `drop(tx)` close idiom is a hang-footgun, and `move`/`Send` bounds force ownership thinking — but that thinking IS the race-freedom proof |
-| stream | _tbd_ | _tbd_ |
+| stream | comptime `\"`-escape gymnastics, manual nonce/tag/ct array-slicing, 6-positional-arg `decrypt` the compiler can't check → typed `Nonce`/`Key` (swap = type error), tag-at-end IS the crate's `ct‖tag` convention | RustCrypto's trait + `GenericArray` maze (`new_from_slice`, `Aead`, implicit tag-append convention you must *know*); base64 0.22 API churn (no more `base64::decode`) |
 | mpv | _tbd_ | _tbd_ |
 
 ---
@@ -111,3 +111,32 @@ who owns what before it compiles. That second one isn't really a tax though, it'
 the same safety zigoku bought with a hand-written comment and a "do this in a
 scratch copy, it's instructive because it's wrong." Here the wrong version simply
 doesn't build.
+
+## 4. spike_stream — AES-256-GCM resolver
+
+The reverse-engineering spike. zigoku decrypts the provider's `tobeparsed` blob:
+`key = sha256(seed)`, base64 decode, then hand-slice `[0]` prefix, `[1..13]`
+nonce, ciphertext, and the trailing 16-byte tag using the `raw[1..][0..12].*`
+array-coercion idiom, and finally call `Aes256Gcm.decrypt` with six positional
+arguments in an exact order. Its own comment admits the danger: "the type system
+won't catch a swapped nonce/tag" because both are just byte arrays.
+
+The Rust version keeps the same golden vectors (this spike asserts against the
+exact blob and expected plaintext zigoku pins offline) but the crypto reads
+differently. `Nonce` and `Key` are distinct types, so swapping them is a compile
+error, not a silent `AuthenticationFailed`. And RustCrypto's AEAD convention is
+"ciphertext with the tag appended," which is precisely how the blob already lays
+out its bytes, so `&raw[13..]` goes straight in with no manual tag split. GCM
+still fails closed exactly like Zig's: wrong key or offset returns `Err`.
+
+**Deleted:** the comptime `\"`-escaping to build JSON-inside-JSON, the manual
+nonce/tag/ciphertext slicing, and the unchecked argument ordering.
+
+**Taxed:** RustCrypto is a trait-and-`GenericArray` maze. You have to import the
+`Aead` trait to get `.decrypt`, reach for `new_from_slice`, and *know* the
+implicit tag-append convention, which is nowhere in the call and bites silently
+if you assume separate tag handling. base64 0.22 also churned its API hard:
+`base64::decode` is gone, replaced by building a `GeneralPurpose` engine with an
+explicit padding mode. Zig's `std.crypto` is one flat, explicit namespace you
+read top to bottom; RustCrypto is safer once learned but assumes you already
+speak its conventions.
