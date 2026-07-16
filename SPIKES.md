@@ -29,7 +29,7 @@ cargo run --bin spike_mpv         -- frieren      # ROD-407  full pipeline -> mp
 | sqlite | `@cImport` + the whole C wrapper layer (bind/col/null-ptr handling) → `params![]` + `query_map`; `bundled` kills the system-link and the macOS unbundled-sqlite segfault class | `bundled` compiles sqlite C on first build; and you *gave up* the interop the Zig spike existed to prove |
 | concurrency | hand-built `Channel(T)` on `Io.Mutex`/`Condition`, `io`-threaded locks, per-scope allocator choice → `mpsc::channel()` + `thread::spawn` + `for msg in rx` | almost none (home turf); the `drop(tx)` close idiom is a hang-footgun, and `move`/`Send` bounds force ownership thinking, but that thinking IS the race-freedom proof |
 | stream | comptime `\"`-escape gymnastics, manual nonce/tag/ct array-slicing, 6-positional-arg `decrypt` the compiler can't check → typed `Nonce`/`Key` (swap = type error), tag-at-end IS the crate's `ct‖tag` convention | RustCrypto's trait + `GenericArray` maze (`new_from_slice`, `Aead`, implicit tag-append convention you must *know*); base64 0.22 API churn (no more `base64::decode`) |
-| mpv | `io`-threaded `spawn`/`wait`, unmanaged-ArrayList argv, tagged-union `Term` (lowercase-tag gotcha) → `Command` builder + `.status()` | ~none, but Rust gains ~none either: process spawning was already clean in Zig. Closest to a dead heat. |
+| mpv | `io`-threaded `spawn`/`wait`, unmanaged-ArrayList argv, tagged-union `Term` (lowercase-tag gotcha) → `Command` + `.status()`; `?` collapses the multi-step resolve's error handling | spawn primitive is a dead heat; process spawning was already clean in Zig |
 
 ---
 
@@ -143,23 +143,34 @@ speak its conventions.
 
 ## 5. spike_mpv: the pipeline capstone
 
-Search, resolve, hand the stream to mpv, one binary. The resolver is already
-proven in spike_stream, so this spike stands in a libavfilter `testsrc` for the
-stream URL (deterministic, offline) and proves the one new thing: spawning mpv.
+The real end-to-end chain, one binary: search the live provider, fetch the
+episode, decrypt the `tobeparsed` blob (the same crypto as spike_stream, now
+against a live payload), resolve a playable URL (direct fast4speed, or follow a
+`--<hex>` provider through clock.json), and spawn mpv on it. The headless probe
+decodes one real frame off the CDN and exits 0. That exit code is the capstone's
+whole point: the resolved stream actually plays. Verified live: `frieren` ->
+"Sousou no Frieren" (28 sub eps) -> a fast4speed MP4 with an auth token -> frame
+decoded.
 
-This is the spike where the two languages are closest. zigoku's version is
+The mpv spawn itself is the closest the two languages get. zigoku's is
 `std.process.spawn(io, .{ .argv = … })` + `child.wait(io)`, building argv with an
-unmanaged `ArrayList` (allocator passed to each `append`) and switching on a
-`Term` tagged union whose lowercase tags cost a compile error. Rust's is a
-`Command` builder and `.status()` returning an `ExitStatus`. Both inherit
-stdio by default so mpv just takes the terminal, and both pass user args straight
-through so one binary serves a human and a headless CI probe.
+unmanaged `ArrayList` and switching on a `Term` tagged union whose lowercase tags
+cost a compile error; Rust's is a `Command` builder and `.status()`. Both inherit
+stdio and pass user args straight through, so one binary serves a human and a CI
+probe.
 
-**Deleted:** the `io` threading and the manual argv allocation. Small wins.
+The interesting part isn't the spawn, it's *composing* the whole pipeline. Rust's
+`?` and `let Some(x) = … else { continue }` thread errors and missing fields
+through a five-step network+crypto flow without a single visible `match` ladder,
+and the argv-injection guards (`consider` / `clean_arg`, printable-ASCII only,
+reject a leading `--`) port over one-for-one because handing an untrusted CDN URL
+to a subprocess is the same hazard in any language.
 
-**Taxed:** almost nothing, and that cuts both ways: Rust barely pulls ahead here
-because process spawning was already clean in Zig. Honest result: a near dead
-heat.
+**Deleted:** the `io` threading and manual argv allocation (small), plus the
+error-handling boilerplate the multi-step flow would otherwise need.
+
+**Taxed:** the spawn primitive barely differs. Process spawning was already clean
+in Zig, so on that one axis it's a near dead heat.
 
 ---
 
@@ -181,8 +192,10 @@ Five spikes, five commits, and the pattern is clear enough to act on:
 - **Rust gives up** the thing zigoku's sqlite spike was built to celebrate:
   trivial C interop. Here a crate covered it. The day one doesn't exist, that's a
   cliff Zig doesn't have.
-- **The mpv capstone is a wash.** Not everything is a blowout, and saying so is
-  what keeps the rest of this ledger credible.
+- **The mpv spawn is a wash**, and the capstone as a whole proves the real chain
+  end to end: a live search resolves to a real stream that mpv actually plays.
+  Where Rust helps at capstone scale is composing the five-step flow, not the
+  spawn itself. Naming the wash is what keeps the rest of this ledger credible.
 
 Net: for an app that is fundamentally HTTP-and-threads wearing a TUI, Rust
 removes the exact friction that made zigoku a drag, and the tax it charges back
