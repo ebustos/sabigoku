@@ -94,7 +94,7 @@ A chapter becomes `review-stable` only after an adversarial pass
 | [`04-tui-runtime.md`](docs/port/04-tui-runtime.md) | ROD-425 | draft |
 | [`05-behavior-contracts.md`](docs/port/05-behavior-contracts.md) | ROD-426 | draft |
 | [`06-auth-sync-cli.md`](docs/port/06-auth-sync-cli.md) | ROD-427 | draft |
-| [`07-bug-ledger.md`](docs/port/07-bug-ledger.md) | ROD-428 | stub |
+| [`07-bug-ledger.md`](docs/port/07-bug-ledger.md) | ROD-428 | draft |
 | [`08-rust-mapping.md`](docs/port/08-rust-mapping.md) | ROD-429 | stub |
 | Adversarial loop | ROD-430 | process (not a doc) |
 
