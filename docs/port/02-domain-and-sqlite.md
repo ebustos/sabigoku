@@ -184,7 +184,7 @@ CREATE TABLE show (
     start_year                  INTEGER,
     start_month                 INTEGER,
     start_day                   INTEGER,
-    genres                      TEXT,          -- storage encoding TBD; display list
+    genres                      TEXT,          -- JSON string array (L5); display list
     studios                     TEXT,
     source_material             TEXT,
     rank                        INTEGER,
@@ -544,6 +544,7 @@ store work.
 | L2 | **`catalog_cache` is required and durable** for Browse/Discover/detail metadata (§3.5) |
 | L3 | **No zigoku data plane.** Independent store; importer is a later standalone issue if ever (§3.6) |
 | L4 | **Library membership is an explicit column** (`library_added_at`), stamped set-once inside P/reveal, user status writers, and successful `recordPlay` only; never by grid open, probe, prewarm, enrich, or sync pull (§3.7). `completed` ratchets progress only, not membership |
+| L5 | **`genres` / `studios` are JSON string arrays** in TEXT columns (ratified with ROD-434). The Rust layer owns the encoding; SQL never splits or matches inside them. Replaces zigoku's `'\n'`-joined encoding |
 
 ## 8b. Still open
 

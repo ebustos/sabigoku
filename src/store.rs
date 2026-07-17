@@ -22,8 +22,10 @@ const SCHEMA_VERSION: u32 = 1;
 /// flip; `enable_wal` retries that by hand.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
-const WAL_RETRY_LIMIT: usize = 100;
-const WAL_RETRY_BACKOFF: Duration = Duration::from_millis(5);
+/// Bounded hand-rolled retry for the two lock upgrades busy_timeout does not
+/// cover: the WAL flip and the ladder's BEGIN IMMEDIATE.
+const LOCK_RETRY_LIMIT: usize = 100;
+const LOCK_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 
 /// Status-aware enrichment heal TTL (02 §5). Statuses here are AniList media
 /// status only; legacy provider spellings do not exist in this store.
@@ -179,36 +181,47 @@ CREATE TABLE app_meta (
 
 #[derive(Debug)]
 pub struct Store {
+    // dead_code: no reader until the first query method lands (chunk 2);
+    // deliberately NOT pub, raw SQL must stay unreachable outside this module.
+    #[allow(dead_code)]
     conn: Connection,
 }
 
 impl Store {
-    /// Open (creating if absent), flip WAL, enable FKs, migrate. The path must
-    /// be sabigoku's own DB file; there is no zigoku compatibility mode.
+    /// Open (creating if absent), flip WAL, enable FKs, migrate, prove
+    /// writability. The path must be sabigoku's own DB file; there is no
+    /// zigoku compatibility mode.
     pub fn open(path: &Path) -> Result<Store, Error> {
         let conn = Connection::open(path)?;
-        Store::finish_open(conn)
+        Store::finish_open(conn, path)
     }
 
     /// Isolated blank in-memory DB for tests.
     pub fn open_memory() -> Result<Store, Error> {
         let conn = Connection::open_in_memory()?;
-        Store::finish_open(conn)
+        Store::finish_open(conn, Path::new(":memory:"))
     }
 
-    fn finish_open(mut conn: Connection) -> Result<Store, Error> {
+    fn finish_open(conn: Connection, path: &Path) -> Result<Store, Error> {
         // Before the first statement, so migrate's BEGIN IMMEDIATE can wait
         // out a concurrent opener instead of failing (ROD-287 mechanism).
         conn.busy_timeout(BUSY_TIMEOUT)?;
         enable_wal(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        migrate(&mut conn)?;
+        migrate(&conn)?;
+        probe_writable(&conn, path)?;
         Ok(Store { conn })
     }
+}
 
-    pub fn conn(&self) -> &Connection {
-        &self.conn
-    }
+/// The retryable contention pair. rusqlite's `code` is already the primary
+/// code, so extended BUSY_* variants classify here too.
+fn is_contended(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _)
+    if matches!(
+        f.code,
+        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+    ))
 }
 
 /// Switch to WAL, retrying SQLITE_BUSY by hand: busy_timeout does not cover
@@ -224,51 +237,48 @@ fn enable_wal(conn: &Connection) -> Result<(), Error> {
         });
         match flipped {
             Ok(_) => return Ok(()),
-            // rusqlite's `code` is already the primary code, so extended
-            // BUSY_* variants retry through this arm too.
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if attempt < WAL_RETRY_LIMIT
-                    && matches!(
-                        e.code,
-                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                    ) =>
-            {
+            Err(e) if attempt < LOCK_RETRY_LIMIT && is_contended(&e) => {
                 attempt += 1;
-                std::thread::sleep(WAL_RETRY_BACKOFF);
+                std::thread::sleep(LOCK_RETRY_BACKOFF);
             }
             Err(e) => return Err(e.into()),
         }
     }
 }
 
-fn migrate(conn: &mut Connection) -> Result<(), Error> {
-    // Fast path: version read without a write lock (WAL).
-    let v = user_version(conn)?;
-    if v > SCHEMA_VERSION {
-        return Err(Error::SchemaTooNew {
-            found: v,
-            supported: SCHEMA_VERSION,
-        });
+/// BEGIN IMMEDIATE with the same bounded retry as the WAL flip: a peer
+/// holding the ladder lock past busy_timeout must be waited out, not turned
+/// into a hard open failure. `new_unchecked` only because the retry loop
+/// needs to re-borrow; drop of the returned tx is still the rollback.
+fn immediate_tx(conn: &Connection) -> Result<rusqlite::Transaction<'_>, Error> {
+    let mut attempt = 0;
+    loop {
+        match rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+            Ok(tx) => return Ok(tx),
+            Err(e) if attempt < LOCK_RETRY_LIMIT && is_contended(&e) => {
+                attempt += 1;
+                std::thread::sleep(LOCK_RETRY_BACKOFF);
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
-    if v == SCHEMA_VERSION {
-        return Ok(());
+}
+
+fn migrate(conn: &Connection) -> Result<(), Error> {
+    // Fast path: version read without a write lock (WAL).
+    if user_version(conn)? == SCHEMA_VERSION {
+        return verify_schema_present(conn);
     }
 
     // Whole ladder under one BEGIN IMMEDIATE so DDL and the version bump are
     // atomic (no half-applied state); busy_timeout waits out a concurrent
     // opener. Drop of an uncommitted tx is the rollback.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = immediate_tx(conn)?;
 
     // Re-read under the lock: a peer may have finished while we waited.
     let mut v = user_version(&tx)?;
-    if v > SCHEMA_VERSION {
-        return Err(Error::SchemaTooNew {
-            found: v,
-            supported: SCHEMA_VERSION,
-        });
-    }
     if v == SCHEMA_VERSION {
-        return Ok(());
+        return verify_schema_present(&tx);
     }
 
     if v < 1 {
@@ -291,8 +301,51 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     Ok(())
 }
 
-fn user_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
-    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+/// Validated read: negative (a legal SQLite header state) is a clean error,
+/// never a raw out-of-range failure, and too-new refuses before any write in
+/// both migrate paths.
+fn user_version(conn: &Connection) -> Result<u32, Error> {
+    let v: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let Ok(v) = u32::try_from(v) else {
+        return Err(Error::SchemaInvalid { found: v });
+    };
+    if v > SCHEMA_VERSION {
+        return Err(Error::SchemaTooNew {
+            found: v,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    Ok(v)
+}
+
+/// user_version alone proves nothing: a stamped version over missing DDL (a
+/// foreign file, a backup captured mid-write) must fail here, not as a raw
+/// "no such table" at some later query (ROD-434 review finding).
+fn verify_schema_present(conn: &Connection) -> Result<(), Error> {
+    let tables: u32 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'show'",
+        [],
+        |row| row.get(0),
+    )?;
+    if tables == 0 {
+        return Err(Error::SchemaMissing {
+            version: SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// SQLite silently downgrades to a read-only connection when the file denies
+/// READWRITE. That must fail loud at open, not at the first user write
+/// (ROD-434 review finding). Asks sqlite3_db_readonly directly: lock probes
+/// lie under WAL (they go through the -shm in the still-writable directory).
+fn probe_writable(conn: &Connection, path: &Path) -> Result<(), Error> {
+    if conn.is_readonly(rusqlite::DatabaseName::Main)? {
+        return Err(Error::ReadOnlyDb {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -317,7 +370,7 @@ mod tests {
     #[test]
     fn open_migrates_to_current_version() {
         let store = Store::open_memory().unwrap();
-        assert_eq!(user_version(store.conn()).unwrap(), SCHEMA_VERSION);
+        assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
@@ -325,7 +378,7 @@ mod tests {
         let path = tmp_db("reopen.db");
         drop(Store::open(&path).unwrap());
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(store.conn()).unwrap(), SCHEMA_VERSION);
+        assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
@@ -342,9 +395,13 @@ mod tests {
             }) => {}
             other => panic!("expected SchemaTooNew, got {other:?}"),
         }
-        // The failed open must not have touched the version.
+        // The failed open must not have touched the version. Raw pragma read:
+        // the validated helper refuses 99 by design.
         let raw = Connection::open(&path).unwrap();
-        assert_eq!(user_version(&raw).unwrap(), 99);
+        let v: i64 = raw
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 99);
     }
 
     #[test]
@@ -360,7 +417,7 @@ mod tests {
             t.join().unwrap().unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(user_version(store.conn()).unwrap(), SCHEMA_VERSION);
+        assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
@@ -368,17 +425,17 @@ mod tests {
         let path = tmp_db("pragmas.db");
         let store = Store::open(&path).unwrap();
         let mode: String = store
-            .conn()
+            .conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
         let busy: u64 = store
-            .conn()
+            .conn
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
         assert_eq!(busy, BUSY_TIMEOUT.as_millis() as u64);
         let fk: u32 = store
-            .conn()
+            .conn
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fk, 1);
@@ -388,7 +445,7 @@ mod tests {
     fn schema_has_every_02_table() {
         let store = Store::open_memory().unwrap();
         let mut stmt = store
-            .conn()
+            .conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .unwrap();
         let names: Vec<String> = stmt
@@ -414,7 +471,7 @@ mod tests {
     #[test]
     fn foreign_keys_are_enforced() {
         let store = Store::open_memory().unwrap();
-        let orphan = store.conn().execute(
+        let orphan = store.conn.execute(
             "INSERT INTO provider_binding (anilist_id, provider, provider_id, bound_at)
              VALUES (1, 'senshi', 'x', 0)",
             [],
@@ -423,6 +480,75 @@ mod tests {
             orphan.is_err(),
             "binding without a show row must be rejected"
         );
+    }
+
+    #[test]
+    fn stamped_version_without_tables_is_rejected() {
+        let path = tmp_db("ghost.db");
+        let raw = Connection::open(&path).unwrap();
+        raw.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .unwrap();
+        drop(raw);
+        match Store::open(&path) {
+            Err(Error::SchemaMissing {
+                version: SCHEMA_VERSION,
+            }) => {}
+            other => panic!("expected SchemaMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_user_version_is_a_clean_error() {
+        let path = tmp_db("negative.db");
+        let raw = Connection::open(&path).unwrap();
+        raw.pragma_update(None, "user_version", -5).unwrap();
+        drop(raw);
+        match Store::open(&path) {
+            Err(Error::SchemaInvalid { found: -5 }) => {}
+            other => panic!("expected SchemaInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_only_db_fails_loud_at_open() {
+        let path = tmp_db("readonly.db");
+        drop(Store::open(&path).unwrap());
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        // CAP_DAC_OVERRIDE (root CI) makes read-only files writable anyway;
+        // nothing to test there.
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            return;
+        }
+        let result = Store::open(&path);
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        match result {
+            Err(Error::ReadOnlyDb { path: p }) => assert_eq!(p, path),
+            other => panic!("expected ReadOnlyDb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ladder_waits_out_a_slow_peer() {
+        let path = tmp_db("slow-peer.db");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                ready_tx.send(()).unwrap();
+                // Longer than BUSY_TIMEOUT: only the retry loops get us past.
+                std::thread::sleep(Duration::from_millis(400));
+                conn.execute_batch("ROLLBACK").unwrap();
+            }
+        });
+        ready_rx.recv().unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        peer.join().unwrap();
     }
 
     #[test]

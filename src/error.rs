@@ -27,6 +27,17 @@ pub enum Error {
 
     #[error("migration ladder stopped at v{at}, expected v{expected}")]
     MigrationIncomplete { at: u32, expected: u32 },
+
+    #[error(
+        "database claims schema v{version} but its tables are missing; not a sabigoku DB or a broken copy"
+    )]
+    SchemaMissing { version: u32 },
+
+    #[error("database user_version {found} is invalid")]
+    SchemaInvalid { found: i64 },
+
+    #[error("database at {path} is not writable")]
+    ReadOnlyDb { path: std::path::PathBuf },
 }
 
 impl Error {
