@@ -125,8 +125,9 @@ open(show: AniListId):
 
 ```
 openHistory(rec):
-  if rec is unbound sentinel:
-    clear grid; refresh pin/avail meta; return
+  if rec has no binding (zigoku: unbound sentinel):
+    clear grid + pending_bind; cancel any parked fallback walk;
+    disarm resume-demote; mark no-source; refresh pin/avail meta; return
   if pin set:
     if pin registered AND pin != rec.source AND pin has binding:
       open that pin binding; return
@@ -198,7 +199,10 @@ All keyed by **`anilist_id`** (02). Own tables; enrichment upserts never touch t
 
 - Row `(anilist_id, provider, checked_at)` = definitive not stocked.
 - **TTL @ freeze: 7 days.** Fresh absence ⇒ skip automatic probe/search; **bindings always win.**
-- Manual walks (`v` flip, forced preferred tier C) may probe anyway.
+- Manual walks (`v` flip, the one-shot forced-preferred probe) may probe anyway.
+  ("Manual" here = probe-through-absence behavior; it is orthogonal to the walk
+  **origin** tag in §5.3 — the K-2 continuation walk is `forced_preferred` origin
+  but non-manual.)
 - Successful bind **deletes** absence for that pair (bound and absent never coexist).
 - Availability UI: `unchecked` | `bound` | `absent` (derived; only absence is stored).
 

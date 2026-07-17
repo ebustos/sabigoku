@@ -446,7 +446,7 @@ These are easy to break in the port if only unit-tested in isolation:
 
 | Source | Count (freeze) | In this chapter |
 |---|---|---|
-| `app_test.zig` | 321 (exact; 758 total across src/) | Grouped above; every ROD-tagged cluster named |
+| `app_test.zig` | 321 (exact; 758 named across src/, +1 aggregator block) | Grouped above; every ROD-tagged cluster named |
 | store / domain / source / resolver / sync / config / auth | many | Pointed via §0 and 02/03/06 |
 
 **Not expanded here (by design):** pure render pixel assertions beyond halfBlockFit;

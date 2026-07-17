@@ -226,6 +226,13 @@ Fetch `MediaListCollection`: the **full remote list in one POST, unpaginated**;
 it shares the 2MB response cap, so a huge AniList list can fail the whole pull.
 Surface that failure, do not swallow it (`OPEN`: raise the cap or paginate).
 
+**Candidates:** reconcile joins **library rows with an `anilist_id` only**
+(zigoku: `history_visible != 0`, store comment "engaged + anilist_id with
+snapshot. Not dirty-filtered"; sabigoku: `library_added_at IS NOT NULL`). Clean
+rows are included: clean rows can still receive remote changes. Identity-only
+rows are invisible to sync, so a pull can neither stamp membership nor park user
+state on a show the user never engaged (02 §3.7).
+
 **Pure merge (`reconcile`), the total matrix.** `eff_base` = snapshot status,
 or `planning` when the snapshot is null (first contact). `local_moved` =
 local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
@@ -252,7 +259,9 @@ After merge write:
 - **CAS / optimistic guard:** the UPDATE is guarded on the pre-merge local pair
   (`WHERE … AND list_status = ? AND progress = ?`); zero rows changed means a
   concurrent edit landed mid-reconcile → count `contended`, leave the row, retry
-  next run. A real guard, not advisory.
+  next run. A real guard, not advisory. The merged pair and the snapshot land in
+  **one** CAS-guarded UPDATE; when neither the local pair nor the snapshot
+  changed, the row is skipped entirely.
 - Unmatched remote ids: counted and listed; **v1 does not auto-import** new
   AniList-only shows into the library.
 

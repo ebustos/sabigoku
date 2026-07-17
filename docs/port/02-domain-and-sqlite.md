@@ -427,7 +427,7 @@ AniList. Exact rules (zigoku `store.zig` @ freeze; ROD-193/296/346 tests):
 | Writer | Rule |
 |---|---|
 | `recordPlay(completed=true)` | `progress = max(progress, episode_index)`: a ratchet, never lowers. `episode_index` is the 1-based ordinal in the current grid |
-| `recordPlay` (any play) | Always bumps `play_count` and `last_watched_at`; a rewatch still counts as engagement (History sort) |
+| `recordPlay` (callers gate on a **meaningful** position: finite > 0) | Always bumps `play_count` and `last_watched_at`, and stamps `library_added_at` if null (set-once, inside the writer, §3.7); a rewatch still counts as engagement (History sort) |
 | `setListStatus(completed)` | Snaps `progress = total` iff `total > 0` (total 0 leaves progress alone) |
 | Undo (`restoreListStatus`) | Restores the exact prior `(status, progress)` pair; no snap |
 | Recompute (`r`) | Positional high-water (below); overwrites unconditionally |

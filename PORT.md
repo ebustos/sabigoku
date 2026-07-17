@@ -87,16 +87,16 @@ A chapter becomes `review-stable` only after an adversarial pass
 
 | Chapter | Ticket | Status |
 |---|---|---|
-| `PORT.md` (this file) | ROD-421 | draft |
-| [`01-modules.md`](docs/port/01-modules.md) | ROD-422 | draft |
-| [`02-domain-and-sqlite.md`](docs/port/02-domain-and-sqlite.md) | ROD-423 | draft |
-| [`03-providers-and-resolve.md`](docs/port/03-providers-and-resolve.md) | ROD-424 | draft |
-| [`04-tui-runtime.md`](docs/port/04-tui-runtime.md) | ROD-425 | draft |
-| [`05-behavior-contracts.md`](docs/port/05-behavior-contracts.md) | ROD-426 | draft |
-| [`06-auth-sync-cli.md`](docs/port/06-auth-sync-cli.md) | ROD-427 | draft |
-| [`07-bug-ledger.md`](docs/port/07-bug-ledger.md) | ROD-428 | draft |
-| [`08-rust-mapping.md`](docs/port/08-rust-mapping.md) | ROD-429 | draft |
-| Adversarial loop | ROD-430 | process (not a doc) |
+| `PORT.md` (this file) | ROD-421 | review-stable |
+| [`01-modules.md`](docs/port/01-modules.md) | ROD-422 | review-stable |
+| [`02-domain-and-sqlite.md`](docs/port/02-domain-and-sqlite.md) | ROD-423 | review-stable |
+| [`03-providers-and-resolve.md`](docs/port/03-providers-and-resolve.md) | ROD-424 | review-stable |
+| [`04-tui-runtime.md`](docs/port/04-tui-runtime.md) | ROD-425 | review-stable |
+| [`05-behavior-contracts.md`](docs/port/05-behavior-contracts.md) | ROD-426 | review-stable |
+| [`06-auth-sync-cli.md`](docs/port/06-auth-sync-cli.md) | ROD-427 | review-stable |
+| [`07-bug-ledger.md`](docs/port/07-bug-ledger.md) | ROD-428 | review-stable |
+| [`08-rust-mapping.md`](docs/port/08-rust-mapping.md) | ROD-429 | review-stable |
+| Adversarial loop | ROD-430 | done; record in [`docs/port/review-log.md`](docs/port/review-log.md) |
 
 ---
 
@@ -133,8 +133,9 @@ A chapter becomes `review-stable` only after an adversarial pass
 | `DESIGN.md`, `CHANGELOG.md` | UI truth + user-facing scars |
 | Inline contract comments | Landmines DESIGN never spells out |
 
-Rough scale at freeze: ~27k production LOC in `src/`, 758 tests (321 of them in
-`app_test.zig`), product at `v0.4.6` plus a few post-tag commits through ROD-419.
+Rough scale at freeze: ~27k production LOC in `src/`, 758 named tests plus one
+aggregator `test {}` block (321 of them in `app_test.zig`), product at `v0.4.6`
+plus a few post-tag commits through ROD-419.
 
 ---
 
@@ -190,8 +191,14 @@ progress-only (06 §5.4); test count 758 (PORT / 05).
 (Path 3 pin-flip must not share forced-preferred continue-walk). Round-4 amends:
 walk origin tag `forced_preferred` vs `pin_flip`; K-2 = clear one-shot then
 **begin new** non-manual full walk; membership stamp inside successful
-`recordPlay` / P / status writers (02 §3.7). Chapters remain In Review pending
-a tight re-pass on those paragraphs.
+`recordPlay` / P / status writers (02 §3.7).
+
+**Round 4 re-pass (2026-07-17):** the K-2/Path-3 fence and membership-stamp
+paragraphs verified dry against source; remaining round-3 mechanical residue
+closed in the same commit (06 §5.4 pull candidate scoping, Path 2 unbound-arm
+resets, 02 §4b recordPlay row, count wording, manual-vs-origin note in 03 §5.2).
+Loop record: [`docs/port/review-log.md`](docs/port/review-log.md). All chapters
+promoted `review-stable`.
 
 ---
 
