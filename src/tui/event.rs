@@ -3,8 +3,11 @@
 //! Worker-result variants arrive with their subsystems (ROD-434+).
 
 use std::sync::mpsc;
+use std::time::Duration;
 
-use ratatui::crossterm::event::KeyEvent;
+use ratatui::crossterm::event::{self as ct, KeyEvent};
+
+use super::workers::{CancelFlag, Drain};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -14,6 +17,10 @@ pub enum Event {
     FocusLost,
     /// ~100ms clock (04 §8): spinner, debounces, deadlines.
     Tick,
+    /// Shell demo worker (ROD-433): generation-tagged so the loop demonstrates
+    /// the 04 §6 stale drop. Dies when real subsystem events land (ROD-434+).
+    DemoProgress { token: u64, percent: u8 },
+    DemoDone { token: u64 },
 }
 
 pub type EventRx = mpsc::Receiver<Event>;
@@ -32,6 +39,32 @@ impl EventTx {
 pub fn channel() -> (EventTx, EventRx) {
     let (tx, rx) = mpsc::channel();
     (EventTx(tx), rx)
+}
+
+/// Forward terminal input into the queue until `shutdown` flips. Polling keeps
+/// the thread joinable at teardown; a blocking `read` could only be freed by a
+/// keypress.
+pub fn spawn_input_thread(drain: &Drain, tx: EventTx, shutdown: CancelFlag) -> bool {
+    drain.spawn("input", move || {
+        while !shutdown.is_cancelled() {
+            match ct::poll(Duration::from_millis(50)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => return,
+            }
+            let Ok(raw) = ct::read() else { return };
+            match raw {
+                // Repeats and releases stay out of the queue: binds fire on press.
+                ct::Event::Key(k) if k.kind == ct::KeyEventKind::Press => {
+                    tx.post(Event::Key(k));
+                }
+                ct::Event::Resize(w, h) => tx.post(Event::Resize(w, h)),
+                ct::Event::FocusGained => tx.post(Event::FocusGained),
+                ct::Event::FocusLost => tx.post(Event::FocusLost),
+                _ => {}
+            }
+        }
+    })
 }
 
 #[cfg(test)]
