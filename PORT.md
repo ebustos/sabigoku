@@ -154,14 +154,27 @@ it only removes the excuse to re-learn zigoku under panic.
 
 ## Adversarial review (ROD-430)
 
-After each substantial chapter fill (or thick subsection):
+**Plane workflow for chapter tickets (ROD-421…429):**
 
-1. Author commits a `draft`.
-2. Other agent cold-reads **without** re-opening zigoku first.
+| When | State |
+|---|---|
+| Not started | Backlog / Todo |
+| Being written | In Progress |
+| Filled enough for review | **In Review** (hold; do not Done yet) |
+| After adversarial batch pass + amends | Done + chapter status `review-stable` in this file |
+
+Fill all chapters to **In Review** first, then run the batch adversarial pass
+(ROD-430) against the set. Parent ROD-420 stays In Progress until the batch is clear.
+
+Per-chapter cold-read steps (when the batch runs, or sooner if needed):
+
+1. Author commits a `draft` and moves the child ticket to **In Review**.
+2. Reviewer cold-reads **without** re-opening zigoku first.
 3. Attack list: missing invariant, `ZIG-SHAPE` smuggled as requirement, known bug
    unnamed, test contract uncaptured, ambiguity an implementer would coin-flip.
 4. Author amends or cites source.
-5. Promote to `review-stable` only when both sides stop finding implementer-misleading holes.
+5. Promote chapter status to `review-stable` and ticket to **Done** only when
+   implementer-misleading holes are gone.
 
 ---
 
