@@ -36,8 +36,16 @@ impl Drain {
             .name(name.to_string())
             .spawn(move || {
                 let _finish_last = guard;
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+                if let Err(cause) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
                     panics.fetch_add(1, Ordering::Relaxed);
+                    // The scoped hook is mute off-main; without this line a
+                    // worker panic would leave no trace but the counter.
+                    let msg = cause
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| cause.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown panic payload");
+                    eprintln!("worker panicked: {msg}");
                 }
             })
             .is_ok()

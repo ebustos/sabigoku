@@ -49,8 +49,8 @@ pub struct App {
     ticks: u64,
     demo: Demo,
     demo_gen: Generation,
-    /// Replaced per spawn: a superseded worker keeps its own flag, so
-    /// cancelling the current one never kills its successor.
+    /// Replaced per spawn; `start_demo` cancels the outgoing flag before the
+    /// swap, so no superseded worker outlives its supersession.
     demo_cancel: CancelFlag,
     demo_drain: Drain,
     dropped_stale: u64,
