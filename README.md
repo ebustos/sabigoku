@@ -26,6 +26,10 @@ never to already knowing the problem.
 each mirroring a zigoku spike one-for-one. This is a spike repo, not the app yet;
 M1 is where the ideas collapse into real modules behind interfaces.
 
+**Port bible in progress** ([ROD-420](http://fern.comet-ruler.ts.net)): runtime and
+behavior distillation of zigoku lives in [`PORT.md`](PORT.md) and `docs/port/`.
+UI/design truth stays in [`DESIGN.md`](DESIGN.md).
+
 ## The spikes
 
 ```
