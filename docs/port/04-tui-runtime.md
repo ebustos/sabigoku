@@ -36,11 +36,11 @@ from the hot path (detach + generation / keep-check drop).
 
 | Option | Verdict |
 |---|---|
-| `std::thread` + `mpsc` (or equivalent channel) | **Default lean** (matches M0 `spike_concurrency`, zigoku model) |
-| tokio multi-thread runtime for everything | Optional later; not required for parity |
+| `std::thread` + `mpsc` (or equivalent channel) | **Decided** (M1 cut 2026-07-17, ROD-431/433; matches M0 `spike_concurrency`, zigoku model, and `spike_cover`'s ThreadProtocol wiring) |
+| tokio multi-thread runtime for everything | Rejected for M1; revisit only on measured pain |
 | async TUI framework that owns the loop | Avoid unless measured win; keep ratatui draw pure |
 
-DESIGN left runtime open; this chapter **binds the default**: blocking workers +
+DESIGN 11.1 is resolved by this decision: blocking workers +
 channel into a crossterm/ratatui loop, with a **~100ms tick** for spinner, debounce,
 and sync flush deadlines.
 
@@ -362,7 +362,7 @@ make it safe.
 
 | ID | Question | Lean |
 |---|---|---|
-| O1 | Single `tokio` runtime vs pure threads | Threads + mpsc until pain |
+| O1 | ~~Single `tokio` runtime vs pure threads~~ **Closed:** threads + mpsc (M1 cut, ROD-431/433) | closed |
 | O2 | Play on UI-blocking thread pool vs dedicated | Dedicated thread per play |
 | O3 | Cover decode on worker vs GPU | Worker CPU decode; pixels to UI |
 | O4 | ~~Exact discover_cover concurrency default~~ **Closed:** 4, clamped [1,16] (06 §2.2) | — |

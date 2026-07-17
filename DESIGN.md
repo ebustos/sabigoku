@@ -16,8 +16,8 @@
 > renders, and the degrade fallback when a field is null.
 >
 > **Stack:** ratatui + crossterm. Cover art via `ratatui-image` (Kitty graphics
-> protocol) is the plan but unspiked; see §11. The async runtime (tokio vs
-> `std::thread` + mpsc) is deliberately undecided; this doc does not bind it (§9.8).
+> protocol), spiked and ratified 2026-07-17 (ROD-417; §11.2). Runtime:
+> `std::thread` + mpsc, decided with the M1 cut (ROD-431; §11.1).
 
 ---
 
@@ -319,9 +319,9 @@ to the column origin. No border around it. Padding: 1 cell above, 0 cells left
 
 **Kitty protocol path:** render the cover image via `ratatui-image` into the fixed
 cell block. The image is aspect-ratio cropped to fill the block (no letterboxing;
-the crop is intentional, like a book cover). This pipeline is **unspiked** (§11):
-protocol detection, pixel-geometry queries, and redraw behavior all need validation
-before the sizing rules here can be trusted.
+the crop is intentional, like a book cover). This pipeline is spiked and ratified
+(ROD-417, 2026-07-17; §11.2): protocol detection, pixel-geometry queries, crop, and
+resize redraw all validated, so the sizing rules here are trusted.
 
 **Half-block fallback:** when Kitty graphics are unavailable, render the cover into
 the cell block with `▄`/`▀` half-block cells (`ratatui-image`'s halfblocks
@@ -502,7 +502,8 @@ its spacer from the content height.
 **Adaptive cover height.** `cover_h` is derived from the terminal's reported cell
 pixel dimensions so a ~2:3 AniList poster fills the card width rather than
 pillarboxing inside a too-short box. For a 20-col card on a terminal reporting
-10×22-px cells, `cover_h ≈ 13` and `slot_h = 17`. When cell pixels are unreported
+10×22-px cells, `cover_h ≈ 13` and `slot_h = 17` (measured for real in ROD-417:
+ghostty reports 9×20-px cells and lands `cover_h = 13`). When cell pixels are unreported
 (tmux, headless, SSH setups that don't answer the pixel metric) the height falls
 back to fixed values, 7 for the large tier and 5 for the small, which are always
 the minimum (the adaptive height never shrinks below them). The trade: taller
@@ -2946,9 +2947,10 @@ width). List/detail content height is `frame.height - 3` (top bar, spacer, botto
 bar). ratatui rects are content regions with no implicit borders, which is correct
 for Terminal Ghost: never attach a `Block` with borders to a pane.
 
-### 9.3 Cover Art (`ratatui-image`, unspiked)
+### 9.3 Cover Art (`ratatui-image`, spiked: ROD-417)
 
-The plan: `ratatui-image` with the Kitty graphics protocol.
+The pipeline, validated end to end by `spike_cover` (**normative artifact:**
+sabigoku `src/bin/spike_cover.rs`; findings in `SPIKES.md` §6):
 
 1. Fetch cover image bytes (JPEG/PNG) from the AniList URL via HTTP.
 2. Decode to pixels (the `image` crate).
@@ -2960,12 +2962,20 @@ The plan: `ratatui-image` with the Kitty graphics protocol.
 When Kitty graphics are unavailable, `ratatui-image`'s halfblocks fallback renders
 the image via `▀`/`▄` cells (§3.3).
 
-**This whole pipeline is unspiked (§11).** Specific risks: protocol detection
-under tmux/SSH; whether the terminal reports cell pixel dimensions (the §3.2/§3.8
-adaptive cover heights depend on it; the fixed fallbacks of 7/5 rows and the
-28/20-row caps are the no-pixel-geometry path); interaction between image
-placement and ratatui's diff-based rendering; resize/redraw cost. Validate all of
-this in a spike before trusting the §3.3 sizing rules.
+**Spike verdicts (2026-07-17, ROD-417).** Protocol detection: ghostty lands on
+Kitty with cell pixels reported (9x20 measured); tmux lands on halfblocks with no
+geometry, so the fixed fallbacks (7/5-row cards, 28/20-row detail caps) engage
+exactly as specced, with no escape garbage. The §3.8 adaptive height derivation
+checked out to the row (20-col cover at 9x20 px -> `cover_h = 13`). No conflict
+between image placement and ratatui's diff-based rendering was observed across
+resize storms. Cost: ~1 ms worst draw frame, ~4 ms mean Kitty encode per cover,
+off-thread, zero encode errors.
+
+**Threading contract (landmine).** Resize+encode runs on a worker via
+`ratatui-image`'s `ThreadProtocol`, and its request ids count per instance: N
+images sharing one worker channel cannot route responses by trial (colliding ids
+would install the wrong poster). Give each image a private request channel and
+drain them into an index-tagged worker queue, as the spike does.
 
 Cache the decoded pixel buffer; re-render at new cell dimensions on resize, never
 re-fetch from network (§9.5).
@@ -3164,19 +3174,21 @@ nothing; no placeholder, no orphan separator, no bare rail row.
 Genuinely undecided items. The spec above does not resolve these; do not treat
 any of them as settled by implication.
 
-1. **Async runtime: tokio vs `std::thread` + mpsc.** Deliberately open. §9.8
-   lists what the doc binds either way (event vocabulary, spinner clock,
-   debounces, render purity); the runtime choice is made at build time, not here.
-2. **Cover art pipeline is unspiked.** `ratatui-image` + Kitty protocol +
-   halfblock fallback is the plan, not a proven path. Must be validated in a
-   spike before the §3.3/§3.8 sizing rules are trusted: protocol detection,
-   cell-pixel-geometry availability (the adaptive cover heights depend on it;
-   7/5-row and 28/20-row fixed values are the no-geometry fallback), image
-   placement vs diff-based rendering, resize/redraw cost. **Support matrix
-   (ratified):** the Kitty-graphics path must render in ghostty (daily driver),
-   kitty, and wezterm; every other terminal degrades to halfblocks. The app must
-   survive tmux without breaking (halfblocks and fixed fallback heights are
-   acceptable there; tmux support is required for headless/self-driven use).
+1. ~~**Async runtime: tokio vs `std::thread` + mpsc.**~~ **Resolved 2026-07-17
+   with the M1 cut (ROD-431/433): `std::thread` + mpsc.** The 04 worker model is
+   thread-and-channel shaped, all six spikes ran on blocking reqwest + threads,
+   and `ratatui-image`'s `ThreadProtocol` works on plain mpsc; reqwest's internal
+   runtime stays contained behind `blocking`. §9.8's bindings (event vocabulary,
+   spinner clock, debounces, render purity) were runtime-agnostic and stand.
+2. ~~**Cover art pipeline is unspiked.**~~ **Resolved 2026-07-17 (spike_cover,
+   ROD-417): validated end to end.** Protocol detection, cell-pixel geometry and
+   the adaptive heights derived from it, crop-to-fill, halfblock degrade, tmux
+   survival, and off-thread encode all verified; results in §9.3 and SPIKES.md
+   §6. **Support matrix (ratified):** the Kitty-graphics path must render in
+   ghostty (daily driver), kitty, and wezterm; every other terminal degrades to
+   halfblocks. ghostty is visually ratified; kitty and wezterm remain
+   spot-checks (same `ratatui-image` protocol branch). tmux survival is verified
+   (halfblocks + fixed fallback heights, required for headless/self-driven use).
 3. **History row-1 right-meta.** The §5.4 mock draws a rich right-meta column on
    the title row (`[▸12] 冬 2024 放映中`: resume indicator + season + status
    chips). Not ratified; the ratified baseline is title-only row 1 with the count

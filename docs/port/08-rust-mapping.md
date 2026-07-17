@@ -27,7 +27,7 @@ DESIGN; this file only answers "what do we reach for in the crate graph?"
 | Crypto (allanime) | `aes-gcm` + `sha2` + `base64` | SPIKES stream; 03 |
 | Process / mpv | `std::process::Command` | SPIKES mpv; 03 |
 | TUI | **ratatui** + **crossterm** | DESIGN |
-| Cover images | `ratatui-image` / Kitty **unspiked** — treat as risk | DESIGN §11; 04 |
+| Cover images | `ratatui-image` (Kitty + halfblocks), **spiked ROD-417**; per-image `ThreadProtocol` request channels (ids are per-instance) | DESIGN §9.3/§11.2; SPIKES §6 |
 | Config / auth files | **TOML** lean (`toml` + serde) or JSON; not ZON | 06 O1 |
 | Errors | `thiserror` for libraries; `anyhow` only at binary edges if useful | — |
 | Logging | `tracing` or `log` + env filter | 06 debug flag |
@@ -35,7 +35,8 @@ DESIGN; this file only answers "what do we reach for in the crate graph?"
 
 **Do not** default the whole app to a multi-thread tokio runtime just because
 reqwest pulls one in transitively. Workers may use `reqwest::blocking` on their
-own threads. Revisit only if measured pain (04 O1).
+own threads. Decided with the M1 cut: threads + mpsc (04 O1 closed); revisit
+only on measured pain.
 
 ---
 
@@ -90,7 +91,7 @@ Migrations live in `store`; no `provider_migrate` zigoku re-key theater.
 |---|---|
 | libvaxis Loop + Cell | crossterm event stream + ratatui `Frame` / `Buffer` |
 | tick mutates; draw pure | same split (04) |
-| Kitty image widget | spike before depending; half-block fallback per DESIGN |
+| Kitty image widget | `ratatui-image`, spiked (ROD-417); half-block fallback per DESIGN |
 | `App` megastruct | modules per 01 §3.1; avoid one 3k-line `app.rs` if possible |
 | Input modes | enum + dispatch table (05/06) |
 
