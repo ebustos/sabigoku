@@ -184,8 +184,14 @@ Findings amended: membership trigger = any meaningful play not "completed"
 (02 §3.7/L4); History open Path 2 rewritten as full algorithm including
 unpinned ROD-398 (03 §4.1); K-2 post-miss = exit one-shot then full ordered walk,
 stamp stays (03 §5.3); sync snapshot rebaseline = remote pair ≠ snapshot including
-progress-only (06 §5.4); test count 758 (PORT / 05). Chapters remain In Review
-pending the adversarial pass on these amendments.
+progress-only (06 §5.4); test count 758 (PORT / 05).
+
+**Round 3 (2026-07-17):** adversarial pass on round-2 found residual K-2 hole
+(Path 3 pin-flip must not share forced-preferred continue-walk). Round-4 amends:
+walk origin tag `forced_preferred` vs `pin_flip`; K-2 = clear one-shot then
+**begin new** non-manual full walk; membership stamp inside successful
+`recordPlay` / P / status writers (02 §3.7). Chapters remain In Review pending
+a tight re-pass on those paragraphs.
 
 ---
 
