@@ -44,8 +44,9 @@ impl Translation {
 
 /// Watchlist state. Persisted as the lowercase `as_str` form in
 /// `show.list_status` (no SQL CHECK; the column trusts this enum).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ListStatus {
+    #[default]
     Planning,
     Watching,
     Paused,
@@ -304,6 +305,63 @@ pub fn episode_sort_key(label: &str) -> f64 {
 /// stable sort keeps their incoming order, matching the grid.
 pub fn episode_label_cmp(a: &str, b: &str) -> Ordering {
     episode_sort_key(a).total_cmp(&episode_sort_key(b))
+}
+
+/// The AniList-shaped enrichment fieldset, shared verbatim by the library
+/// `show` row and `catalog_cache` (02 §3.3: column parity is intentional so
+/// promote-to-library is a straight copy). No user state lives here, ever.
+///
+/// `score` is AniList community averageScore (0..=100); the user's own 0..=10
+/// rating is `Show::user_rating`. Never conflate (02 §4).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Enrichment {
+    pub anilist_id: i64,
+    /// Secondary bridge id (AniSkip); non-unique in the wild, never a key.
+    pub mal_id: Option<i64>,
+    pub title_romaji: String,
+    pub title_english: Option<String>,
+    pub title_native: Option<String>,
+    pub cover_url: Option<String>,
+    pub total_episodes: Option<u32>,
+    pub duration_minutes: Option<u32>,
+    pub year: Option<u32>,
+    pub season: Option<Season>,
+    /// Raw AniList media status; `is_still_airing` consumes it un-normalized.
+    pub status: Option<String>,
+    pub description: Option<String>,
+    pub score: Option<u32>,
+    pub kind: Option<String>,
+    pub start_date: Option<Date>,
+    pub genres: Vec<String>,
+    pub studios: Vec<String>,
+    pub source_material: Option<String>,
+    pub rank: Option<u32>,
+    pub rank_type: Option<String>,
+    pub rank_year: Option<u32>,
+    pub next_airing_at: Option<i64>,
+    pub next_airing_episode: Option<u32>,
+    pub country: Option<String>,
+}
+
+/// One library show: enrichment plus the user state that must never be
+/// clobbered by it (02 §5). `library_added_at` None = identity row only,
+/// not in History (02 §3.7).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Show {
+    pub enrichment: Enrichment,
+    pub enrichment_fetched_at: Option<i64>,
+    pub enrichment_fieldset_version: Option<u32>,
+    pub list_status: ListStatus,
+    pub user_rating: Option<f64>,
+    pub notes: Option<String>,
+    pub play_count: u32,
+    /// Unclamped on purpose: overshoot past total still counts as completed;
+    /// the 14/2 clamp is render-time only (02 §4b).
+    pub progress: u32,
+    pub library_added_at: Option<i64>,
+    pub last_watched_at: Option<i64>,
+    pub synced_status: Option<ListStatus>,
+    pub synced_progress: Option<u32>,
 }
 
 /// Playable stream for mpv. Every field is provider-derived and untrusted.
