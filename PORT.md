@@ -91,7 +91,7 @@ A chapter becomes `review-stable` only after an adversarial pass
 | [`01-modules.md`](docs/port/01-modules.md) | ROD-422 | stub |
 | [`02-domain-and-sqlite.md`](docs/port/02-domain-and-sqlite.md) | ROD-423 | draft |
 | [`03-providers-and-resolve.md`](docs/port/03-providers-and-resolve.md) | ROD-424 | draft |
-| [`04-tui-runtime.md`](docs/port/04-tui-runtime.md) | ROD-425 | stub |
+| [`04-tui-runtime.md`](docs/port/04-tui-runtime.md) | ROD-425 | draft |
 | [`05-behavior-contracts.md`](docs/port/05-behavior-contracts.md) | ROD-426 | draft |
 | [`06-auth-sync-cli.md`](docs/port/06-auth-sync-cli.md) | ROD-427 | stub |
 | [`07-bug-ledger.md`](docs/port/07-bug-ledger.md) | ROD-428 | stub |
