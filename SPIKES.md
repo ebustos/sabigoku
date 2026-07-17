@@ -233,7 +233,8 @@ drained after every draw into an index-tagged worker queue; the real app needs
 the same shape. And the dependency avalanche returns: `image` plus
 ratatui-image's wezterm helper crates roughly double `Cargo.lock`.
 
-**Pending ratification:** the Kitty-protocol path itself needs eyes in
-ghostty / kitty / wezterm (adaptive `cover_h` from reported cell pixels, crop
-quality, redraw behavior). The probe report prints everything needed to judge
-it.
+**Kitty path ratified in ghostty (Rod, 2026-07-17):** protocol detected, cell
+pixels reported (9x20), adaptive `cover_h=13` matching the 2:3 derivation
+exactly, crop-to-fill clean, ~4.4 ms mean off-thread encode, zero errors.
+kitty and wezterm are spot-checks when convenient; ratatui-image drives all
+three through the same protocol branch.
