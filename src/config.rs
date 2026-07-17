@@ -26,6 +26,7 @@ pub struct Config {
     pub palette: String,
     pub landing: String,
     pub title_language: String,
+    /// Unclamped as stored; read through `effective_cover_concurrency()`.
     pub discover_cover_concurrency: u32,
     pub preferred_provider: String,
     pub anilist_sync_enabled: bool,
@@ -137,6 +138,15 @@ mod tests {
         assert_eq!(cfg.translation, "dub");
         assert_eq!(cfg.mpv_path, "mpv");
         assert_eq!(cfg.resume_offset_sec, 5);
+    }
+
+    #[test]
+    fn save_failure_surfaces_io_error_with_path() {
+        let path = Path::new("/nonexistent-dir-sabigoku/config.toml");
+        match Config::default().save(path) {
+            Err(Error::Io { path: p, .. }) => assert_eq!(p, path),
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
     }
 
     #[test]

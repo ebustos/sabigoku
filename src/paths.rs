@@ -157,6 +157,23 @@ mod tests {
     }
 
     #[test]
+    fn ensure_dirs_creates_all_four() {
+        let root = std::env::temp_dir().join("sabigoku-paths-tests").join("ensure");
+        let _ = std::fs::remove_dir_all(&root);
+        let p = Paths {
+            config: root.join("cfg"),
+            data: root.join("data"),
+            cache: root.join("cache"),
+            runtime: root.join("run"),
+        };
+        p.ensure_dirs();
+        for dir in [&p.config, &p.data, &p.cache, &p.runtime] {
+            assert!(dir.is_dir(), "{} not created", dir.display());
+        }
+        p.ensure_dirs();
+    }
+
+    #[test]
     fn collapse_home_is_boundary_safe() {
         let home = Path::new("/home/rod");
         assert_eq!(collapse_home(Path::new("/home/rod/x"), home), "~/x");
