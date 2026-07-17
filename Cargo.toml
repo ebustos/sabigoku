@@ -2,11 +2,14 @@
 name = "sabigoku"
 version = "0.1.0"
 edition = "2024"
+default-run = "sabigoku"
 
 [dependencies]
 # spike_http (ROD-403): HTTPS POST + typed JSON. rustls avoids a system OpenSSL dep.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
 # spike_concurrency (ROD-405) / spike_stream (ROD-406): build JSON bodies by value.
 serde_json = "1"
 # spike_sqlite (ROD-404): `bundled` compiles sqlite from source into the binary,
