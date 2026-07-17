@@ -184,7 +184,7 @@ CREATE TABLE show (
     start_year                  INTEGER,
     start_month                 INTEGER,
     start_day                   INTEGER,
-    genres                      TEXT,          -- storage encoding TBD; display list
+    genres                      TEXT,          -- JSON string array (L5); display list
     studios                     TEXT,
     source_material             TEXT,
     rank                        INTEGER,
@@ -485,6 +485,7 @@ These are product invariants; only the tables they sit on change.
 | Still-airing totals must not freeze aired-so-far as finale | ROD-419: clear a stale total only when `enrichment_fetched_at IS NOT NULL AND total_episodes IS NULL AND is_still_airing(status)`; never stamp partial field sets | `CLONE` on enrich write rules |
 | Hard delete cascades progress/cache/bindings/pins/absences/routes | zigoku's `deleteAnime` is **binding-scoped** and never touches canonical/pins/absences/routes | `FIX-IN-RUST`: show-wide cascade from the show PK is new behavior, not a clone |
 | Cover URL never downgrades absolute → relative | ROD-267: case-sensitive `GLOB 'http://*' / 'https://*'` CASE in the upsert; `http`-prefixed garbage neither sticks nor clobbers | `CLONE` |
+| Blank romaji never wipes a stored title | zigoku gated canonical title behind a real-romaji flag (ROD-312, seed vs healed) | Adapted: `NULLIF(…, '')` in the merge treats blank as absence. The full seed-flag gate is not ported: every `Enrichment` here is AniList-sourced, provider seeds never reach these writers (ROD-434 review) |
 | Migration completion is a real runtime check | zigoku checks in every build mode and unwinds via errdefer; a strippable assert is exactly the half-applied-schema bug | `CLONE`: no `debug_assert!` here |
 | WAL flip has its own retry loop | `busy_timeout` does not cover the initial WAL PRAGMA; zigoku retries 100×5ms | `CLONE` mechanism |
 | Enrichment heal TTL is status-aware | finished 30d / releasing 1d / else 7d | `CLONE` the shape or reject explicitly in M1 |
@@ -544,6 +545,7 @@ store work.
 | L2 | **`catalog_cache` is required and durable** for Browse/Discover/detail metadata (§3.5) |
 | L3 | **No zigoku data plane.** Independent store; importer is a later standalone issue if ever (§3.6) |
 | L4 | **Library membership is an explicit column** (`library_added_at`), stamped set-once inside P/reveal, user status writers, and successful `recordPlay` only; never by grid open, probe, prewarm, enrich, or sync pull (§3.7). `completed` ratchets progress only, not membership |
+| L5 | **`genres` / `studios` are JSON string arrays** in TEXT columns (ratified with ROD-434). The Rust layer owns the encoding; SQL never splits or matches inside them. Replaces zigoku's `'\n'`-joined encoding |
 
 ## 8b. Still open
 
