@@ -2,8 +2,8 @@
 
 Adversarial loop record for the sabigoku port bible. Baseline: zigoku frozen at
 `083abd3f2af6be5a372414c6b291045c926402cd` (`v0.4.6-3`, tip ROD-419). Chapters
-ROD-421..429; process ROD-430. Round briefs live at the repo root as
-`COUNTER-READ-ROUND*.md`; full per-round findings are comments on the Plane
+ROD-421..429; process ROD-430. Transient `COUNTER-READ-ROUND*.md` briefs were
+removed when the loop closed; full per-round findings are comments on the Plane
 tickets. This file is the durable summary.
 
 ## Round 1 — cold read + source verification (commit `4615d7a`)

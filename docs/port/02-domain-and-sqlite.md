@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | `draft` |
+| Status | `review-stable` |
 | Ticket | ROD-423 |
 | Freeze | zigoku `083abd3` (see [`PORT.md`](../../PORT.md)) |
 | Nature | **Port design**, not a schema transcript. Zigoku is evidence and scar tissue. |

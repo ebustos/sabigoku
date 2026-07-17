@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | `draft` |
+| Status | `review-stable` |
 | Ticket | ROD-426 |
 | Freeze | zigoku `083abd3` (see [`PORT.md`](../../PORT.md)) |
 | Spine | Identity [02](02-domain-and-sqlite.md) · Resolve [03](03-providers-and-resolve.md) · UI [DESIGN.md](../../DESIGN.md) |

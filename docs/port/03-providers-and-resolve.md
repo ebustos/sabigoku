@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | `draft` |
+| Status | `review-stable` |
 | Ticket | ROD-424 |
 | Freeze | zigoku `083abd3` (see [`PORT.md`](../../PORT.md)) |
 | Identity | Bindings point **to** AniList shows; see [`02-domain-and-sqlite.md`](02-domain-and-sqlite.md) §1 |

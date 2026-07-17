@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | `draft` |
+| Status | `review-stable` |
 | Ticket | ROD-428 |
 | Freeze | zigoku `083abd3` (`v0.4.6-3`, tip ROD-419) |
 | Sources | `CHANGELOG.md` Fixed/Known + port decisions 02–06 + freeze tip beyond 0.4.6 tag |

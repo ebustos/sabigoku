@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | `draft` |
+| Status | `review-stable` |
 | Ticket | ROD-422 |
 | Freeze | zigoku `083abd3` (see [`PORT.md`](../../PORT.md)) |
 | Depends on | [02](02-domain-and-sqlite.md) · [03](03-providers-and-resolve.md) · [04](04-tui-runtime.md) · [05](05-behavior-contracts.md) · [DESIGN.md](../../DESIGN.md) |

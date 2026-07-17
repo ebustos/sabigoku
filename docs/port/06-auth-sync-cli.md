@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | `draft` |
+| Status | `review-stable` |
 | Ticket | ROD-427 |
 | Freeze | zigoku `083abd3` (see [`PORT.md`](../../PORT.md)) |
 | Spine | [02](02-domain-and-sqlite.md) show-keyed library · [01](01-modules.md) entrypoints · [04](04-tui-runtime.md) workers · [05](05-behavior-contracts.md) TUI arms |
