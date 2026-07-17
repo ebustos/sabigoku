@@ -18,10 +18,22 @@ pub enum Error {
 
     #[error("config serialize: {0}")]
     ConfigSerialize(#[from] toml::ser::Error),
+
+    #[error("store: {0}")]
+    Store(#[from] rusqlite::Error),
+
+    #[error("database schema v{found} is newer than this build supports (v{supported})")]
+    SchemaTooNew { found: u32, supported: u32 },
+
+    #[error("migration ladder stopped at v{at}, expected v{expected}")]
+    MigrationIncomplete { at: u32, expected: u32 },
 }
 
 impl Error {
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
-        Error::Io { path: path.into(), source }
+        Error::Io {
+            path: path.into(),
+            source,
+        }
     }
 }
