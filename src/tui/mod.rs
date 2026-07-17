@@ -76,6 +76,8 @@ impl App {
             Event::Key(key) => self.on_key(key, now, tx),
             Event::Resize(..) => self.dirty = true,
             Event::FocusGained | Event::FocusLost => {}
+            // No keys can ever arrive again; quit clean instead of zombieing.
+            Event::InputClosed => self.quit = true,
             Event::Tick => {
                 self.ticks += 1;
                 self.dirty = true;
@@ -115,14 +117,17 @@ impl App {
         }
     }
 
-    /// Supersede then spawn: bump first so anything the old worker already
-    /// posted is stale before the new state exists (04 §6). Never join it.
+    /// Supersede: cancel the old worker's own flag, bump so its in-queue posts
+    /// go stale, THEN give the new worker a fresh flag (04 §6). Never join.
+    /// Without the cancel, superseded workers pile up unkillable to their
+    /// natural end and blow the teardown drain budget.
     fn start_demo(&mut self, now: Instant, tx: &EventTx) {
+        self.demo_cancel.cancel();
         let token = self.demo_gen.bump();
         self.demo_cancel = CancelFlag::default();
         let cancel = self.demo_cancel.clone();
         let tx = tx.clone();
-        self.demo_drain.spawn("demo", move || {
+        let spawned = self.demo_drain.spawn("demo", move || {
             for percent in (0..=100u8).step_by(4) {
                 if cancel.is_cancelled() {
                     return;
@@ -132,7 +137,11 @@ impl App {
             }
             tx.post(Event::DemoDone { token });
         });
-        self.demo = Demo::Running { token, percent: 0, started: AsyncStartEq(AsyncStart::new(now)) };
+        self.demo = if spawned {
+            Demo::Running { token, percent: 0, started: AsyncStartEq(AsyncStart::new(now)) }
+        } else {
+            Demo::Idle
+        };
         self.dirty = true;
     }
 
@@ -185,27 +194,46 @@ impl Default for App {
     }
 }
 
-/// Init, loop, clean-drain teardown. The drain on quit is a deliberate
-/// deviation from zigoku's production `_exit(0)` (04 §3, Rod 2026-07-17);
-/// bounded timeouts below are what 04 §11 demands of that choice.
-/// `ratatui::init` installs the panic hook that restores the terminal.
+/// Cap on events per loop pass so a bursting producer can never starve the
+/// tick clock, the draw, or the quit check (unbounded queue, 04 §8).
+const MAX_EVENTS_PER_PASS: usize = 256;
+
+/// Init, loop, clean-drain teardown (a ratified deviation from zigoku's
+/// `_exit(0)`; the bounded timeouts are what 04 §3/§11 demand of it).
 pub fn run() -> std::io::Result<()> {
     let mut terminal = ratatui::init();
+    scope_panic_hook_to_main_thread();
+    // External kills route through the same clean-drain quit as `q`; the OS
+    // default disposition would strand the terminal raw + alt-screen.
+    let sig_quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGINT,
+    ] {
+        let _ = signal_hook::flag::register(sig, std::sync::Arc::clone(&sig_quit));
+    }
     let (tx, rx) = event::channel();
     let shutdown = CancelFlag::default();
     let input_drain = Drain::default();
-    event::spawn_input_thread(&input_drain, tx.clone(), shutdown.clone());
+    if !event::spawn_input_thread(&input_drain, tx.clone(), shutdown.clone()) {
+        ratatui::restore();
+        return Err(std::io::Error::other("could not spawn the input thread"));
+    }
 
     let mut app = App::new();
     let mut clock = TickClock::new(Instant::now());
     let result = (|| {
-        while !app.quit {
+        while !app.quit && !sig_quit.load(std::sync::atomic::Ordering::Relaxed) {
             let now = Instant::now();
             if let Ok(ev) = rx.recv_timeout(clock.timeout(now)) {
                 app.tick(ev, Instant::now(), &tx);
             }
-            while let Ok(ev) = rx.try_recv() {
+            let mut budget = MAX_EVENTS_PER_PASS;
+            while budget > 0 && !app.quit {
+                let Ok(ev) = rx.try_recv() else { break };
                 app.tick(ev, Instant::now(), &tx);
+                budget -= 1;
             }
             let now = Instant::now();
             if clock.should_tick(now) {
@@ -225,6 +253,21 @@ pub fn run() -> std::io::Result<()> {
     app.demo_drain.drain(Duration::from_secs(1));
     ratatui::restore();
     result
+}
+
+/// `ratatui::init` installs a process-global restore hook, so an uncaught
+/// worker panic would yank the terminal out from under the live UI thread.
+/// Scope it: main panics restore; worker panics are contained by the
+/// catch_unwind in `Drain::spawn` and counted there. Threads spawned outside
+/// a Drain would panic without a trace, so do not spawn any.
+fn scope_panic_hook_to_main_thread() {
+    let main_thread = std::thread::current().id();
+    let restore_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == main_thread {
+            restore_hook(info);
+        }
+    }));
 }
 
 #[cfg(test)]
@@ -305,6 +348,39 @@ mod tests {
         app.tick(Event::Tick, now, &tx);
         assert_eq!(app.ticks, 1);
         assert!(app.dirty);
+    }
+
+    #[test]
+    fn real_worker_roundtrip_supersede_and_drain() {
+        let (mut app, tx, rx, now) = harness();
+        app.tick(key(KeyCode::Char('w')), now, &tx);
+        assert_eq!(app.demo_drain.inflight(), 1);
+        let Demo::Running { token: old_token, .. } = app.demo else {
+            panic!("demo not running after w");
+        };
+        app.tick(key(KeyCode::Char('w')), Instant::now(), &tx);
+        let Demo::Running { token: new_token, .. } = app.demo else {
+            panic!("demo not running after second w");
+        };
+        assert_ne!(old_token, new_token);
+        app.tick(Event::DemoProgress { token: old_token, percent: 50 }, Instant::now(), &tx);
+        assert_eq!(app.dropped_stale, 1);
+        assert!(matches!(app.demo, Demo::Running { percent: 0, .. }));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.demo != Demo::Done {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ev = rx.recv_timeout(left).expect("worker events before deadline");
+            app.tick(ev, Instant::now(), &tx);
+        }
+        assert!(app.demo_drain.drain(Duration::from_secs(5)));
+        assert_eq!(app.demo_drain.panics(), 0);
+    }
+
+    #[test]
+    fn input_closed_quits() {
+        let (mut app, tx, _rx, now) = harness();
+        app.tick(Event::InputClosed, now, &tx);
+        assert!(app.quit);
     }
 
     #[test]

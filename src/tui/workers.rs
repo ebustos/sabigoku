@@ -3,7 +3,7 @@
 //! queue; drain only at teardown. Supersede is detach + stale-token drop,
 //! NEVER a join on the hot path.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Default)]
 pub struct Drain {
     state: Arc<(Mutex<usize>, Condvar)>,
+    panics: Arc<AtomicUsize>,
 }
 
 impl Drain {
@@ -23,20 +24,32 @@ impl Drain {
     }
 
     /// begin + detached spawn in the contract-correct order. Returns false if
-    /// the OS refused the thread (accounting already settled).
+    /// the OS refused the thread (accounting already settled). A panicking
+    /// worker is contained: accounting settles, `panics()` counts it, and the
+    /// terminal-restoring panic hook must be main-thread-scoped (see tui::run)
+    /// or the hook still fires before the unwind reaches the catch here.
+    #[must_use]
     pub fn spawn(&self, name: &str, work: impl FnOnce() + Send + 'static) -> bool {
         let guard = self.begin();
+        let panics = Arc::clone(&self.panics);
         std::thread::Builder::new()
             .name(name.to_string())
             .spawn(move || {
                 let _finish_last = guard;
-                work();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+                    panics.fetch_add(1, Ordering::Relaxed);
+                }
             })
             .is_ok()
     }
 
     pub fn inflight(&self) -> usize {
         *self.state.0.lock().unwrap()
+    }
+
+    /// Workers that died by panic; a later ticket surfaces this as a toast.
+    pub fn panics(&self) -> usize {
+        self.panics.load(Ordering::Relaxed)
     }
 
     /// Teardown only (04 §5): block until inflight hits zero or the deadline
@@ -131,9 +144,9 @@ mod tests {
     fn finish_lands_after_last_post() {
         let (tx, rx) = event::channel();
         let drain = Drain::default();
-        drain.spawn("post-then-finish", move || {
+        assert!(drain.spawn("post-then-finish", move || {
             tx.post(Event::Tick);
-        });
+        }));
         assert!(drain.drain(Duration::from_secs(5)));
         assert_eq!(rx.try_recv().unwrap(), Event::Tick);
     }
@@ -141,7 +154,7 @@ mod tests {
     #[test]
     fn drain_waits_for_slow_worker() {
         let drain = Drain::default();
-        drain.spawn("slow", || std::thread::sleep(Duration::from_millis(50)));
+        assert!(drain.spawn("slow", || std::thread::sleep(Duration::from_millis(50))));
         assert!(drain.drain(Duration::from_secs(5)));
         assert_eq!(drain.inflight(), 0);
     }
@@ -150,9 +163,9 @@ mod tests {
     fn drain_times_out_instead_of_hanging() {
         let drain = Drain::default();
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        drain.spawn("stuck", move || {
+        assert!(drain.spawn("stuck", move || {
             let _ = release_rx.recv();
-        });
+        }));
         assert!(!drain.drain(Duration::from_millis(50)));
         release_tx.send(()).unwrap();
         assert!(drain.drain(Duration::from_secs(5)));
@@ -164,9 +177,9 @@ mod tests {
         let generation = Generation::default();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let stale_token = generation.current();
-        drain.spawn("superseded", move || {
+        assert!(drain.spawn("superseded", move || {
             let _ = release_rx.recv();
-        });
+        }));
         let fresh_token = generation.bump();
         assert!(!generation.is_current(stale_token));
         assert!(generation.is_current(fresh_token));
@@ -176,15 +189,26 @@ mod tests {
     }
 
     #[test]
+    fn panicking_worker_settles_accounting_and_is_counted() {
+        let drain = Drain::default();
+        assert!(drain.spawn("kamikaze", || panic!("contained")));
+        assert!(drain.drain(Duration::from_secs(5)));
+        assert_eq!(drain.inflight(), 0);
+        assert_eq!(drain.panics(), 1);
+        assert!(drain.spawn("after", || {}));
+        assert!(drain.drain(Duration::from_secs(5)));
+    }
+
+    #[test]
     fn cancel_stops_a_looping_worker() {
         let drain = Drain::default();
         let cancel = CancelFlag::default();
         let seen = cancel.clone();
-        drain.spawn("loop", move || {
+        assert!(drain.spawn("loop", move || {
             while !seen.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(1));
             }
-        });
+        }));
         cancel.cancel();
         assert!(drain.drain(Duration::from_secs(5)));
         cancel.reset();

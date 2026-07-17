@@ -17,6 +17,9 @@ pub enum Event {
     FocusLost,
     /// ~100ms clock (04 §8): spinner, debounces, deadlines.
     Tick,
+    /// The input thread died on a terminal error. Keys can never arrive again,
+    /// so the app must not idle on as an unquittable zombie.
+    InputClosed,
     /// Shell demo worker (ROD-433): generation-tagged so the loop demonstrates
     /// the 04 §6 stale drop. Dies when real subsystem events land (ROD-434+).
     DemoProgress { token: u64, percent: u8 },
@@ -50,9 +53,15 @@ pub fn spawn_input_thread(drain: &Drain, tx: EventTx, shutdown: CancelFlag) -> b
             match ct::poll(Duration::from_millis(50)) {
                 Ok(true) => {}
                 Ok(false) => continue,
-                Err(_) => return,
+                Err(_) => {
+                    tx.post(Event::InputClosed);
+                    return;
+                }
             }
-            let Ok(raw) = ct::read() else { return };
+            let Ok(raw) = ct::read() else {
+                tx.post(Event::InputClosed);
+                return;
+            };
             match raw {
                 // Repeats and releases stay out of the queue: binds fire on press.
                 ct::Event::Key(k) if k.kind == ct::KeyEventKind::Press => {
