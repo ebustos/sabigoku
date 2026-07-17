@@ -201,3 +201,39 @@ Net: for an app that is fundamentally HTTP-and-threads wearing a TUI, Rust
 removes the exact friction that made zigoku a drag, and the tax it charges back
 is mostly paid once (build graph, learning the ecosystem) rather than per-feature.
 That's the case for the port, stated in receipts instead of vibes.
+
+---
+
+## 6. spike_cover: cover-art pipeline (post-M0, ROD-417)
+
+```
+cargo run --bin spike_cover                    # interactive grid, ROD-417
+cargo run --bin spike_cover -- --halfblocks    # force the fallback path
+cargo run --bin spike_cover -- --probe 10      # auto-quit, print a report
+```
+
+Not an M0 parity spike: zigoku got Kitty graphics natively from libvaxis, so
+there is no Zig twin to ledger against. This one validates sabigoku's bet on
+`ratatui-image` before M1 commits to hero cover art (DESIGN 3.3/3.8, support
+matrix in 11.2): protocol detection, cell-pixel geometry and the adaptive cover
+height derived from it, `Resize::Crop` into fixed cell blocks, halfblock
+degrade, tmux survival, and worker-thread encode via `ThreadProtocol`.
+
+**Measured (tmux, halfblocks path, 9 trending AniList covers):** detection
+correctly lands on halfblocks with no reported cell size, so the DESIGN
+fallback tiers (7/5-row cards, 28/20-row detail caps) engage; draw frames stay
+around 1 ms worst-case; a full-grid re-encode after a terminal resize runs
+~1.4 ms per cover off-thread; zero encode errors across resize storms into and
+out of the narrow tier. No escape garbage inside tmux.
+
+**Taxed:** `ThreadProtocol` counts request ids per instance, so N images
+sharing one worker channel cannot route responses by trial (colliding ids would
+install the wrong poster). The spike gives each card a private request channel
+drained after every draw into an index-tagged worker queue; the real app needs
+the same shape. And the dependency avalanche returns: `image` plus
+ratatui-image's wezterm helper crates roughly double `Cargo.lock`.
+
+**Pending ratification:** the Kitty-protocol path itself needs eyes in
+ghostty / kitty / wezterm (adaptive `cover_h` from reported cell pixels, crop
+quality, redraw behavior). The probe report prints everything needed to judge
+it.
