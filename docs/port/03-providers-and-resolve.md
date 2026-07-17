@@ -6,6 +6,7 @@
 | Ticket | ROD-424 |
 | Freeze | zigoku `083abd3` (see [`PORT.md`](../../PORT.md)) |
 | Priority | **Fill early** (play pipeline) |
+| Identity | Bindings point **to** AniList shows; see [`02-domain-and-sqlite.md`](02-domain-and-sqlite.md) §1 |
 
 ## Purpose
 

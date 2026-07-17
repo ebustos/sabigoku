@@ -5,7 +5,7 @@
 | Status | `stub` |
 | Ticket | ROD-422 |
 | Freeze | zigoku `083abd3` (see [`PORT.md`](../../PORT.md)) |
-| Depends on | 02, 03 for accurate boxes; polish after those drafts exist |
+| Depends on | 02 (draft: AniList-first show identity), 03 for resolve boxes; polish after those drafts exist |
 
 ## Purpose
 
