@@ -367,25 +367,34 @@ impl Store {
     /// Record a play of the 1-based `episode_index` (02 §4b table). Always
     /// bumps play_count / last_watched_at and stamps membership set-once
     /// (callers gate on meaningful position; a partial or rewatch is
-    /// engagement). progress ratchets only when completed, never lowers.
-    /// Status via after_play. Unknown show: no-op.
+    /// engagement). `natural_end` is the >= 0.80 tier: progress ratchets only
+    /// then, and never lowers. Status via after_play. Unknown show or a zero
+    /// (unknown) index: no-op, membership must not ride an unknown episode.
+    ///
+    /// The read-compute-write runs under one BEGIN IMMEDIATE: a second
+    /// process on the same file must not be able to regress the ratchet from
+    /// a stale read (ROD-434 red-team finding).
     pub fn record_play(
         &self,
         anilist_id: i64,
         episode_index: u32,
-        completed: bool,
+        natural_end: bool,
         now: i64,
     ) -> Result<(), Error> {
-        let Some(cur) = self.status_row(anilist_id)? else {
+        if episode_index == 0 {
+            return Ok(());
+        }
+        let tx = immediate_tx(&self.conn)?;
+        let Some(cur) = status_row(&tx, anilist_id)? else {
             return Ok(());
         };
-        let new_progress = if completed {
+        let new_progress = if natural_end {
             cur.progress.max(episode_index)
         } else {
             cur.progress
         };
         let new_status = cur.status.after_play(new_progress, cur.total, cur.airing);
-        self.conn.execute(
+        tx.execute(
             "UPDATE show SET
                 play_count = play_count + 1,
                 last_watched_at = :now,
@@ -400,26 +409,30 @@ impl Store {
                 ":id": anilist_id,
             },
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Manual status write (ROD-139): no play_count / last_watched_at.
     /// completed snaps progress to total only when total > 0 (total 0 must
     /// not zero progress). Stamps membership set-once. Unknown show: no-op.
+    /// Same BEGIN IMMEDIATE envelope as record_play: the snap must not write
+    /// through a stale read.
     pub fn set_list_status(
         &self,
         anilist_id: i64,
         status: ListStatus,
         now: i64,
     ) -> Result<(), Error> {
-        let Some(cur) = self.status_row(anilist_id)? else {
+        let tx = immediate_tx(&self.conn)?;
+        let Some(cur) = status_row(&tx, anilist_id)? else {
             return Ok(());
         };
         let new_progress = match (status, cur.total) {
             (ListStatus::Completed, Some(t)) if t > 0 => t,
             _ => cur.progress,
         };
-        self.conn.execute(
+        tx.execute(
             "UPDATE show SET
                 list_status = :status,
                 progress = :progress,
@@ -432,6 +445,7 @@ impl Store {
                 ":id": anilist_id,
             },
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -492,27 +506,6 @@ impl Store {
             .execute("DELETE FROM show WHERE anilist_id = ?1", [anilist_id])?
             > 0)
     }
-
-    fn status_row(&self, anilist_id: i64) -> Result<Option<StatusRow>, Error> {
-        self.conn
-            .query_row(
-                "SELECT list_status, progress, total_episodes, status
-                 FROM show WHERE anilist_id = ?1",
-                [anilist_id],
-                |row| {
-                    let list_status: String = row.get(0)?;
-                    let media_status: Option<String> = row.get(3)?;
-                    Ok(StatusRow {
-                        status: ListStatus::parse(&list_status),
-                        progress: row.get(1)?,
-                        total: row.get(2)?,
-                        airing: is_still_airing(media_status.as_deref()),
-                    })
-                },
-            )
-            .optional()
-            .map_err(Error::from)
-    }
 }
 
 struct StatusRow {
@@ -520,6 +513,28 @@ struct StatusRow {
     progress: u32,
     total: Option<u32>,
     airing: bool,
+}
+
+/// Takes a &Connection (not &self) so the user-state writers can read inside
+/// their own transaction.
+fn status_row(conn: &Connection, anilist_id: i64) -> Result<Option<StatusRow>, Error> {
+    conn.query_row(
+        "SELECT list_status, progress, total_episodes, status
+         FROM show WHERE anilist_id = ?1",
+        [anilist_id],
+        |row| {
+            let list_status: String = row.get(0)?;
+            let media_status: Option<String> = row.get(3)?;
+            Ok(StatusRow {
+                status: ListStatus::parse(&list_status),
+                progress: row.get(1)?,
+                total: row.get(2)?,
+                airing: is_still_airing(media_status.as_deref()),
+            })
+        },
+    )
+    .optional()
+    .map_err(Error::from)
 }
 
 /// The enrichment merge SET fragment, shared by every writer so the shape
@@ -553,7 +568,10 @@ fn enrichment_merge_set(new: &str, old: &str) -> String {
         "next_airing_episode",
         "country",
     ];
-    let mut set = format!("title_romaji = {new}title_romaji");
+    // NULLIF: a blank incoming title is absence, not a value; it must never
+    // wipe a real one (red-team ROD-434; kin to zigoku's ROD-312 title guard).
+    let mut set =
+        format!("title_romaji = COALESCE(NULLIF({new}title_romaji, ''), {old}title_romaji)");
     for col in cols {
         set.push_str(&format!(", {col} = COALESCE({new}{col}, {old}{col})"));
     }
@@ -762,14 +780,18 @@ impl Store {
         provider_id: &str,
         now: i64,
     ) -> Result<(), Error> {
-        self.ensure_show_row(e)?;
-        self.conn.execute(
+        // One transaction: a peer landing between the steal-delete and the
+        // insert would otherwise surface as a raw UNIQUE(provider,
+        // provider_id) failure (ROD-434 red-team finding).
+        let tx = immediate_tx(&self.conn)?;
+        ensure_show_row(&tx, e)?;
+        tx.execute(
             "DELETE FROM provider_binding
              WHERE provider = :provider AND provider_id = :provider_id
                AND anilist_id <> :id",
             named_params! { ":provider": provider, ":provider_id": provider_id, ":id": e.anilist_id },
         )?;
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO provider_binding (anilist_id, provider, provider_id, bound_at)
              VALUES (:id, :provider, :provider_id, :now)
              ON CONFLICT(anilist_id, provider) DO UPDATE SET
@@ -777,10 +799,11 @@ impl Store {
                 bound_at = excluded.bound_at",
             named_params! { ":id": e.anilist_id, ":provider": provider, ":provider_id": provider_id, ":now": now },
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM provider_absence WHERE anilist_id = ?1 AND provider = ?2",
             (e.anilist_id, provider),
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -831,13 +854,15 @@ impl Store {
         provider: &str,
         now: i64,
     ) -> Result<(), Error> {
-        self.ensure_show_row(e)?;
-        self.conn.execute(
+        let tx = immediate_tx(&self.conn)?;
+        ensure_show_row(&tx, e)?;
+        tx.execute(
             "INSERT INTO provider_absence (anilist_id, provider, checked_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(anilist_id, provider) DO UPDATE SET checked_at = excluded.checked_at",
             (e.anilist_id, provider, now),
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -934,7 +959,10 @@ impl Store {
     }
 
     /// Upsert resume for (show, track, episode label). fully_watched derives
-    /// from WATCHED_RATIO here and only here (02 §4b).
+    /// from WATCHED_RATIO here and only here (02 §4b). Non-finite floats are
+    /// rejected loud: SQLite silently turns a NaN REAL into NULL, and
+    /// +Infinity would sail through the ratio into a permanent fully_watched
+    /// (ROD-434 red-team finding).
     #[allow(clippy::too_many_arguments)]
     pub fn save_progress(
         &self,
@@ -946,6 +974,12 @@ impl Store {
         last_provider: Option<&str>,
         now: i64,
     ) -> Result<(), Error> {
+        if !position_secs.is_finite() || !duration_secs.is_finite() {
+            return Err(Error::NonFinitePosition {
+                position: position_secs,
+                duration: duration_secs,
+            });
+        }
         let watched = duration_secs > 0.0 && position_secs / duration_secs >= WATCHED_RATIO;
         self.conn.execute(
             "INSERT INTO episode_progress
@@ -1060,9 +1094,10 @@ impl Store {
         Ok(high_water)
     }
 
-    /// Cache a provider episode listing. Labels never contain newlines, so
-    /// the blob is a plain '\n' join (CLONE; the L5 JSON lock is
-    /// genres/studios only).
+    /// Cache a provider episode listing. The blob is a JSON array, not
+    /// zigoku's '\n' join: labels are provider-controlled and nothing
+    /// enforces "no newlines", so a delimiter join lets one hostile label
+    /// forge extra episodes (ROD-434 red-team finding).
     pub fn set_episode_cache(
         &self,
         anilist_id: i64,
@@ -1084,7 +1119,7 @@ impl Store {
                 anilist_id,
                 provider,
                 translation.as_str(),
-                episodes.join("\n"),
+                serde_json::to_string(episodes).expect("Vec<String> to JSON is infallible"),
                 now,
                 now + episode_cache_ttl_secs(airing_status),
             ),
@@ -1113,10 +1148,8 @@ impl Store {
             if now >= expires_at {
                 return None;
             }
-            if blob.is_empty() {
-                return Some(Vec::new());
-            }
-            Some(blob.split('\n').map(str::to_string).collect())
+            // A corrupt blob is a miss (refetch), never an error.
+            serde_json::from_str(&blob).ok()
         }))
     }
 
@@ -1176,19 +1209,20 @@ impl Store {
         )?;
         Ok(())
     }
+}
 
-    /// Identity-row mint (02 §3.7): enrichment seed, no membership, and an
-    /// existing row is left entirely alone (mint is not a patch).
-    fn ensure_show_row(&self, e: &Enrichment) -> Result<(), Error> {
-        let bind = EnrichBind::new(e);
-        let params = enrich_params(e, &bind);
-        let sql = format!(
-            "INSERT INTO show ({ENRICH_COLS}) VALUES ({ENRICH_VALS})
-             ON CONFLICT(anilist_id) DO NOTHING"
-        );
-        self.conn.execute(&sql, params.as_slice())?;
-        Ok(())
-    }
+/// Identity-row mint (02 §3.7): enrichment seed, no membership, and an
+/// existing row is left entirely alone (mint is not a patch). Takes a
+/// &Connection so bind/absence can mint inside their own transaction.
+fn ensure_show_row(conn: &Connection, e: &Enrichment) -> Result<(), Error> {
+    let bind = EnrichBind::new(e);
+    let params = enrich_params(e, &bind);
+    let sql = format!(
+        "INSERT INTO show ({ENRICH_COLS}) VALUES ({ENRICH_VALS})
+         ON CONFLICT(anilist_id) DO NOTHING"
+    );
+    conn.execute(&sql, params.as_slice())?;
+    Ok(())
 }
 
 /// The retryable contention pair. rusqlite's `code` is already the primary
@@ -2312,6 +2346,144 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].progress, 1);
         assert_eq!(dirty[0].list_status, ListStatus::Watching);
+    }
+
+    #[test]
+    fn blank_title_never_wipes_a_real_one() {
+        let store = Store::open_memory().unwrap();
+        let blank = Enrichment {
+            anilist_id: 80,
+            title_romaji: String::new(),
+            ..Enrichment::default()
+        };
+        store.upsert_catalog_cache(&sample(80), 100, None).unwrap();
+        store.upsert_catalog_cache(&blank, 200, None).unwrap();
+        assert_eq!(
+            store
+                .get_catalog(80)
+                .unwrap()
+                .unwrap()
+                .enrichment
+                .title_romaji,
+            "Show 80"
+        );
+        store.add_to_library(&sample(80), 100).unwrap();
+        store.add_to_library(&blank, 200).unwrap();
+        store.patch_show_enrichment(&blank, true, 300).unwrap();
+        assert_eq!(
+            store.get_show(80).unwrap().unwrap().enrichment.title_romaji,
+            "Show 80"
+        );
+    }
+
+    #[test]
+    fn record_play_ignores_unknown_episode_index() {
+        let store = Store::open_memory().unwrap();
+        identity_row(&store, 81);
+        store.record_play(81, 0, true, 100).unwrap();
+        let show = store.get_show(81).unwrap().unwrap();
+        assert_eq!(show.play_count, 0);
+        assert_eq!(show.library_added_at, None, "index 0 must not join History");
+    }
+
+    #[test]
+    fn save_progress_rejects_non_finite_floats() {
+        let store = Store::open_memory().unwrap();
+        identity_row(&store, 82);
+        for (pos, dur) in [
+            (f64::NAN, 100.0),
+            (f64::INFINITY, 100.0),
+            (f64::NEG_INFINITY, 100.0),
+            (10.0, f64::NAN),
+            (10.0, f64::INFINITY),
+        ] {
+            match store.save_progress(82, Translation::Sub, "1", pos, dur, None, 100) {
+                Err(Error::NonFinitePosition { .. }) => {}
+                other => panic!("expected NonFinitePosition for ({pos}, {dur}), got {other:?}"),
+            }
+        }
+        assert_eq!(store.get_resume(82, Translation::Sub, "1").unwrap(), None);
+    }
+
+    #[test]
+    fn newline_label_cannot_forge_cache_entries() {
+        let store = Store::open_memory().unwrap();
+        identity_row(&store, 83);
+        let eps = vec!["1".to_string(), "2\nEVIL".to_string(), "3".to_string()];
+        store
+            .set_episode_cache(83, "senshi", Translation::Sub, &eps, Some("FINISHED"), 1000)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_cached_episodes(83, "senshi", Translation::Sub, 1000)
+                .unwrap(),
+            Some(eps),
+            "hostile label round-trips as one label, not two"
+        );
+    }
+
+    /// Store is deliberately !Sync, so each racer opens its own handle on
+    /// the same file: the real two-app-instances scenario.
+    #[test]
+    fn ratchet_survives_two_processes() {
+        let path = tmp_db("ratchet-race.db");
+        let main = Store::open(&path).unwrap();
+        main.add_to_library(&sample(84), 50).unwrap();
+        for round in 0..15 {
+            main.restore_list_status(84, ListStatus::Watching, 0, 60)
+                .unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|s| {
+                for ep in [20u32, 5] {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let path = path.clone();
+                    s.spawn(move || {
+                        let store = Store::open(&path).unwrap();
+                        barrier.wait();
+                        store.record_play(84, ep, true, 100).unwrap();
+                    });
+                }
+            });
+            let progress = main.get_show(84).unwrap().unwrap().progress;
+            assert_eq!(progress, 20, "ratchet regressed on round {round}");
+        }
+    }
+
+    #[test]
+    fn concurrent_rebind_never_errors_and_keeps_one_owner() {
+        let path = tmp_db("bind-race.db");
+        let main = Store::open(&path).unwrap();
+        for round in 0..15 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|s| {
+                for id in [85, 86] {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let path = path.clone();
+                    s.spawn(move || {
+                        let store = Store::open(&path).unwrap();
+                        barrier.wait();
+                        store
+                            .bind_provider(&sample(id), "senshi", "dup", 100)
+                            .unwrap();
+                    });
+                }
+            });
+            let owner = main.show_id_for_binding("senshi", "dup").unwrap();
+            assert!(
+                owner == Some(85) || owner == Some(86),
+                "round {round}: edge lost, owner {owner:?}"
+            );
+            let edges: u32 = main
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM provider_binding \
+                     WHERE provider = 'senshi' AND provider_id = 'dup'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(edges, 1, "round {round}: exactly one owner");
+        }
     }
 
     #[test]

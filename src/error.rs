@@ -38,6 +38,9 @@ pub enum Error {
 
     #[error("database at {path} is not writable")]
     ReadOnlyDb { path: std::path::PathBuf },
+
+    #[error("non-finite playback position ({position}/{duration})")]
+    NonFinitePosition { position: f64, duration: f64 },
 }
 
 impl Error {
