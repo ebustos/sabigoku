@@ -121,10 +121,29 @@ open(show: AniListId):
   → NeedsSearch (tier C across all non-absent providers, same order)
 ```
 
-**Path 2: History record open.** Pin is a **hard restriction**: only the pin's
-own binding is looked up. If the pinned provider has no binding, there is no tier
-walk; the open falls back to the record's existing provider. An unbound pin never
-silently borrows another provider's binding on this path.
+**Path 2: History record open** (full algorithm; pin is only one arm):
+
+```
+openHistory(rec):
+  if rec is unbound sentinel:
+    clear grid; refresh pin/avail meta; return
+  if pin set:
+    if pin registered AND pin != rec.source AND pin has binding:
+      open that pin binding; return
+    // pin == rec.source, retired name, or unbound pin: fall through
+    // pin set ⇒ routePreferred no-ops (pin overrides)
+  else if unpinned:
+    if routePreferred(rec.anilist_id)  // ROD-398 / §5.3: stamp / force pref
+      return
+  open rec.source / rec.source_id     // owning provider on the History row
+```
+
+**Pin hard restriction (the pin arm only):** only the pin's own binding is
+looked up. An unbound pin never silently borrows another provider's binding. If
+the pin has no binding (or is retired / already `rec.source`), there is no pin
+tier walk; control falls through. With pin still set, `routePreferred` no-ops, so
+fallthrough opens `rec.source`. Unpinned History opens still run preferred
+re-route before the record's provider (05 §10.2).
 
 **Path 3: manual pin set (`v` flip).** Single-provider `.manual` walk on the
 target provider, probing through fresh absence; a miss keeps the pin and toasts.
@@ -198,14 +217,18 @@ Per-show record: `resolved_pref` = the global `preferred_provider` this show las
 
 **After a forced-preferred miss (`FIX-IN-RUST`, closes ledger K-2).** At freeze,
 a stale-stamp re-route onto a search-only preferred provider arms a
-single-provider walk; when the search misses, the walk is already exhausted, the
-grid is left blank/stale, and no existing binding on any other provider is
-consulted. That is bug K-2, live in zigoku. sabigoku law: when the forced
-preferred probe misses, **continue the fallback walk across the full ordered
-provider list** (existing bindings first); the grid must never stay blank while a
-binding exists. Related copy bug: zigoku reuses the pin-miss toast ("no match on
-{name}, pin kept") for this pinless scenario; sabigoku uses distinct copy for
-reroute misses.
+**single-provider** walk; when the search misses, that walk is already exhausted,
+the grid is left blank/stale, and no existing binding on any other provider is
+consulted. That is bug K-2, live in zigoku. sabigoku law: when that one-shot
+forced-preferred probe misses, **exit the single-provider walk and continue a
+full ordered fallback walk** (existing bindings first, then tier A/C on the rest).
+Do not take the pin-kept exhaust path. The route stamp is already advanced
+(stamp-before-fetch, above) and **stays** on miss; do not clear it. Absence
+marking is unchanged: empty `Ok([])` still marks absence (§4.3); a search miss
+without an authoritative empty listing does not invent a new absence rule. The
+grid must never stay blank while a binding exists. Related copy bug: zigoku
+reuses the pin-miss toast ("no match on {name}, pin kept") for this pinless
+scenario; sabigoku uses distinct copy for reroute misses.
 
 ---
 

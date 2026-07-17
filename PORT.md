@@ -133,7 +133,7 @@ A chapter becomes `review-stable` only after an adversarial pass
 | `DESIGN.md`, `CHANGELOG.md` | UI truth + user-facing scars |
 | Inline contract comments | Landmines DESIGN never spells out |
 
-Rough scale at freeze: ~27k production LOC in `src/`, 759 tests (321 of them in
+Rough scale at freeze: ~27k production LOC in `src/`, 758 tests (321 of them in
 `app_test.zig`), product at `v0.4.6` plus a few post-tag commits through ROD-419.
 
 ---
@@ -177,8 +177,15 @@ Per-chapter cold-read steps (when the batch runs, or sooner if needed):
    implementer-misleading holes are gone.
 
 **Round 1 (2026-07-17):** cold read + six-agent source verification +
-inline-comment sweep complete; amendments landed under ROD-430. Chapters remain
-In Review pending the counter-read.
+inline-comment sweep complete; amendments landed under ROD-430.
+
+**Round 2 (2026-07-17):** author counter-read of the round-1 diff against freeze.
+Findings amended: membership trigger = any meaningful play not "completed"
+(02 §3.7/L4); History open Path 2 rewritten as full algorithm including
+unpinned ROD-398 (03 §4.1); K-2 post-miss = exit one-shot then full ordered walk,
+stamp stays (03 §5.3); sync snapshot rebaseline = remote pair ≠ snapshot including
+progress-only (06 §5.4); test count 758 (PORT / 05). Chapters remain In Review
+pending the adversarial pass on these amendments.
 
 ---
 

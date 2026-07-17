@@ -339,7 +339,7 @@ durable **`catalog_cache`** table holds those hits.
 | What does **not** go in | `list_status`, progress, ratings, notes, sync snapshots, pins, bindings |
 | Read path | Detail card / preview prefers `catalog_cache` by `anilist_id`; network only on miss or explicit refresh / expiry policy |
 | Write path | Upsert on every successful AniList list/search page (and fuller enrich when we already paid for it) |
-| Promote to library | User add/play/plan copies enrichment into `show` and stamps `library_added_at` (§3.7). Cache row may remain |
+| Promote to library | User add / meaningful play / plan copies enrichment into `show` and stamps `library_added_at` (§3.7). Cache row may remain |
 | Stale data | `fieldset_version` + `fetched_at` / `expires_at`. Stale may still paint the card; background refresh is a runtime concern (04), not a reason to skip durability |
 | Library shows | Detail/preview for a **library** show renders from `show`; `catalog_cache` serves non-library cards only. No read-time merge of the two (that is the COALESCE dual-spine reborn). Feed/search upserts always write `catalog_cache` and also patch `show` enrichment when the show is library |
 | vs zigoku | Replaces "upsert into `anime` with `history_visible = 0`" without polluting the library |
@@ -375,13 +375,15 @@ grid adds a History entry. The fix is an explicit marker column:
 |---|---|
 | Show row creation | A `show` row is minted by whichever comes first: binding mint, absence mark, or library add. Identity rows are cheap and carry no UI meaning. |
 | History contents | History = `show` rows with `library_added_at IS NOT NULL`. Nothing else, ever. |
-| Membership set by | Watchlist add (`P`), any status mutation, or a completed play. |
-| Membership NOT set by | Episode grid open, availability probe, prewarm, enrichment, Discover/Browse paint. |
+| Membership set by | Watchlist add (`P`), any status mutation, or any **meaningful play** (`recordPlay`: finite position > 0). Partial watches join History. |
+| Membership NOT set by | Episode grid open, availability probe, prewarm, enrichment, Discover/Browse paint. Natural-end / `completed` (progress ratchet, §4b) is **not** the membership gate. |
 
 Ancestry: zigoku's `history_visible` was a `MAX()` ratchet folded into the upsert
 (store.zig:633 @ freeze), which is why search pollution had to be laundered after
-the fact. `library_added_at` keeps the ratchet semantics (set once; enrichment
-can never unset it) as a first-class column instead of laundering.
+the fact. `recordPlay` always sets visible; `completed` only ratchets progress
+(playback_session.zig @ freeze: "partial watches appear in history").
+`library_added_at` keeps that engagement ratchet (set once; enrichment can never
+unset it) as a first-class column instead of laundering.
 
 ---
 
@@ -541,7 +543,7 @@ store work.
 | L1 | Episode equality = **identical label string**. Mismatch repair = future human-in-the-loop UX, not store logic (§3.4) |
 | L2 | **`catalog_cache` is required and durable** for Browse/Discover/detail metadata (§3.5) |
 | L3 | **No zigoku data plane.** Independent store; importer is a later standalone issue if ever (§3.6) |
-| L4 | **Library membership is an explicit column** (`library_added_at`), set by add / status mutation / completed play only; never by grid open, probe, prewarm, or enrichment (§3.7) |
+| L4 | **Library membership is an explicit column** (`library_added_at`), set by add / status mutation / any meaningful play only; never by grid open, probe, prewarm, or enrichment (§3.7). `completed` ratchets progress only, not membership |
 
 ## 8b. Still open
 

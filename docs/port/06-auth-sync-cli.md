@@ -243,9 +243,12 @@ local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
 
 After merge write:
 
-- Snapshot re-baselines to the **raw remote pair** whenever remote moved from
-  base, **including the conflict cell**: server truth in the snapshot is exactly
-  what keeps a kept-local row dirty for the next push. (Not the merged pair.)
+- Snapshot re-baselines to the **raw remote pair** whenever the remote pair
+  differs from the snapshot (status **or** progress), including first contact
+  (`base == null`) and the conflict cell: server truth in the snapshot is
+  exactly what keeps a kept-local row dirty for the next push. (Not the merged
+  pair. Progress-only remote bumps rebaseline too; the status matrix above is
+  only about status outcome.)
 - **CAS / optimistic guard:** the UPDATE is guarded on the pre-merge local pair
   (`WHERE … AND list_status = ? AND progress = ?`); zero rows changed means a
   concurrent edit landed mid-reconcile → count `contended`, leave the row, retry
