@@ -51,25 +51,38 @@ mean "may depend on" downward.
    ┌─────────┐      ┌────────────┐     ┌────────────┐
    │  auth   │      │   sync     │     │    tui     │
    └────┬────┘      └─────┬──────┘     └─────┬──────┘
-        │                 │   anilist        │
-        │                 ▼                  │ workers, resolve, input, render
-        │           ┌──────────┐             │
+        │                 │                  │ workers = the glue point:
+        │                 ▼                  │ imports source, store, player,
+        │           ┌──────────┐             │ resolver, anilist
         └──────────►│ anilist  │◄────────────┤
                     └────┬─────┘             │
-                         │                   │
-   ┌─────────┐     ┌─────▼─────┐     ┌───────▼──────┐
-   │ config  │     │  domain   │     │   resolve    │
-   │ paths   │     └─────┬─────┘     │  (orch.)     │
-   └────┬────┘           │           └───────┬──────┘
-        │          ┌─────▼─────┐             │
-        │          │   store   │◄────────────┤
-        │          └─────┬─────┘             │
-        │                │                   │
-        │          ┌─────▼─────┐       ┌─────▼──────┐
-        └─────────►│ providers │◄──────│  player    │
-                   │ registry  │       │  aniskip   │
-                   └───────────┘       └────────────┘
+                         │           ┌───────▼──────┐
+                    ┌────▼─────┐     │   resolve    │
+                    │  domain  │     │   (orch.)    │
+                    └──────────┘     └──────────────┘
+   ┌─────────┐  ┌───────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐
+   │ config  │  │   store   │  │ providers │  │ resolver │  │  player  │
+   │ paths   │  │           │  │ registry  │  │ (pure)   │  │ aniskip  │
+   └─────────┘  └───────────┘  └───────────┘  └──────────┘  └──────────┘
 ```
+
+Verified import edges at freeze (importer → imported); the diagram is a sketch,
+this table is law:
+
+| Module | Imports |
+|---|---|
+| `domain` | nothing (pure) |
+| `source` | domain |
+| `providers/*` | source (+ own http/hls helpers); **never** tui/store |
+| `store` | domain, paths **only** (no source, no providers) |
+| `player` | domain, paths **only** (StreamLink in, mpv out; glued in tui/workers) |
+| `resolver` | domain, **anilist** (reuses its pure scorers; see §5) |
+| `anilist` | domain, source, util |
+| `auth` | paths |
+| `sync` | anilist, auth, domain, store |
+| `aniskip` | providers/jikan, player, paths |
+| `config` | domain, paths |
+| `tui/workers` | source, store, player, resolver, anilist (the one glue point) |
 
 | Module | Responsibility | Deep doc |
 |---|---|---|
@@ -172,7 +185,7 @@ sabigoku sync → open store → auth credentials
 | **providers** must not import **tui** | Keep play backends testable offline |
 | **store** must not import **tui** or **providers** (except maybe name strings) | Persistence is policy-free of HTTP |
 | **domain** has no I/O | Pure |
-| **resolver** pure; no network | Worker searches, then scores |
+| **resolver** pure; no network | Worker searches, then scores. zigoku's resolver imports `anilist` for its pure scoring helpers even though it never calls the network functions; in Rust either hoist the scorer into a shared module or consciously accept the HTTP-capable dep (M1 decision) |
 | **tui/render** should not write store | Draw pure (04); mutations in tick/handlers |
 | **anilist** is the only user-facing catalog client | Providers do not power Discover/Browse search |
 | Enrichment upserts never touch pins/absences/routes | 02/03 |

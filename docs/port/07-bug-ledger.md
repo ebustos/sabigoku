@@ -43,6 +43,7 @@ this chapter is the **disposition index**.
 | ID-4 | SQLite bind error written as silent NULL | `CLONE` | Propagate bind errors (0.1.3) |
 | ID-5 | Airing availability snapshot pinned as finale `total_episodes` | `CLONE` | ROD-419 @ freeze tip; enrich must not freeze aired-so-far as total |
 | ID-6 | zigoku DB import / dual-read | `N/A` | **02 L3:** independent store; importer separate issue later |
+| ID-7 | Unbundled SQLite segfaults at startup on stock macOS | `CLONE` | v0.1.1 (buried in an "Added" bullet); rusqlite **bundled** (08 §1) — ledger row so the crate choice stays traceable to the crash it prevents |
 
 ---
 
@@ -50,8 +51,8 @@ this chapter is the **disposition index**.
 
 | ID | Symptom | Disposition | Sabigoku plan |
 |---|---|---|---|
-| K-1 | Resume marker one episode behind after **source switch** when labels disagree | `FIX-IN-RUST` (UX later) | **02 L1:** string equality for progress. No auto-remap in M1. Human-in-the-loop UX = **future ticket** when mismatch is detected or user complains |
-| K-2 | First open under **search-only preferred** can show **empty grid** instead of falling back to an existing binding | `FIX-IN-RUST` | **03** preferred re-route: on preferred tier-C miss, **must** fall back to existing binding / walk (no blank dead-end). Close the CHANGELOG hole deliberately |
+| K-1 | Resume marker one episode behind after **source switch** when labels disagree | `OPEN` (deferred UX) | **02 L1:** string equality for progress; no auto-remap in M1, so the limitation **ships**. Human-in-the-loop repair UX = **future ticket**. (Round-1 relabel: the old `FIX-IN-RUST` tag implied an M1 fix that is not scoped) |
+| K-2 | First open under **search-only preferred** can show **empty grid** instead of falling back to an existing binding | `FIX-IN-RUST` | **03 §5.3** "after a forced-preferred miss": continue the walk / land on an existing binding; no blank dead-end. Also split the miss toast: zigoku reuses the pin-kept copy for this pinless miss |
 
 ---
 
@@ -95,6 +96,8 @@ this chapter is the **disposition index**.
 | T-13 | Kitty `_Gi` acks bleed to shell / tmux | `CLONE` if Kitty path ships | 0.1.5 / 0.2.0 drain + quiet |
 | T-14 | Cover decode peak memory | `CLONE` intent | 0.4.6 tighter ceiling; tune in M1 |
 | T-15 | History filter only romaji | `CLONE` | 0.3.1 / ROD-299 all title forms |
+| T-16 | Two-column detail measured the **terminal**, not the pane; borderline widths clipped genres/metadata | `CLONE` | 0.2.1 (filed as Changed, so it dodged the Fixed net); pane-width law pinned in 05 §5 |
+| T-17 | History detail needed a second keypress before the episode grid appeared | `CLONE` | 0.2.1; grid renders on first focus at any width |
 
 ---
 
@@ -137,6 +140,7 @@ Quick map version → themes. Full prose in zigoku `CHANGELOG.md`.
 | 0.3.0 | CDN retry; airing complete; atomic migrate |
 | 0.2.3 | Discover canonical carry |
 | 0.2.2 | Covers WebP/relative; Discover off-thread |
+| 0.2.1 | Two-column split measured pane not terminal; History grid on first focus |
 | 0.2.0 | Kitty quiet; Discover cycle overflow |
 | 0.1.5–0.1.2 | Kitty drain; quit freeze; History banner; scroll join; bind errors; grid bleed; dim seed |
 

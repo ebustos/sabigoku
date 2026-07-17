@@ -55,16 +55,21 @@ Mirror zigoku `run` / `tick` intent:
 1. **Init** terminal, install resize, drain query leftovers (spurious keys), first
    winsize, construct `App` state, open store (already migrated).
 2. **Bootstrap** async: load history worker; optional launch AniList pull; optional
-   update check; optional resume-landing arm (05 §10.6).
+   update check; optional resume-landing arm (05 §10.6). Resume-landing arms from
+   **two** call sites in zigoku (the sync-fallback branch and the
+   history-load-done handler); cover both.
 3. **Loop** until quit:
    - Wait/poll for next `Event` (key, winsize, worker message, or tick).
    - `tick(event)`: mutate state, maybe spawn workers, push toasts.
    - If dirty: **draw** full frame from state (no I/O except terminal write).
-4. **Teardown** (normal return path / tests): cancel connect/prewarm, **drain all
-   worker barriers**, free owned state, restore terminal.
-5. **Hard quit** (user `q` path in zigoku): may `_exit` after save attempts so
-   workers cannot block process death; sabigoku should **prefer clean drain** if
-   practical, but must not deadlock on full event queue (see §8).
+4. **Quit — the production path.** Verified at freeze: zigoku's **only** way out
+   of a user quit is minimal cleanup (graphics clear, terminal restore,
+   `quitFlush`) then `std.c._exit(0)`. The drain-defers are real code but run only
+   in tests and error unwind; the source comment says so outright.
+5. **Teardown (tests / error unwind in zigoku):** cancel connect/prewarm, drain
+   all worker barriers, free owned state. If sabigoku chooses a clean drain on
+   quit, that is a **deliberate deviation**, not a clone: it must keep the
+   quitFlush semantics (§11) and must not deadlock on a full event queue (§8).
 
 ---
 
@@ -140,7 +145,7 @@ zigoku accounts every detachable worker with begin/finish/drain. **Intent ports:
 | Rule | Detail |
 |---|---|
 | **Begin before spawn** | Increment inflight on UI thread **before** `spawn`. On spawn failure, finish immediately. |
-| **Finish after last post** | Worker defers finish so `drain` seeing zero means no further `post` into a dead queue. |
+| **Finish after last post** | Worker defers finish so `drain` seeing zero means no further **touch of the loop, allocator, or io** (the guarantee is broader than "no post"). |
 | **Drain only on teardown** | Not on supersede. Supersede = detach + keep-check drop. |
 | **Exact-fit owned payloads** | Strings/slices posted to UI are fully owned buffers the UI frees (or takes). No partial free of a subslice (`ZIG-SHAPE` → `String`/`Vec`/`Bytes`). |
 
@@ -148,7 +153,7 @@ zigoku accounts every detachable worker with begin/finish/drain. **Intent ports:
 
 | Drain | Workers |
 |---|---|
-| history / one-shot loads | may be joinable or drained |
+| history load | **not** a ThreadDrain in zigoku: plain thread, cancelled via a store-level SQLite interrupt of the in-flight SELECT, then joined; its cleanup is declared to run after the other drains (ordering-sensitive) |
 | `episode` | episode list fetch |
 | `enrich_refresh` | refresh-on-view |
 | `resolve_add` | tier-A/C add |
@@ -207,9 +212,14 @@ live on `App`; records stay modular.
 
 Decision table is **05 §12**. Runtime:
 
-- Fetch worker uses provider `cover_request` + HTTP; SSRF guard on host.
+- Fetch worker uses provider `cover_request` + HTTP; fetch guard (03 §6.7) with
+  **redirects disabled** (a followed 3xx would bypass the host check).
 - Dual LRU: raw bytes (~32 MiB cap) + decoded pixels (~48 MiB) @ freeze; tune in M1.
-- Cooldown on same id+url failure; url change retries.
+- Cache races (`CLONE` rules): clone a cached buffer **inside the same critical
+  section as the insert** (an unlocked dupe races evict); disk-cache writers use a
+  per-writer unique temp path before the atomic rename (a shared `.tmp` for the
+  same url tears the file).
+- Cooldown on same id+url failure (**10s** @ freeze); url change retries.
 
 ### 7.4 `DiscoverCovers`
 
@@ -220,8 +230,9 @@ Decision table is **05 §12**. Runtime:
 
 ### 7.5 `DiscoverState`
 
-- **Four independent axis slots** (trending / this season / … @ freeze enum). Never
-  one shared list re-sorted (rank is positional per axis).
+- **Four independent axis slots**: `trending`, `popular`, `top_rated`,
+  `this_season` (freeze enum order; UI tab order matches). Never one shared list
+  re-sorted (rank is positional per axis). Feed page size **20** (06 §8b).
 - Per slot: results, page, fetched_at, loading, failed, exhausted.
 - **max_feed_rows = 300** → force exhausted (ROD-339).
 - On feed page success: append, set has_next, **upsert `catalog_cache`** for each
@@ -231,7 +242,9 @@ Decision table is **05 §12**. Runtime:
 ### 7.6 `PrewarmState`
 
 - Single active walk; cancel atomic for fallback yield.
-- Session ring of attempted `anilist_id`s; spacing between starts.
+- 32-slot ring of attempted `anilist_id`s (eviction can re-attempt) + **30s
+  app-wide spacing floor** between walk starts (03 §6.5). Rust: use `Option`, not
+  a 0 sentinel; nothing enforces `anilist_id > 0`.
 - Blocked while add/play resolving or fallback active (03).
 
 ### 7.7 `PlaybackSession`
@@ -256,11 +269,15 @@ Decision table is **05 §12**. Runtime:
 
 | Mechanism | Period / rule |
 |---|---|
-| UI `Tick` | ~100ms |
-| Search debounce | arm on key; fire when `now >= deadline` |
-| Cover settle (browse/history scroll) | debounce continuous scroll; discrete nav may sync immediately (05 cover settle) |
-| Sync flush | arm on mutation; fire after settle ms on tick (ROD-291) |
-| Slow spinner color | after async_start threshold (visual; DESIGN) |
+| UI `Tick` | ~100ms (design choice, not a named const in zigoku) |
+| Search debounce | **300ms**, armed on edited keystroke; fire when `now >= deadline` |
+| Cover settle (browse/history scroll) | **150ms** debounce for continuous scroll; discrete nav may sync immediately (05 cover settle) |
+| Cover retry cooldown | **10s** per id+url (shared by detail and discover covers) |
+| Sync flush | arm on mutation; fire after **3000ms** settle on tick (ROD-291) |
+| Slow spinner color | after **3000ms** async_start age (visual; DESIGN) |
+| Prewarm spacing | **30s** app-wide floor between walk starts (§7.6) |
+| Toasts | queue cap **3**; persistent = per-topic singleton refreshed in place; non-persistent evicted oldest-first, compacted; copy truncated to **36 display columns** (width-aware, not chars) |
+| Too-small terminal | `h < 4 or w < 16` → degraded message frame, still renders; **not** a bail/exit |
 
 ---
 
@@ -298,15 +315,20 @@ paid for metadata.
 
 | Requirement | Intent |
 |---|---|
-| Drain all accounted workers | no use-after-free on store/gpa |
+| Drain all accounted workers | no use-after-free on store/gpa (if the port drains at all; see §3) |
+| History load thread | interrupt the in-flight SELECT (store-level) **before** join, or teardown blocks on a slow query |
 | Cancel prewarm + connect | cancel flag; connect skips post on cancel |
 | Playback | best-effort final checkpoint; abandon mpv if hard exit |
 | Dirty settings | save on q / view leave (05 §13) |
+| **quitFlush** | last act before exit: bounded best-effort push of dirty AniList rows; **skipped when a sync worker is inflight** (never push alongside a pull, ROD-285/294) |
+| quitFlush timeout | bound the wait on a **pool-independent clock** (zigoku: libc nanosleep, not the io-pool deadline): under pool starvation a pooled deadline never arms and the quit hangs (ROD-232) |
 | Event queue full at quit | workers must not block forever on post (try_post / drop on shutdown) |
 | Terminal restore | always |
+| Kitty graphics | quiet clear (`q=2`) so the terminal does not ack deletes onto the shell after exit; drain residual tty responses only if an image was actually transmitted |
 
-zigoku hard-quit `_exit` is an implementation escape hatch; document if sabigoku
-keeps a "fast quit" but prefer clean drain for debuggability.
+zigoku quits via `_exit(0)` in production (§3). If sabigoku keeps a clean drain
+for debuggability, every row above still applies; the two timeout rows are what
+make it safe.
 
 ---
 
@@ -316,6 +338,7 @@ keeps a "fast quit" but prefer clean drain for debuggability.
 |---|---|
 | GPA-dupe strings for workers | `String` / `Arc<str>` moved into task |
 | Arena-backed history slice | `Vec<Show>` owned by App or `Arc` swap |
+| Double-buffered history arenas (reload builds into the idle buffer, flip on success) | build the new `Vec`/`Arc` fully, then swap; never mutate the slice a frame may still borrow |
 | `dupeAll` before arming loading | all clones succeed or none; then set loading |
 | Worker frees its inputs | task owns params; UI owns events |
 | Static provider `name()` | `&'static str` or interned |
@@ -342,7 +365,7 @@ keeps a "fast quit" but prefer clean drain for debuggability.
 | O1 | Single `tokio` runtime vs pure threads | Threads + mpsc until pain |
 | O2 | Play on UI-blocking thread pool vs dedicated | Dedicated thread per play |
 | O3 | Cover decode on worker vs GPU | Worker CPU decode; pixels to UI |
-| O4 | Exact discover_cover concurrency default | Clone config clamp from zigoku |
+| O4 | ~~Exact discover_cover concurrency default~~ **Closed:** 4, clamped [1,16] (06 §2.2) | — |
 
 ---
 

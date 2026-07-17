@@ -133,8 +133,8 @@ A chapter becomes `review-stable` only after an adversarial pass
 | `DESIGN.md`, `CHANGELOG.md` | UI truth + user-facing scars |
 | Inline contract comments | Landmines DESIGN never spells out |
 
-Rough scale at freeze: ~27k production LOC in `src/`, ~754 tests, product at
-`v0.4.6` plus a few post-tag commits through ROD-419.
+Rough scale at freeze: ~27k production LOC in `src/`, 759 tests (321 of them in
+`app_test.zig`), product at `v0.4.6` plus a few post-tag commits through ROD-419.
 
 ---
 
@@ -175,6 +175,10 @@ Per-chapter cold-read steps (when the batch runs, or sooner if needed):
 4. Author amends or cites source.
 5. Promote chapter status to `review-stable` and ticket to **Done** only when
    implementer-misleading holes are gone.
+
+**Round 1 (2026-07-17):** cold read + six-agent source verification +
+inline-comment sweep complete; amendments landed under ROD-430. Chapters remain
+In Review pending the counter-read.
 
 ---
 

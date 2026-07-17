@@ -151,6 +151,7 @@ last (zigoku `failureClassCopy` pattern).
 | Date | Change |
 |---|---|
 | 2026-07-17 | Initial lean from SPIKES + chapters 01–07 |
+| 2026-07-17 | ROD-430 round 1: verified against SPIKES/Cargo.toml/source; zero factual corrections needed. This chapter now **owns** the config/auth format decision (06 O1): lean TOML, decide at M1 start |
 
 When M1 picks config format, image crate, or channel crate, add a row here rather
 than rewriting product chapters.

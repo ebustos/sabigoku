@@ -73,7 +73,7 @@ Slice is process-immutable. User preference never rewrites the registry in place
 | API | Behavior |
 |---|---|
 | `primary()` | `providers[0]` (megaplay @ freeze) |
-| `by_name(name)` | Owner of a persisted binding key. **Must** use this for bound rows, never `primary()`. `None` = retired provider. |
+| `by_name(name)` | Owner of a persisted binding key. **Must** use this for bound rows, never `primary()` (fetching a bound id on the wrong provider silently corrupts the binding). `None` = retired provider. |
 | `preferred(name)` | Named or `primary()` if empty/unknown |
 | `ordered(pref)` | Preferred first, then construction order for the rest (ROD-344) |
 
@@ -102,23 +102,37 @@ binding beats a fresh key on an earlier provider. Within a tier, **effective ord
 | **B Id match** | Inside tier-C search results: MAL/AniList id agreement (ROD-342) | Prefer over fuzzy title match |
 | **C Search** | Title/catalog search + scorer | `best_id_match` then `best_provider_match`; below floor → no bind |
 
-### 4.1 Classifier (`ResolveVerdict`)
+### 4.1 Classifier: the two real entry paths (no unified pseudocode exists)
 
-Port intent (AniList-first):
+Round 1 verification (ROD-430): zigoku has **no single classifier**. Two entry
+paths treat the pin differently, and the port `CLONE`s the split (it is what every
+app test pins; inventing a unified rule matches nothing):
+
+**Path 1: canonical open (Browse open, Discover zoom, add-to-watchlist).**
+Pin folds into *effective preference*, nothing more:
 
 ```
-open(show: AniListId, context):
-  if context.explicit_binding:   → Bound { provider, provider_id }   // pin cycle / source flip
-  if any binding in effective order: → Bound { first in ordered(pref) }
-  if pin set and pin has binding: → Bound { pin's binding }          // also see §6
-  for p in ordered(pref):
-    if let key = p.canonical_key(show): → TierA { p, key }
-  → NeedsSearch { anilist_id }
+open(show: AniListId):
+  order = ordered(pin orelse preferred)          // pin-first, then construction
+  for p in order: if binding(p) exists → Bound   // ANY binding wins tier 0:
+                                                 // a non-pinned binding beats an
+                                                 // unbound pin here
+  for p in order: if key = p.canonical_key(show) → TierA { p, key }
+  → NeedsSearch (tier C across all non-absent providers, same order)
 ```
 
-zigoku also had `.direct` for provider-keyed selections where `sel.id` was already a
-provider handle. Under 02, that collapses to **Bound** or an explicit binding context.
-Do not reintroduce "stringified anilist_id as fake provider id" as a library key.
+**Path 2: History record open.** Pin is a **hard restriction**: only the pin's
+own binding is looked up. If the pinned provider has no binding, there is no tier
+walk; the open falls back to the record's existing provider. An unbound pin never
+silently borrows another provider's binding on this path.
+
+**Path 3: manual pin set (`v` flip).** Single-provider `.manual` walk on the
+target provider, probing through fresh absence; a miss keeps the pin and toasts.
+
+zigoku also had `.direct` for provider-keyed selections where `sel.id` was already
+a provider handle. Under 02, that collapses to **Bound** or an explicit binding
+context. Do not reintroduce "stringified anilist_id as fake provider id" as a
+library key.
 
 ### 4.2 Tier-C match rules (`resolver.zig` @ freeze)
 
@@ -182,6 +196,17 @@ Per-show record: `resolved_pref` = the global `preferred_provider` this show las
 
 **Pin supremacy** and **stamp-before-fetch** are `CLONE` contracts.
 
+**After a forced-preferred miss (`FIX-IN-RUST`, closes ledger K-2).** At freeze,
+a stale-stamp re-route onto a search-only preferred provider arms a
+single-provider walk; when the search misses, the walk is already exhausted, the
+grid is left blank/stale, and no existing binding on any other provider is
+consulted. That is bug K-2, live in zigoku. sabigoku law: when the forced
+preferred probe misses, **continue the fallback walk across the full ordered
+provider list** (existing bindings first); the grid must never stay blank while a
+binding exists. Related copy bug: zigoku reuses the pin-miss toast ("no match on
+{name}, pin kept") for this pinless scenario; sabigoku uses distinct copy for
+reroute misses.
+
 ---
 
 ## 6. Open / play pipelines
@@ -202,6 +227,9 @@ High-level:
 **Do not join** a prior episode worker on the UI thread. Detach + drain; keep-check drops
 stale results (`ZIG-SHAPE` → Rust: generation token / `anilist_id` + cancel flag).
 
+**FK order (ROD-327):** persist the `show` identity row **before** caching
+episodes or minting bindings, so foreign keys hold on the first resolve.
+
 ### 6.2 Add to watchlist (`P`)
 
 Same classifier:
@@ -216,10 +244,42 @@ Same classifier:
 
 1. Resolve stream for current binding + episode + translation + quality.
 2. Optional AniSkip prepare (MAL id + episode number).
-3. Spawn mpv with referer/UA/cloak/sub flags from `StreamLink`.
+3. Spawn mpv with referer/UA/cloak/sub flags from `StreamLink` (§6.3.1).
 4. Observe position; on meaningful progress, write `episode_progress` (02 keys).
 5. On `MpvOpenFailed` (exit 2): retry budget with re-resolve; then play-fallback hop.
 6. Mid-play prewarm siblings so a source flip is tier-0.
+
+#### 6.3.1 mpv invocation and IPC (byte-critical enough to table)
+
+| `StreamLink` field / need | mpv argv |
+|---|---|
+| `url` | positional |
+| `referer` | `--http-header-fields-append=Referer: {r}` |
+| `user_agent` | `--user-agent={ua}`: **dedicated flag, replaces the Lavf default** (Cloudflare 403s the default; header-append would send two UAs) |
+| any `http` url | `--stream-lavf-o=multiple_requests=1,icy=0` (constant: keep-alive across HLS segments + drop Icy-MetaData, gentler on CF rate scoring) |
+| `sub_url` | `--sub-file={s}` plus `--sub-pos=92 --sub-bold=yes` |
+| `cloaked_segments` | `--demuxer-lavf-o=allowed_extensions=ALL` |
+| title | `--force-media-title={title}`, `--title=sabigoku - ${media-title}` (property expansion, injection-safe) |
+| IPC | `--input-ipc-server={runtimeDir}/sabigoku-mpv-{uid}-{pid}-{counter}.sock` (unique per launch) |
+| resume | `--start={secs}` when start > 0 |
+| aniskip | `--script={path} --script-opts={opts}` |
+
+**Sanitize first (ROD-92):** provider-supplied referer/UA are untrusted; strip
+CR/LF before they touch argv (header injection).
+
+**IPC is push-based, not polled.** Watcher connects to the socket (connect budget
+~2s: 40 × 50ms), sends `observe_property` for `time-pos` (id 1) and `duration`
+(id 2), then blocking-reads newline-delimited JSON `property-change` events.
+**Meaningful position** = finite and > 0; it gates both retry eligibility (only
+retry `MpvOpenFailed` with no meaningful playback yet) and whether the final
+position persists.
+
+**Resume start rule:** every play calls progress-get for the episode. Start = 0
+if `fully_watched`, or position/duration ≥ 0.80, or position ≤ 0 / non-finite;
+else saved position minus `resume_offset_sec` (default 5), saturating at 0.
+zigoku reads checkpoints across sibling bindings (canonical join, freshest wins);
+the 02 keying gives that by construction. Do not re-scope resume reads to a
+single binding or resume breaks across a fallback hop.
 
 ### 6.4 Fallback walk (ROD-346)
 
@@ -240,9 +300,16 @@ hops. User-driven opens never arm demote.
 
 ### 6.5 Prewarm
 
-After successful add/play: silently try unbound providers (no binding, no fresh absence)
-so later flips are tier 0. Once per `anilist_id` per session. Yields to user-facing
-resolve and active fallback. Construction order for candidates (pref is not required).
+After successful add/play: background-probe unbound providers (no binding, no fresh
+absence) so later flips are tier 0. Yields to user-facing resolve and active
+fallback. Construction order for candidates (pref is not required).
+
+Dedup at freeze is **not** a per-session set: a 32-slot ring of attempted
+`anilist_id`s (round-robin eviction, so a show can re-attempt after 32 others)
+plus a **30s app-wide spacing floor** between walk starts. `blocked()` also gates
+on: walk already active, add or play resolving, fallback active. Port lean: strict
+per-session set + the 30s spacing (deliberate simplification; say so in 08 if it
+sticks).
 
 ### 6.6 Episode label remap across providers
 
@@ -253,6 +320,27 @@ resolve and active fallback. Construction order for candidates (pref is not requ
 
 Aligns with 02 **L1**: string equality is identity; ordinal is best-effort hop UX, not a
 second progress key.
+
+### 6.7 Fetch guard (SSRF) — all provider-supplied URLs
+
+Every URL a provider hands back (stream, embed, master playlist, subtitle probe,
+cover) passes one guard before fetch, **always paired with redirects disabled**
+(a followed 3xx would defeat the check). `CLONE` of zigoku `util/fetchguard.zig`
+(0.4.6 hardening, ledger R-10):
+
+- Scheme allowlist: `http` / `https` only.
+- Reject URL userinfo (`user@host`).
+- Validate the **decoded** host (defeats `127%2e0%2e0%2e1` percent-encoding).
+- Block `localhost` and `*.localhost` by name.
+- IP-literal denylist: IPv4 `0/8`, `10/8`, `127/8`, `100.64/10` (CGNAT),
+  `169.254/16` (link-local / cloud metadata), `172.16/12`, `192.168/16`, `≥224`
+  (multicast/reserved/broadcast); IPv6 `::`/`::1`, `fe80::/10`, `fc00::/7`,
+  IPv4-mapped `::ffff:a.b.c.d` recursed through the v4 rules.
+- Reject alternate IPv4 spellings in a non-literal host: all-decimal, `0x` hex,
+  short forms like `127.1`; reject `:` in the host.
+- Known residual (accepted, documented): DNS rebinding — a public name resolving
+  to a private IP at connect time is not caught without a resolve-then-validate
+  hook.
 
 ---
 
@@ -275,6 +363,8 @@ changes deliberately.
 
 Watch completion for progress accounting uses **natural end ratio 0.80** (not the 0.95
 fully_watched threshold) so a clean quit mid-credits is not a full watch (ROD-168).
+The single authoritative threshold table lives in 02 §4b. The mpv-open-failed
+retry toast copy at freeze: `stream didn't open — try again`.
 
 ---
 
@@ -288,6 +378,12 @@ Detail protocols stay in provider modules + golden tests. This section is the ma
   (`search` unsupported).
 - Episodes: listing-less; uses `count_hint` / expected episode count to mint labels.
 - Stream: MAL-based embed route; may attach softsub `sub_url`.
+- Softsub pick (0.4.3 fix, ledger R-7): metadata baseline (host `default` flag →
+  first English-labeled captions → first captions); then, sub translation only and
+  ≥2 English caption tracks (cap 6 probes), **cue-count refinement**: fetch each
+  candidate `.vtt` (guarded §6.7, redirects refused), count cues, upgrade only on
+  strictly more (never downgrade; a failed candidate fetch just drops it). This is
+  what keeps a signs-only "default" track from beating the dialogue track.
 - Absence: empty/miss paths mark not stocked when appropriate; unsupported search must
   **not** poison absence for "no mal yet" cases.
 
@@ -297,12 +393,18 @@ Detail protocols stay in provider modules + golden tests. This section is the ma
 - Search: POST filter API (tier C recovery when no MAL).
 - Episodes / embeds by mal_id; covers via poster CDN.
 - HLS may use **cloaked segments** (`cloaked_segments = true` on `StreamLink`).
+- Softsub pick is metadata-only (host default → English-labeled → first); no cue
+  probing here.
 
 ### 8.3 allanime (backstop)
 
 - GraphQL + persisted query hashes; site facts quarantined in module.
-- Stream blob: AES-256-GCM `tobeparsed` (key = sha256(seed); layout prefix/nonce/ct/tag).
-  Golden vector in zigoku tests / sabigoku `spike_stream`.
+- Stream blob: AES-256-GCM `tobeparsed`. Key = `sha256(GCM_SEED)` where the seed
+  is a **hardcoded constant** (not derived from any response). Layout after
+  base64-decode: 1-byte prefix (discard) + 12-byte nonce + ciphertext + 16-byte
+  tag, empty AAD. **Normative artifact:** sabigoku `src/bin/spike_stream.rs`
+  carries the seed and a byte-identical golden vector from zigoku's test fixture;
+  golden test is the contract.
 - Has real search + episodes + resolve; trailing in registry order.
 
 ### 8.4 Helpers (not full registry members)
@@ -329,7 +431,8 @@ forces a stub; default = parity with freeze lineup.
 ## 9. AniSkip (play adjunct)
 
 - Keyed on **MAL id** + numeric episode (from label or ordinal).
-- Modes from config: op / ed / both; unknown string → both (typo must not disable).
+- Modes from config `skip_mode`: `none` | `intro` | `outro` | `both`; unknown
+  string → both (a typo must not disable skip). See 06 §2.2.
 - Fetch skip times; write `skip.lua` + mpv opts; announce before seek.
 - Any failure → plain play, no error toast.
 

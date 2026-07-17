@@ -54,8 +54,8 @@ behavior. Pointers:
 
 | Contract | Cites |
 |---|---|
-| **G** j/k stay in bounds; g/G jump ends; empty history is a no-op | `j/k navigation stays in bounds`, `g/G jump to ends`, `navigation is a no-op with empty history` |
-| **G** scrollIntoView keeps cursor in viewport; degenerate tops do not corrupt | `scrollIntoView…`, history 2-row scroll tests |
+| j/k stay in bounds; g/G jump ends; empty history is a no-op | `j/k navigation stays in bounds`, `g/G jump to ends`, `navigation is a no-op with empty history` |
+| scrollIntoView keeps cursor in viewport; degenerate tops do not corrupt | `scrollIntoView…`, history 2-row scroll tests |
 
 ### 1.2 Quit
 
@@ -138,6 +138,10 @@ Cites: full ROD-220 cluster in app_test. Confirm chrome width drift guard is `UI
 | After `c` then `r` then `u`: recompute survives; undo no-op | `History c then r then u…` |
 | action-sync arms debounce on status/undo/finished ep when connected | ROD-291 action-sync tests |
 
+Key map (input dispatch @ freeze; DESIGN help bar agrees): `p` = paused,
+`x` = dropped, `c` = completed, `w` = watching, `P` = planning (re-plan),
+`X` = arm delete confirm.
+
 **Store-level** afterPlay / still-airing completion: domain + store tests (02 §4–5). `DEFER` detail but **must** hold in TUI after play.
 
 **Port:** P-add writes `show` + optional binding; never a provider-only library row. Discover/Browse cards that are AniList-keyed use catalog → promote (02 L2). zigoku "provider-keyed card adds directly" becomes "already has binding" or "tier path from 03", not a second identity.
@@ -148,7 +152,7 @@ Cites: full ROD-220 cluster in app_test. Confirm chrome width drift guard is `UI
 
 | Gate | Law | Cites |
 |---|---|---|
-| Too-small terminal | bail if **either** arm trips | `layout bails when EITHER too-small…` |
+| Too-small terminal | degraded message frame when either arm trips (`h < 4 or w < 16` @ freeze); still renders, never exits — the test name says "bails" but the behavior is a render guard | `layout bails when EITHER too-small…` |
 | pane_split_min **60** | two-pane Browse/History; in-pane episode grid; Enter plays from pane | two-pane / ROD-170 / ROD-259 tests |
 | List width | ~38% with **30-col floor** | `paneSplit holds…`, `clamps…30-col` |
 | Detail two-column **100** | keyed on **pane** width, not terminal | ROD-113 / ROD-258 |
@@ -189,6 +193,7 @@ DESIGN owns mocks; these numbers are **shipped constants** unless DESIGN + this 
 | Persist rows **canonically** (AniList id), never as provider bindings | **02/03** | `discover_feed persists rows canonically…` |
 | Enter resolves AniList card via **binding**, never raw provider id confusion | **03** | `Discover Enter resolves an AniList-keyed card…` |
 | P on AniList card reveals/binds, no bogus row | **03** | `Discover P on an AniList-keyed card…` |
+| P on a provider-keyed card adds directly | `.direct` → **PORT**: existing-binding context (03 §4.1) | `Discover P on a provider-keyed card adds directly (.direct fallthrough, ROD-239)` |
 | This Season gated on live clock | | `This Season fetch is gated…` |
 | NEW chip: current-cour match | `UI` | `isNewRelease…` |
 | Season chip from enriched card | catalog_cache fields | `topBarSeasonChip…` |
@@ -197,10 +202,13 @@ DESIGN owns mocks; these numbers are **shipped constants** unless DESIGN + this 
 
 ## 8. Enrichment refresh
 
+Three-state contract (ROD-278). A boolean "answered" flag loses the middle case:
+
 | | |
 |---|---|
-| **When** enrichment_refreshed with answered=true | overwrite drift fields, stamp freshness, **preserve user state** |
-| **When** answered=false | skip stamp and persist |
+| **When** enrich returns metadata | overwrite drift fields, stamp freshness, **preserve user state** |
+| **When** enrich returns a confirmed no-match (null) | **stamp freshness anyway**: a true negative is an answer; never re-query it forever |
+| **When** transport error / timeout / malformed (no answer) | skip stamp and skip persist: never freeze a never-answered row |
 
 Cites: `enrichment_refreshed overwrites…`, `answered=false skips…` (ROD-182/278).
 
@@ -221,6 +229,22 @@ Cites: `enrichment_refreshed overwrites…`, `answered=false skips…` (ROD-182/
 
 Full pipeline law is **03**. These TUI contracts pin orchestration scars:
 
+### 10.0 Resolve classification and result handling (ROD-327/328/329)
+
+Round-1 review found this cluster (14 tests) cited nowhere in the bible.
+
+| Contract | Cites |
+|---|---|
+| episodes_done persists the show identity row **before** caching episodes, so FKs hold on first resolve | `episodes_done binds the canonical before caching so the FK holds on first resolve (ROD-327)` |
+| resolve_add hit: bind + reveal + success toast + clear single-flight guard | `resolve_add_result binds revealed and toasts success on a hit; clears the guard (ROD-327)` |
+| resolve_add miss with catalog metadata present: persist the show **without** a binding + warn | `resolve_add_result miss with a canonical row persists the unbound marker and warns (ROD-329)` **PORT**: show row + library stamp, no sentinel binding |
+| resolve_add miss with nothing known: error toast, write nothing | `…miss with no canonical row falls back to the error toast, writes nothing (ROD-329)` |
+| Opening a no-binding show clears the prior show's grid so play cannot launch the wrong one | `opening an unbound row clears a prior show's grid… (ROD-329)` |
+| resolve_play hit: arm pending bind + fire episode fetch + clear guard; miss: toast only, no bind, no fetch | `resolve_play_target on a hit…`, `…on a miss…` (ROD-328) |
+| Tier-0 on a **later** provider beats tier-A on the first | `browseResolveTarget: tier 0 on a later provider beats tier A on the first` (ROD-343) |
+| Bindings on multiple providers tie-break by registry order; preference breaks the tie | `…tie to registry order` (ROD-343), `…the provider preference breaks a tier-0 tie` (ROD-344) |
+| AniList hit with mal_id classifies tier-A; without, needs-search; existing binding always wins | `browseResolveTarget:` cluster (ROD-328) |
+
 ### 10.1 Owning provider / open
 
 | Contract | Cites |
@@ -228,6 +252,7 @@ Full pipeline law is **03**. These TUI contracts pin orchestration scars:
 | History open fetches on **owning** provider, not always primary | `ROD-343: a history row fetches…` |
 | Unregistered source falls back to default provider | `…unregistered source falls back…` |
 | Browse open dispatches to verdict's provider | `browse open dispatches…` |
+| Browse P-add reveals the binding under the provider that **owns** it | `ROD-343: browse P-add reveals the binding under the provider that owns it` |
 | Browse scroll does **not** fetch episodes; detail entry lazy-loads | `browse scrolling fires zero episode fetches…` |
 | Superseded episode prefetch abandoned, not joined | `ROD-179: a superseded episode prefetch…` |
 
@@ -298,6 +323,18 @@ Full pipeline law is **03**. These TUI contracts pin orchestration scars:
 | Never-played + last_watched landing stays History | `never-played history under last_watched…` |
 | Successful load clears demote arm | `successful resume grid load clears…` |
 
+### 10.7 Episode grid cursor seeding (ROD-163)
+
+Where the cursor lands when a grid opens; distinct from §10.6 (which governs the
+History auto-open target). Round-1 review: previously uncited.
+
+| Contract | Cites |
+|---|---|
+| History detail: episodes_done seeds cursor from progress | `history detail episodes_done seeds cursor from progress` |
+| Browse detail: watched-dim seeds from store progress, network and cache-hit paths both | `browse detail episodes_done seeds watched-dim…`, `…cache-hit seeds watched-dim…` (ROD-163) |
+| A resume position overrides the next-episode cursor | `history detail resume overrides next-episode cursor` |
+| Completed show defaults cursor to episode one | `history detail completed show defaults cursor to episode one` |
+
 ---
 
 ## 11. Playback session
@@ -314,6 +351,7 @@ Full pipeline law is **03**. These TUI contracts pin orchestration scars:
 | play_retry warn toast during backoff | `play_retry surfaces…` |
 | Playback for **other** show must not advance detail; still toast errors | cross-show tests |
 | Double firePlay while playing is no-op | `firePlay: double-play guard…` |
+| Landing/reroute progress joins are raise-only; a force-completed sibling never un-completes | zigoku raise-only contract (ROD-346); 02 §4b |
 
 Resume ratios and fully_watched: **02** / store tests.
 
@@ -386,6 +424,8 @@ Resume ratios and fully_watched: **02** / store tests.
 |---|---|
 | Search mode: chars append + debounce; h/H append not navigate | search mode tests |
 | tick advances spinner; fires debounced search past deadline | tick tests |
+| Browse load-more fires on Down arrow at the last result, not just j | `Browse load-more fires on Down arrow at the last result (ROD-156 parity)` |
+| DB backfill into live search results fills **null gaps only**; never overwrites a field the fresh hit carries | search_state nulls-only rule |
 
 ---
 
@@ -406,7 +446,7 @@ These are easy to break in the port if only unit-tested in isolation:
 
 | Source | Count (freeze) | In this chapter |
 |---|---|---|
-| `app_test.zig` | ~321 | Grouped above; every ROD-tagged cluster named |
+| `app_test.zig` | 321 (exact; 759 total across src/) | Grouped above; every ROD-tagged cluster named |
 | store / domain / source / resolver / sync / config / auth | many | Pointed via §0 and 02/03/06 |
 
 **Not expanded here (by design):** pure render pixel assertions beyond halfBlockFit;

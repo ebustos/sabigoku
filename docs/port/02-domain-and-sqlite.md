@@ -130,9 +130,9 @@ for that gap (V17 anipub retirement is the clearest bloodstain: re-key orphans t
    ids live on binding (and binding-scoped caches).
 3. **User state never lives on a provider id.** Switching preferred source or
    pinning must not fork or drop watch state (the V12/V17 class of bug).
-4. **No play provider ⇒ no binding row**, not a fake `unbound` source. History
-   lists `show` rows the user engaged with; playability is "has at least one
-   binding" or "resolve can find one."
+4. **No play provider ⇒ no binding row**, not a fake `unbound` source. Playability
+   is "has at least one binding" or "resolve can find one." History membership is
+   its own explicit marker, not an accident of row existence: see §3.7.
 5. **Catalog cache is separate from the library.** Browse/Discover AniList hits
    land in `catalog_cache` (durable, no user state). They never share a table with
    watchlist rows and never need `history_visible` laundering. See §3.5.
@@ -201,7 +201,8 @@ CREATE TABLE show (
     notes                       TEXT,
     play_count                  INTEGER NOT NULL DEFAULT 0,
     progress                    INTEGER NOT NULL DEFAULT 0,
-    added_at                    INTEGER NOT NULL,
+    -- NULL = identity row only (bindable, probeable), NOT in the library (§3.7)
+    library_added_at            INTEGER,
     last_watched_at             INTEGER,
     -- AniList list sync snapshots (dirty = live pair differs or NULL)
     synced_status               TEXT,
@@ -338,8 +339,9 @@ durable **`catalog_cache`** table holds those hits.
 | What does **not** go in | `list_status`, progress, ratings, notes, sync snapshots, pins, bindings |
 | Read path | Detail card / preview prefers `catalog_cache` by `anilist_id`; network only on miss or explicit refresh / expiry policy |
 | Write path | Upsert on every successful AniList list/search page (and fuller enrich when we already paid for it) |
-| Promote to library | User add/play/plan copies enrichment into `show` (or upserts `show` from cache + user defaults). Cache row may remain |
+| Promote to library | User add/play/plan copies enrichment into `show` and stamps `library_added_at` (§3.7). Cache row may remain |
 | Stale data | `fieldset_version` + `fetched_at` / `expires_at`. Stale may still paint the card; background refresh is a runtime concern (04), not a reason to skip durability |
+| Library shows | Detail/preview for a **library** show renders from `show`; `catalog_cache` serves non-library cards only. No read-time merge of the two (that is the COALESCE dual-spine reborn). Feed/search upserts always write `catalog_cache` and also patch `show` enrichment when the show is library |
 | vs zigoku | Replaces "upsert into `anime` with `history_visible = 0`" without polluting the library |
 
 | zigoku | sabigoku |
@@ -361,6 +363,26 @@ durable **`catalog_cache`** table holds those hits.
 zigoku remains a **behavior and archaeology reference** (freeze rev), not a data
 dependency.
 
+### 3.7 Library membership (**locked**)
+
+Round 1 of the adversarial review (ROD-430) found that FK-parenting every policy
+table on `show` while equating "show row" with "History row" rebuilds zigoku's
+search-pollution problem by construction: tier-A resolve mints a binding on
+episode success, a binding needs a `show` row, and suddenly opening an episode
+grid adds a History entry. The fix is an explicit marker column:
+
+| Rule | One sentence |
+|---|---|
+| Show row creation | A `show` row is minted by whichever comes first: binding mint, absence mark, or library add. Identity rows are cheap and carry no UI meaning. |
+| History contents | History = `show` rows with `library_added_at IS NOT NULL`. Nothing else, ever. |
+| Membership set by | Watchlist add (`P`), any status mutation, or a completed play. |
+| Membership NOT set by | Episode grid open, availability probe, prewarm, enrichment, Discover/Browse paint. |
+
+Ancestry: zigoku's `history_visible` was a `MAX()` ratchet folded into the upsert
+(store.zig:633 @ freeze), which is why search pollution had to be laundered after
+the fact. `library_added_at` keeps the ratchet semantics (set once; enrichment
+can never unset it) as a first-class column instead of laundering.
+
 ---
 
 ## 4. Domain types (logical)
@@ -380,8 +402,9 @@ from zigoku `domain.zig` unless noted.
 | `EpisodeNumber` | raw label string + helpers |
 | `StreamLink` | playable URL + metadata for mpv |
 | `max_episode_hint` | cap untrusted grid allocs (10_000 @ freeze) |
-| `expected_episode_count` | airing uses next_airing-1 floor; settled uses total (ROD-359) |
-| Resume ratios | `WATCHED_RATIO = 0.95`, `NATURAL_END_RATIO = 0.80` (`CLONE`) |
+| `expected_episode_count` | (ROD-359) airing with `next_airing_episode` present: `aired = next_airing_episode - 1`, except `next_airing_episode <= 1` → **null** (nothing aired yet; null ≠ 0), and `min(aired, total)` when total is known. Airing **without** `next_airing_episode`: falls back to `total`. Settled: `total`. `max_episode_hint` clamps every branch |
+| Resume ratios | `WATCHED_RATIO = 0.95`, `NATURAL_END_RATIO = 0.80` (`CLONE`); interplay table in §4b |
+| `score` vs `user_rating` | `score` = AniList community `averageScore`, 0–100 integer, enrichment-side. `user_rating` = the user's own 0–10, user-state-side. Never conflate |
 
 **Show vs binding in the type model**
 
@@ -391,6 +414,55 @@ from zigoku `domain.zig` unless noted.
   link**, not library identity.
 - In-memory TUI "focused show" should be `anilist_id`-keyed; active binding is a
   field on that focus, not the focus key itself.
+
+---
+
+## 4b. Progress arithmetic (law)
+
+The single `show.progress` integer feeds History display and the number pushed to
+AniList. Exact rules (zigoku `store.zig` @ freeze; ROD-193/296/346 tests):
+
+| Writer | Rule |
+|---|---|
+| `recordPlay(completed=true)` | `progress = max(progress, episode_index)`: a ratchet, never lowers. `episode_index` is the 1-based ordinal in the current grid |
+| `recordPlay` (any play) | Always bumps `play_count` and `last_watched_at`; a rewatch still counts as engagement (History sort) |
+| `setListStatus(completed)` | Snaps `progress = total` iff `total > 0` (total 0 leaves progress alone) |
+| Undo (`restoreListStatus`) | Restores the exact prior `(status, progress)` pair; no snap |
+| Recompute (`r`) | Positional high-water (below); overwrites unconditionally |
+| Reroute / landing joins | Raise-only variant `MAX(progress, union)` so a force-completed sibling never un-completes (ROD-346) |
+
+**Recompute contract** (zigoku comment, verbatim intent: "1-based ordinal of last
+fully-watched among present rows (sortKey order), not a count and not absolute ep
+number. Gap-watch under-counts on purpose."):
+
+1. Take this show's `episode_progress` rows for the **active translation only**.
+2. Sort by numeric-prefix key; non-numeric labels (`SP1`, `OVA`) sort last.
+3. `progress` = 1-based position of the **last `fully_watched` row** in that
+   sorted set. Positional: not the label value, not a count. Only ep "5" watched
+   → progress 1. No rows → 0.
+
+zigoku unions rows across sibling bindings before sorting; the §3.4 keying
+(`anilist_id`, not provider) makes that union automatic.
+
+**Translation:** progress rows are per-translation; the one `show.progress`
+integer is translation-blind (whichever translation last completed a play
+ratchets it). Resume and counting never mix sub with dub.
+
+**Resume marker:** derived UI state, not a column. The episode grid's resume seed
+returns null when `progress == 0`; that is all "recompute-to-0 clears the marker"
+means. `episode_progress.position_secs` rows are untouched by recompute.
+
+**Clamping:** storage is **unclamped**. `progress` may exceed `total` (overshoot
+still counts as completed). The "14/2" fix (0.3.1 / ROD-297) is a render-time
+clamp only; clamping on write makes stored watch history lossy.
+
+**Threshold interplay** (single authority; 03 §7 and 05 §11 cite this table):
+
+| position / duration | recordPlay | progress ratchet, cursor advance, dim | fully_watched |
+|---|---|---|---|
+| < 0.80 | yes | no | no |
+| ≥ 0.80 (natural end) | yes | yes | no |
+| ≥ 0.95 | yes | yes | yes |
 
 ---
 
@@ -404,12 +476,16 @@ These are product invariants; only the tables they sit on change.
 | Schema too new ⇒ hard error | `SchemaTooNew` | `CLONE` |
 | Single `user_version` ladder, one bump at end | migrate() @ freeze | `CLONE` |
 | Enrichment fieldset version heals columns without full TTL | `ENRICHMENT_FIELDSET_VERSION = 5` | `CLONE` idea; renumber for our column set |
-| Upsert must not clobber user state with search/enrichment | upsert COALESCE / preserve list_status, progress, … | Show upsert splits "enrichment patch" vs "user patch" |
+| Upsert must not clobber user state with search/enrichment | user-state columns are **excluded from the `ON CONFLICT … DO UPDATE SET` clause entirely** (`list_status`, `user_rating`, `notes`, `play_count`, `progress`, `library_added_at`, `last_watched_at`); COALESCE guards only nullable enrichment columns | **Not COALESCE.** `COALESCE(excluded.list_status, …)` on a NOT NULL column always takes the excluded value and reintroduces the clobber bug. Split "enrichment patch" vs "user patch" APIs |
 | Pins/absences/routes immune to enrichment upsert | own tables | `CLONE` |
-| Absence TTL; bind clears absence | ROD-347 tests | `CLONE` |
+| Absence TTL **7 days**; bind clears absence | `ABSENCE_TTL_SECONDS = 7*24*60*60`; ROD-347 tests | `CLONE` |
 | Preferred re-route uses route stamp vs live pref | ROD-398 / `provider_routes` | `CLONE` intent on `show` id |
-| Still-airing totals must not freeze aired-so-far as finale | ROD-419 | `CLONE` on enrich write rules |
-| Hard delete cascades progress/cache/bindings | FK ON DELETE CASCADE | `CLONE` from show PK |
+| Still-airing totals must not freeze aired-so-far as finale | ROD-419: clear a stale total only when `enrichment_fetched_at IS NOT NULL AND total_episodes IS NULL AND is_still_airing(status)`; never stamp partial field sets | `CLONE` on enrich write rules |
+| Hard delete cascades progress/cache/bindings/pins/absences/routes | zigoku's `deleteAnime` is **binding-scoped** and never touches canonical/pins/absences/routes | `FIX-IN-RUST`: show-wide cascade from the show PK is new behavior, not a clone |
+| Cover URL never downgrades absolute → relative | ROD-267: case-sensitive `GLOB 'http://*' / 'https://*'` CASE in the upsert; `http`-prefixed garbage neither sticks nor clobbers | `CLONE` |
+| Migration completion is a real runtime check | zigoku checks in every build mode and unwinds via errdefer; a strippable assert is exactly the half-applied-schema bug | `CLONE`: no `debug_assert!` here |
+| WAL flip has its own retry loop | `busy_timeout` does not cover the initial WAL PRAGMA; zigoku retries 100×5ms | `CLONE` mechanism |
+| Enrichment heal TTL is status-aware | finished 30d / releasing 1d / else 7d | `CLONE` the shape or reject explicitly in M1 |
 | Episode labels are free text | TEXT episode column | `CLONE` |
 | History group order by ListStatus | domain `group_order` | `CLONE` (UI reads show rows) |
 
@@ -465,8 +541,11 @@ store work.
 | L1 | Episode equality = **identical label string**. Mismatch repair = future human-in-the-loop UX, not store logic (§3.4) |
 | L2 | **`catalog_cache` is required and durable** for Browse/Discover/detail metadata (§3.5) |
 | L3 | **No zigoku data plane.** Independent store; importer is a later standalone issue if ever (§3.6) |
+| L4 | **Library membership is an explicit column** (`library_added_at`), set by add / status mutation / completed play only; never by grid open, probe, prewarm, or enrichment (§3.7) |
 
 ## 8b. Still open
+
+(O1/O2/O4 were promoted into locks L1–L3; numbering kept stable.)
 
 | ID | Question | Lean |
 |---|---|---|

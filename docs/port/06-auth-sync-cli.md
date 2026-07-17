@@ -99,7 +99,7 @@ Nest under `.anilist` so future MAL/Kitsu blocks fit.
 
 | Rule | Why |
 |---|---|
-| Control bytes (`ch < 0x20`) in token → treat as signed-out | Header injection / HTTP assert abort |
+| Control bytes (`ch < 0x20`) in token → treat as signed-out | CR/LF trips strict HTTP clients' line asserts (release abort); a bare LF can inject headers |
 | `is_expired(now)` only if `expires_at != 0 && now >= expires_at` | Zero expiry stays live until 401 |
 | ~1 year JWT, **no refresh** | Implicit Grant reality |
 | Never persist before live Viewer verify | `completeLogin` order |
@@ -158,8 +158,10 @@ the hash on first GET.
 **Cancel (TUI):** set cancel flag, then **dial localhost once** to wake blocked
 `accept`. Worker skips posting `ConnectResult` on `.canceled` (no race on freed arena).
 
-**No overall timeout** on CLI wait (browser may be slow). Per-connection read deadline
-so one stalled socket cannot wedge accept forever.
+**No overall timeout** on CLI wait (browser may be slow). Per-connection read
+deadline (**5s** @ freeze) so one stalled socket cannot wedge accept forever.
+Bind is **IPv4 `127.0.0.1` only**, deliberately: pure-`::1` localhost hosts
+cannot reach it (rare; Happy Eyeballs falls back to IPv4).
 
 ### 4.5 Post-login bootstrap
 
@@ -183,14 +185,21 @@ Each library show carries last server-accepted pair:
 **Pull then push.** Never push-first on first contact: dirty never-synced rows would
 blind-upsert and wipe AniList history (ROD-285 regression).
 
-```
-sync CLI / flush worker:
-  pullAll → reconcile
-  pushAll → SaveMediaListEntry for remaining dirty
-```
+Round-1 verification: the protection is **structural**, not caller discipline.
+Every TUI sync entry point funnels through one worker function whose first
+statement is the pull; `pull_only` merely gates whether the push runs after. The
+one push-only path anywhere is the quit flush, and it is explicitly skipped while
+a pull is inflight. Entry points at freeze:
 
-TUI action flush (ROD-291) may be push-oriented after local edits; launch refresh is
-pull-oriented. See 04/05 for when each arms.
+| Entry point | Gate | Runs |
+|---|---|---|
+| CLI `sync` | token present + unexpired | pull → reconcile → push (push skipped if pull hit 401/429/store error) |
+| TUI launch refresh | connected + sync enabled | pull only |
+| TUI action flush (ROD-291) | connected + sync enabled | pull → push (same shared worker as CLI order) |
+| TUI post-connect bootstrap (ROD-292) | connected + sync enabled | pull → push |
+| TUI quit flush | connected + sync enabled, **skipped if a pull is inflight** | push only, bounded best-effort (04 §11) |
+
+There is no push-oriented fast path for action flush; do not build one.
 
 ### 5.3 Push (`pushAll`)
 
@@ -201,7 +210,8 @@ pull-oriented. See 04/05 for when each arms.
 | Spacing | ~2s between row calls (AniList rate) |
 | 429 | Sleep ~60s once, retry row; second 429 → stop run, rest stay dirty |
 | 401 | Stop run immediately |
-| Success | `markSynced` advances snapshot |
+| Success | `markSynced` advances snapshot; success requires a **non-null `SaveMediaListEntry.id` in the body**, never HTTP 200 alone (a 200 without id advancing the snapshot silently loses the row) |
+| Engaged-but-unlinked | summary lists their titles as an actionable list, capped at 12 + "and N more" (not just a count) |
 | No token / expired | No-op summary flags |
 | Per-row other errors | Count failed, continue |
 
@@ -212,30 +222,46 @@ Requires token, not expired, `user_id > 0`.
 Fetch `MediaListCollection`. For each local reconcile candidate joined by
 `anilist_id`:
 
-**Pure merge (`reconcile`):**
+Fetch `MediaListCollection`: the **full remote list in one POST, unpaginated**;
+it shares the 2MB response cap, so a huge AniList list can fail the whole pull.
+Surface that failure, do not swallow it (`OPEN`: raise the cap or paginate).
 
-| Field | Rule |
-|---|---|
-| **progress** | `max(local, remote)` always |
-| **status** | Adopt remote only if local unmoved from base; if both moved differently → **keep local** + **conflict** (dirty for push) |
-| **base** | Last synced pair; null base = first contact (treat base status as planning for "local moved") |
+**Pure merge (`reconcile`), the total matrix.** `eff_base` = snapshot status,
+or `planning` when the snapshot is null (first contact). `local_moved` =
+local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
 
-First contact examples (tests):
+| local_moved | remote_moved | status outcome | conflict |
+|---|---|---|---|
+| no | no | unchanged | no |
+| no | yes | adopt remote | no |
+| yes | no | keep local | no |
+| yes | yes, same target | keep local (converged) | no |
+| yes | yes, different | **keep local** | **yes** (stays dirty for push) |
 
-- Local planning + remote completed → adopt remote status, max progress.
-- Local watching + remote dropped → keep local status if both "moved" from planning appropriately (see store tests).
+- **progress** = `max(local, remote)` in every cell, unconditionally.
+- `REPEATING` is folded to `watching` at ingest, before the merge; progress still maxes.
 
 After merge write:
 
-- Re-baseline snapshot to **server truth** when remote moved (kept-local status stays dirty if conflict).
-- **CAS / optimistic guard:** if local pair changed mid-flight, skip write (`contended`); retry next run.
-- Unmatched remote ids: counted; **v1 does not auto-import** new AniList-only shows into library.
-- Rewatch remote `REPEATING` → map to watching; progress still max.
+- Snapshot re-baselines to the **raw remote pair** whenever remote moved from
+  base, **including the conflict cell**: server truth in the snapshot is exactly
+  what keeps a kept-local row dirty for the next push. (Not the merged pair.)
+- **CAS / optimistic guard:** the UPDATE is guarded on the pre-merge local pair
+  (`WHERE … AND list_status = ? AND progress = ?`); zero rows changed means a
+  concurrent edit landed mid-reconcile → count `contended`, leave the row, retry
+  next run. A real guard, not advisory.
+- Unmatched remote ids: counted and listed; **v1 does not auto-import** new
+  AniList-only shows into the library.
 
 ### 5.5 Master switch
 
-`anilist_sync_enabled = false` → TUI sync rail inert; **do not delete token**. CLI
-`sync` should still respect or document override (lean: respect same flag if loaded).
+`anilist_sync_enabled = false` → TUI sync rail inert; **do not delete token**.
+
+Documented fact at freeze (not an open lean): the **CLI ignores the switch
+entirely**: both the `sync` subcommand and the post-login bootstrap sync gate only
+on token presence + expiry, while every TUI entry point gates on connected +
+enabled. Port decision: unify on respecting the switch everywhere (lean), or
+document the asymmetry on purpose.
 
 ### 5.6 Port identity note
 
@@ -289,22 +315,23 @@ Subcommand detection: flags may precede (`--debug login` OK). After a real query
 | Flag | Role |
 |---|---|
 | `--debug` | Enable debug log (also env) |
-| `--dub` | CLI play path translation |
-| `--quality …` | CLI play quality |
+| `--dub` / `--sub` | CLI play path translation |
+| `--quality v` / `--quality=v` | CLI play quality (both forms) |
 
 ### 7.3 Default binary behavior
 
 | Invocation | Behavior |
 |---|---|
 | `sabigoku` | TUI |
-| `sabigoku <query>…` | Optional non-TUI search→pick→mpv (zigoku had this). **Lean: defer** to post-M1 unless needed; TUI is the product (01 O3) |
+| `sabigoku <query>…` | zigoku's non-TUI path is a full secondary UI: **single provider** via `preferred()` (no fallback walk), interactive stdin picks, cache-first episodes, resume + AniSkip + recordPlay wiring, and the CLI's only nonzero exit (1) on failure. **Lean: defer** to post-M1 (01 O3); M1 behavior for a positional arg: print "not supported yet", exit 2 — never silently open the TUI |
 | Bare flags only | TUI |
 
 ### 7.4 Exit / messaging
 
 Sync/login print human summaries (signed-out, expired, rate limit, conflicts,
-unmatched). Soft failures do not need nonzero exit if zigoku didn't; keep CLI
-scriptable later if desired (`OPEN`).
+unmatched). Baseline fact at freeze: `login`/`sync`/`update`/usage always exit 0,
+even on outcome failure; only the CLI play path exits nonzero (1). Making sync
+scriptable with real exit codes is a deliberate deviation (`OPEN`).
 
 ---
 
@@ -315,10 +342,30 @@ scriptable later if desired (`OPEN`).
 | XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_CACHE_HOME / XDG_RUNTIME_DIR | Path bases |
 | HOME | Fallbacks + collapse |
 | COLORTERM | truecolor hint for TUI (04) |
-| Debug env (zigoku `log.envDebug`) | Same idea: force debug without flag |
+| `SABIGOKU_DEBUG` (zigoku: `ZIGOKU_DEBUG`) | Force debug log without the flag; truthy/falsy parse |
 
 No token in env at freeze (file only). Keep it that way unless a test harness needs
 injection.
+
+---
+
+## 8b. AniList client (shared surface)
+
+Round-1 review: this surface had no owning chapter; it lives here because auth and
+sync already own the AniList edge. Facts @ freeze:
+
+| | |
+|---|---|
+| Endpoint | `https://graphql.anilist.co`, POST, deadline ~10s, response cap 2 MB |
+| Queries | by-id enrich; search (`sort: SEARCH_MATCH`); discover per axis (`season`/`seasonYear` vars **omitted**, not sent null, for non-this_season axes); `Viewer` (login verify); `MediaListCollection` (pull, unpaginated §5.4); `SaveMediaListEntry` (push) |
+| Fieldset | **One** shared field superset for by-id / search / discover: id, idMal, titles, episodes, duration, averageScore, status, season(+year), startDate, format, source, country, genres, main studios, rankings, nextAiringEpisode, description, coverImage.large. There is no card-vs-detail tier at the GraphQL layer; card vs detail is UI-side selection. (zigoku's narrow batch fieldset served only its migration tool: drop it) |
+| Page sizes | Browse search **26**; discover feed **20** (AniList perPage cap 50) |
+| Enrich contract | three-state (05 §8): metadata / confirmed-null / no-answer |
+| Rate limits | sync push: 2s spacing, 429 → 60s sleep once → stop; **non-sync calls have NO 429 handling at freeze**: any non-200 collapses to no-answer, no backoff, no retry classification |
+
+`OPEN` (decide deliberately): port the non-sync rate-limit gap as-is, or add a
+courtesy backoff/classification for search/discover/enrich 429s. Lean: classify
+429 distinctly and back off; hammering the catalog API is how apps get blocked.
 
 ---
 
