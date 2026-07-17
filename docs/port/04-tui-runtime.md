@@ -19,6 +19,7 @@ threads open per DESIGN §9.8 unless this chapter forces a call.
 - [ ] Event types and who produces them
 - [ ] Worker caps, spawn, cancel, join rules (what must never block the loop)
 - [ ] Cover fetch pump (concurrency cap, in-flight room)
+- [ ] Catalog cache upsert on Browse/Discover pages; detail card reads cache before network (see 02 §3.5)
 - [ ] Discover multi-axis fan-out and feed retention
 - [ ] Prewarm / episode fetch overlap rules
 - [ ] String/buffer ownership across thread boundary (`ZIG-SHAPE` → Rust)

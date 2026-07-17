@@ -133,20 +133,24 @@ for that gap (V17 anipub retirement is the clearest bloodstain: re-key orphans t
 4. **No play provider ⇒ no binding row**, not a fake `unbound` source. History
    lists `show` rows the user engaged with; playability is "has at least one
    binding" or "resolve can find one."
-5. **Search/Discover catalog is not the library table.** AniList hits may be
-   cached separately or kept ephemeral; they do not insert provider-PK rows that
-   need `history_visible` laundering.
+5. **Catalog cache is separate from the library.** Browse/Discover AniList hits
+   land in `catalog_cache` (durable, no user state). They never share a table with
+   watchlist rows and never need `history_visible` laundering. See §3.5.
 6. **Pins, absences, routes stay off the enrichment upsert path** (keep zigoku's
    table-split invariant; it was right).
+7. **Independent store.** sabigoku does not open, migrate, or import zigoku DBs.
+   No shared path, no compatibility ladder, no dual-read. A zigoku importer is a
+   **separate future issue**, designed later if needed.
 
 ### 3.2 Logical entities
 
 | Entity | Key | Owns |
 |---|---|---|
-| **Show** | `anilist_id` | Titles, cover, scores, airing, genres, …; list status; progress count; ratings/notes; sync snapshots; enrichment freshness |
+| **Show** | `anilist_id` | Library: titles/enrichment + list status, progress, ratings/notes, sync snapshots, enrichment freshness |
+| **CatalogCache** | `anilist_id` | Durable AniList search/Discover hit metadata for card + detail populate; **no** user state |
 | **ProviderBinding** | `(anilist_id, provider)` unique; `provider_id` opaque | How to talk to a stream source for this show |
 | **EpisodeProgress** | see §3.4 | Resume + fully_watched per episode label per translation |
-| **EpisodeCache** | `(anilist_id, provider, translation)` or `(provider, provider_id, translation)` | Provider episode label lists + TTL |
+| **EpisodeCache** | `(anilist_id, provider, translation)` | Provider episode label lists + TTL |
 | **ProviderPin** | `anilist_id` | Forced provider for resolve |
 | **ProviderAbsence** | `(anilist_id, provider)` | Negative cache "not stocked" + checked_at |
 | **ProviderRoute** | `anilist_id` | Last settled preferred_provider (stale ⇒ re-route once; ROD-398 intent) |
@@ -257,60 +261,105 @@ CREATE TABLE provider_route (
     resolved_pref  TEXT NOT NULL
 );
 
+CREATE TABLE catalog_cache (
+    anilist_id                  INTEGER PRIMARY KEY,
+    mal_id                      INTEGER,
+    -- metadata returned by search / Discover / page queries (fieldset-versioned)
+    title_romaji                TEXT NOT NULL,
+    title_english               TEXT,
+    title_native                TEXT,
+    cover_url                   TEXT,
+    total_episodes              INTEGER,
+    duration_minutes            INTEGER,
+    year                        INTEGER,
+    season                      TEXT,
+    status                      TEXT,
+    description                 TEXT,
+    score                       INTEGER,
+    kind                        TEXT,
+    start_year                  INTEGER,
+    start_month                 INTEGER,
+    start_day                   INTEGER,
+    genres                      TEXT,
+    studios                     TEXT,
+    source_material             TEXT,
+    rank                        INTEGER,
+    rank_type                   TEXT,
+    rank_year                   INTEGER,
+    next_airing_at              INTEGER,
+    next_airing_episode         INTEGER,
+    country                     TEXT,
+    fieldset_version            INTEGER NOT NULL,
+    fetched_at                  INTEGER NOT NULL,
+    -- optional soft expiry for background refresh; reads may still serve stale
+    expires_at                  INTEGER
+);
+
+CREATE INDEX idx_catalog_fetched ON catalog_cache(fetched_at DESC);
+
 CREATE TABLE app_meta (
     key   TEXT NOT NULL PRIMARY KEY,
     value TEXT NOT NULL
 );
 ```
 
-### 3.4 Episode progress keying (decision + risk)
+`catalog_cache` column set tracks the AniList **card + detail** enrichment
+surface (same fieldset idea as library `show`, without user-state columns). Exact
+column parity with `show`'s enrichment half is intentional so promote-to-library
+is a straight copy into `show` plus defaults for user fields.
 
-**Decision:** progress rows key by **`(anilist_id, translation, episode_label)`**,
+### 3.4 Episode progress keying (**locked**)
+
+**Locked:** progress rows key by **`(anilist_id, translation, episode_label)`**,
 not by provider. Watch state belongs to the show.
 
-**Risk (known from zigoku):** providers disagree on labels and numbering. zigoku
-CHANGELOG already names resume-one-behind after source switch. Provider-scoped
-progress would "fix" that by forking state; show-scoped progress needs an
-explicit policy when labels disagree:
+**Locked equality rule:** **same episode string ⇒ same episode.** `"1"` is `"1"`
+across providers. No automatic remap, no integer-normalization layer in v1.
 
-| Policy | Notes |
-|---|---|
-| **A. Label identity** (default above) | Same string = same ep. Simple; mismatches are user-visible scars. |
-| **B. Prefer pin's label space** | Progress only meaningful under active binding; remap on pin change. Complex. |
-| **C. Integer-only core + label map** | Only when both sides are pure ints; specials stay provider-local. |
-
-**Port default: A**, document mismatches in [`07-bug-ledger.md`](07-bug-ledger.md)
-as `FIX-IN-RUST` candidates (better remap UX later), not as a reason to put user
-state back on `(provider, provider_id)`.
+**Mismatch handling:** out of band for the store. If two providers use different
+labels for what a human considers the same episode (or the same label for
+different ones), that is a **future UX task**: human-in-the-loop decision, not
+schema gymnastics. Track in [`07-bug-ledger.md`](07-bug-ledger.md) as known
+product risk + planned UX; do **not** put user state back on
+`(provider, provider_id)` to paper over it.
 
 `episode` stays **TEXT**, never INTEGER. Labels are not always integers (`1.5`,
 `SP1`). That zigoku choice is `CLONE`.
 
-### 3.5 What replaces `history_visible` and `unbound`
+### 3.5 Catalog cache (**locked**) vs library `show`
+
+AniList search and Discover queries return **limited but useful** metadata. Opening
+a detail card must not force a full network re-fetch every time. **Locked:** a
+durable **`catalog_cache`** table holds those hits.
+
+| Concern | Rule |
+|---|---|
+| What goes in | AniList-keyed enrichment from Browse search, Discover feeds, and similar list/page queries |
+| What does **not** go in | `list_status`, progress, ratings, notes, sync snapshots, pins, bindings |
+| Read path | Detail card / preview prefers `catalog_cache` by `anilist_id`; network only on miss or explicit refresh / expiry policy |
+| Write path | Upsert on every successful AniList list/search page (and fuller enrich when we already paid for it) |
+| Promote to library | User add/play/plan copies enrichment into `show` (or upserts `show` from cache + user defaults). Cache row may remain |
+| Stale data | `fieldset_version` + `fetched_at` / `expires_at`. Stale may still paint the card; background refresh is a runtime concern (04), not a reason to skip durability |
+| vs zigoku | Replaces "upsert into `anime` with `history_visible = 0`" without polluting the library |
 
 | zigoku | sabigoku |
 |---|---|
-| Search hit upserted into `anime` with `history_visible = 0` | Do not insert into `show` until the user engages (add/play/plan), **or** use a separate catalog cache table with no user-state columns |
-| `source = 'unbound'` sentinel binding | `show` row without `provider_binding` rows; UI still lists the show |
-| COALESCE join binding ↔ canonical on every History load | History is `SELECT … FROM show` (plus optional binding aggregate for "which sources") |
+| Search hit → `anime` + `history_visible = 0` | Search hit → `catalog_cache` only |
+| `source = 'unbound'` sentinel binding | `show` without bindings; no fake provider |
+| COALESCE binding ↔ canonical on History load | History = `SELECT … FROM show` (+ binding aggregate for sources) |
 
-If we need offline AniList catalog cache for Discover, give it its **own** table
-(`catalog_cache` / similar). Never overload the library show row.
+### 3.6 Independent store (**locked**)
 
-### 3.6 Fresh DB vs import
+**Locked:** sabigoku's SQLite file is **totally independent** of zigoku's.
 
-**Default for M1:** sabigoku owns a **new schema** (version ladder starts at 1 for
-this shape). No obligation to open a zigoku `user_version = 18` file.
+- New schema, own `user_version` ladder starting at 1 for the §3 shape.
+- No code path opens a zigoku DB, reads `user_version = 18`, or dual-stacks migrations.
+- No importer designed in this bible chapter or in M1 store work.
+- A "import from zigoku" feature, if ever wanted, is its **own Plane issue at a
+  later date**, with its own design. Until then: greenfield only.
 
-**Optional later:** one-shot importer (zigoku DB → sabigoku) that:
-
-1. builds `show` from `canonical_anime` ∪ distinct `anilist_id` on visible rows
-2. folds user state across sibling bindings (max progress, status precedence TBD)
-3. emits `provider_binding` per non-`unbound` row
-4. rewrites progress onto `anilist_id` keys (drop or collide-resolve provider forks)
-
-Importer is out of scope for this chapter's first implementable store; track as
-`OPEN` / follow-up ticket when parity users need it.
+zigoku remains a **behavior and archaeology reference** (freeze rev), not a data
+dependency.
 
 ---
 
@@ -393,10 +442,11 @@ sabigoku starts a **new** ladder implementing §3 directly.
 
 Not a method-for-method port of `Store` in zigoku. Capabilities the TUI/sync need:
 
-- open/migrate/close (WAL, FKs, busy timeout)
-- upsert show enrichment by `anilist_id`
-- upsert user state (status, progress, rating, notes, visibility-of-engagement)
-- list history (engaged shows), get show, delete show (cascade)
+- open/migrate/close (WAL, FKs, busy timeout) on **sabigoku's own DB path only**
+- upsert / get **catalog_cache** by `anilist_id` (Browse/Discover/detail paint)
+- upsert show enrichment by `anilist_id`; promote from catalog_cache → show
+- upsert user state (status, progress, rating, notes)
+- list history (library `show` rows), get show, delete show (cascade)
 - bind / unbind provider; list bindings for show; lookup show by `(provider, provider_id)`
 - pin / clear pin; mark/check/clear absence; get/set route stamp
 - episode progress get/set/recompute-from-rows; episode cache get/set/invalidate
@@ -408,16 +458,22 @@ store work.
 
 ---
 
-## 8. Open questions
+## 8. Locked decisions (this pass)
+
+| ID | Decision |
+|---|---|
+| L1 | Episode equality = **identical label string**. Mismatch repair = future human-in-the-loop UX, not store logic (§3.4) |
+| L2 | **`catalog_cache` is required and durable** for Browse/Discover/detail metadata (§3.5) |
+| L3 | **No zigoku data plane.** Independent store; importer is a later standalone issue if ever (§3.6) |
+
+## 8b. Still open
 
 | ID | Question | Lean |
 |---|---|---|
-| O1 | Episode progress policy when provider labels disagree (§3.4) | Policy A until UX forces B/C |
-| O2 | Separate `catalog_cache` table vs pure ephemeral AniList responses | Ephemeral first; add cache if Discover needs offline |
 | O3 | Multi-cour: one AniList id per cour already; confirm no "franchise PK" | One row per AniList media id (`CLONE` AniList model) |
-| O4 | zigoku DB importer | Defer; new schema first |
 | O5 | `UNIQUE (provider, provider_id)` if a provider id can map to two AniList ids (rare wrong bind) | Keep UNIQUE; re-bind is delete+insert; log conflicts |
 | O6 | Whether `last_provider` on progress is worth storing | Optional audit column; not required for v1 |
+| O7 | catalog_cache TTL / eviction policy (size cap vs time) | Serve stale OK; refresh policy belongs with runtime (04) + AniList rate limits |
 
 ---
 
@@ -436,7 +492,9 @@ store work.
 
 - [ ] Can an implementer create a library entry without inventing a fake provider?
 - [ ] Can preferred-provider switch avoid rewriting user-state primary keys?
-- [ ] Is search pollution impossible by construction (no shared table)?
+- [ ] Is search pollution impossible by construction (`catalog_cache` ≠ `show`)?
+- [ ] Does detail-card paint have a durable cache path (no mandatory network on every open)?
 - [ ] Are pins/absences/routes clearly non-enrichment?
-- [ ] Is episode TEXT + show-scoped progress explicit about mismatch risk?
-- [ ] No leftover requirement to implement `SOURCE_UNBOUND` or `canonical_id` dual spine?
+- [ ] Is episode TEXT + string-equality progress locked, with mismatch deferred to UX?
+- [ ] No leftover requirement to implement `SOURCE_UNBOUND`, `canonical_id` dual spine, or zigoku DB open/import?
+
