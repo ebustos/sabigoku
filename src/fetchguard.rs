@@ -154,6 +154,7 @@ mod tests {
         assert!(private_v6("::2".parse().unwrap())); // ::/96 lands in 0/8
         assert!(!private_v6("2001:4860:4860::8888".parse().unwrap()));
         assert!(!private_v6("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(!private_v6("::8.8.8.8".parse().unwrap())); // compatible-form public
     }
 
     #[test]
