@@ -62,6 +62,10 @@ fn map_anime(s: SAnime) -> SearchHit {
         title_english: s.title_english,
         title_native: None, // senshi has no separate native field
         anilist_id: None,
+        // Real MAL ids are small positive ints; the u64->i64 cast only wraps
+        // for a hostile id > i64::MAX, and mal_id is a non-key match hint (02).
+        // Landmine for the future AniSkip caller: validate before splicing a
+        // wrapped-negative id into an external URL.
         mal_id: Some(s.id as i64),
         total_episodes: if is_still_airing(status.as_deref()) {
             None
@@ -108,22 +112,26 @@ struct SEp {
 }
 
 /// Parse /episodes into numerically-sorted labels. Pure over response bytes.
-/// Drops phantom ep 0: some shows list a prologue, but /episode-embeds rejects
-/// 0 with 400, so offering it only yields an unresolvable pick (ROD-301).
+/// Drops any non-finite or non-positive ep_id, not just 0: /episode-embeds
+/// rejects ep 0 with 400, and a hostile negative would otherwise mislabel to
+/// "0" and slip past `guard_ep_label` as that same unresolvable pick (ROD-301,
+/// ROD-441 review). This drop is the single gate; `ep_label` never sees a
+/// value it must reject.
 fn parse_episodes(raw: &[u8]) -> Result<Vec<String>, super::ProviderError> {
     let rows: Vec<SEp> = serde_json::from_slice(raw)
         .map_err(|e| super::ProviderError::Decode(format!("episodes: {e}")))?;
     let mut labels: Vec<String> = rows
         .into_iter()
-        .filter(|e| e.ep_id != 0.0)
+        .filter(|e| e.ep_id.is_finite() && e.ep_id > 0.0)
         .map(|e| ep_label(e.ep_id))
         .collect();
     labels.sort_by(|a, b| crate::domain::episode_label_cmp(a, b));
     Ok(labels)
 }
 
-/// Integral drops the decimal ("1"); fractional keeps it ("13.5"). Non-finite
-/// or negative → "0" (the phantom filtered out upstream).
+/// Integral drops the decimal ("1"); fractional keeps it ("13.5"). The
+/// non-finite/negative guard is defensive: `parse_episodes` already filters
+/// those out, so a live caller only ever passes a finite positive.
 fn ep_label(n: f64) -> String {
     if !n.is_finite() || n < 0.0 {
         return "0".to_string();
@@ -159,13 +167,23 @@ struct SubTrack {
 /// Best embed for the track (03 §8.2). Sub: SoftSub > HardSub > other sub; dub
 /// is separate and never matches a sub request. Returns the whole embed so the
 /// caller can follow `serverFM`. None when the track is not offered.
+///
+/// First-wins on a score tie (strict `>`, mirrors v0.4.7): two equal-scoring
+/// mirrors resolve to the earlier one, not `max_by_key`'s last.
 fn pick_embed(embeds: &[Embed], tt: Translation) -> Option<Embed> {
-    embeds
-        .iter()
-        .filter(|e| e.url.is_some())
-        .max_by_key(|e| match_score(e.status.as_deref(), tt))
-        .filter(|e| match_score(e.status.as_deref(), tt) > 0)
-        .cloned()
+    let mut best: Option<&Embed> = None;
+    let mut best_score = 0;
+    for e in embeds {
+        if e.url.is_none() {
+            continue;
+        }
+        let sc = match_score(e.status.as_deref(), tt);
+        if sc > best_score {
+            best_score = sc;
+            best = Some(e);
+        }
+    }
+    best.cloned()
 }
 
 /// Rank a status label for a track (0 = wrong track). Sub never matches Dub
@@ -337,7 +355,7 @@ impl Senshi {
 
     /// GET a CDN URL (master playlist, sidecar) with the stream referer. SSRF
     /// guarded, redirects refused (client-wide), 200-only.
-    fn cdn_get(&self, url: &str, deadline: Option<Duration>) -> Result<Vec<u8>, ProviderError> {
+    fn cdn_get(&self, url: &str) -> Result<Vec<u8>, ProviderError> {
         guard_fetch_url(url).map_err(|_| ProviderError::Decode("blocked url".into()))?;
         self.http.fetch(&Request {
             method: Method::Get,
@@ -346,14 +364,14 @@ impl Senshi {
             user_agent: UA,
             extra_headers: &[("Referer", STREAM_REFERER)],
             accept: Accept::OkOnly,
-            deadline,
+            deadline: None,
         })
     }
 
     /// Fetch the adaptive master and return the variant matching the quality
     /// cap, or None so resolve falls back to the master ladder.
     fn cap_variant(&self, master_url: &str, quality: Quality) -> Option<String> {
-        let body = self.cdn_get(master_url, None).ok()?;
+        let body = self.cdn_get(master_url).ok()?;
         let variants = super::hls::parse_master_playlist(&String::from_utf8_lossy(&body));
         if variants.is_empty() {
             return None; // media playlist: let mpv take the master
@@ -392,7 +410,7 @@ impl Senshi {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(SUB_RETRY_BACKOFFS_MS[attempt - 1]));
             }
-            if let Ok(body) = self.cdn_get(&info_url, None)
+            if let Ok(body) = self.cdn_get(&info_url)
                 && let Ok(parsed) = serde_json::from_slice::<Vec<SubTrack>>(&body)
             {
                 tracks = Some(parsed);
@@ -614,6 +632,7 @@ mod tests {
         assert_eq!(ep_label(1.0), "1");
         assert_eq!(ep_label(10.0), "10");
         assert_eq!(ep_label(13.5), "13.5");
+        // Defensive branch only; parse_episodes filters these before ep_label.
         assert_eq!(ep_label(f64::NAN), "0");
         assert_eq!(ep_label(-2.0), "0");
     }
@@ -624,6 +643,42 @@ mod tests {
             br#"[{"ep_id":3},{"ep_id":1},{"ep_id":0},{"ep_id":2},{"ep_id":1.5},{"ep_id":10}]"#;
         let eps = parse_episodes(raw).unwrap();
         assert_eq!(eps, ["1", "1.5", "2", "3", "10"]);
+    }
+
+    #[test]
+    fn parse_episodes_drops_hostile_negative_never_mislabels_to_zero() {
+        // A negative ep_id must be dropped at the source, not coerced to "0"
+        // (which would pass guard_ep_label and then 400 at resolve). Pins the
+        // ROD-441 review regression: the drop, not ep_label, is the gate.
+        let raw = br#"[{"ep_id":-5},{"ep_id":2},{"ep_id":-0.5}]"#;
+        let eps = parse_episodes(raw).unwrap();
+        assert_eq!(eps, ["2"]);
+        assert!(!eps.iter().any(|e| e == "0"));
+    }
+
+    #[test]
+    fn pick_embed_first_wins_on_a_score_tie() {
+        // Two SoftSub mirrors (equal score): the earlier one wins, matching
+        // v0.4.7's strict-greater fold, not max_by_key's last.
+        let embeds = [
+            Embed {
+                url: Some("first".into()),
+                status: Some("SoftSub".into()),
+                server_fm: None,
+            },
+            Embed {
+                url: Some("second".into()),
+                status: Some("SoftSub".into()),
+                server_fm: None,
+            },
+        ];
+        assert_eq!(
+            pick_embed(&embeds, Translation::Sub)
+                .unwrap()
+                .url
+                .as_deref(),
+            Some("first")
+        );
     }
 
     #[test]
@@ -861,5 +916,49 @@ mod tests {
             ..Enrichment::default()
         };
         assert_eq!(p.canonical_key(&no_mal), None);
+    }
+
+    #[test]
+    fn transport_resolve_builds_a_streamlink_from_an_embed() {
+        // Best quality skips cap_variant; a dub request skips the softsub
+        // sidecar, so resolve makes exactly one hop (the one-shot server).
+        let embeds = br#"[{"url":"https://cdn.test/master.m3u8","status":"HardSub"},{"url":"https://cdn.test/dub.m3u8","status":"Dub"}]"#;
+        let p = against(response_with_body("200 OK", embeds));
+        let sl = p
+            .resolve("59708", "1", Translation::Dub, Quality::Best)
+            .unwrap();
+        assert_eq!(sl.url, "https://cdn.test/dub.m3u8");
+        assert!(sl.cloaked_segments);
+        assert_eq!(sl.referer.as_deref(), Some(STREAM_REFERER));
+        assert_eq!(sl.user_agent.as_deref(), Some(UA));
+        assert_eq!(sl.sub_url, None);
+    }
+
+    #[test]
+    fn transport_resolve_track_miss_is_a_clean_error() {
+        // Only a dub embed offered, but sub requested: a clean miss, not a
+        // transport failure, and no subtitle fetch fires.
+        let embeds = br#"[{"url":"https://cdn.test/dub.m3u8","status":"Dub"}]"#;
+        let p = against(response_with_body("200 OK", embeds));
+        let got = p.resolve("59708", "1", Translation::Sub, Quality::Best);
+        assert!(matches!(got, Err(ProviderError::Decode(_))));
+    }
+
+    #[test]
+    fn transport_resolve_rejects_a_non_absolute_embed_url() {
+        // Embed url enters mpv argv: a scheme-less url must not reach it.
+        let embeds = br#"[{"url":"//cdn.test/x.m3u8","status":"SoftSub"}]"#;
+        let p = against(response_with_body("200 OK", embeds));
+        let got = p.resolve("59708", "1", Translation::Sub, Quality::Best);
+        assert!(matches!(got, Err(ProviderError::Decode(_))));
+    }
+
+    #[test]
+    fn resolve_guards_a_bad_episode_label_before_any_fetch() {
+        let p = Senshi::new().unwrap();
+        assert!(matches!(
+            p.resolve("59708", "1.2.3", Translation::Sub, Quality::Best),
+            Err(ProviderError::Decode(_))
+        ));
     }
 }
