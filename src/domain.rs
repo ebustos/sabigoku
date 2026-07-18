@@ -654,6 +654,18 @@ mod tests {
     }
 
     #[test]
+    fn current_cour_pre_epoch_clamps_to_1970_winter() {
+        let c = current_cour(-1);
+        assert_eq!(
+            c,
+            Cour {
+                season: Season::Winter,
+                year: 1970
+            }
+        );
+    }
+
+    #[test]
     fn current_cour_january_stays_in_its_year() {
         // 2026-01-05
         let c = current_cour(1_767_571_200);

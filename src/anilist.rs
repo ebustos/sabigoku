@@ -89,8 +89,10 @@ fn by_id_body(anilist_id: i64) -> serde_json::Value {
     json!({ "query": by_id_query(), "variables": { "id": anilist_id } })
 }
 
-// Response DTOs. Every field tolerates null AND missing: a partial record must
-// degrade to sparse Enrichment, never fail the whole page.
+// Response DTOs. Fields tolerate null and missing keys (sparse records map to
+// sparse Enrichment). A wrong-typed field still fails the whole page: freeze
+// parity, any unparseable body is one no-answer. Per-entry salvage is an OPEN
+// on the ticket, not a silent upgrade.
 
 #[derive(Deserialize)]
 struct GqlPageResp {
@@ -265,13 +267,21 @@ fn select_rank(rankings: &[GqlRanking]) -> Option<SelectedRank> {
     })
 }
 
-/// Drop C0 + DEL from AniList free text before it can reach terminal cells
-/// (ROD-247). Explicit defense, not left to the render layer.
+/// Drop terminal-hostile codepoints from AniList free text before they can
+/// reach terminal cells: C0 + DEL (ROD-247 CLONE) plus C1, bidi overrides,
+/// and zero-width chars (ratified ROD-435 widening; zigoku left those open
+/// and a TUI has no legitimate use for any of them in metadata).
 fn strip_controls(s: String) -> String {
-    if s.bytes().any(|b| b < 0x20 || b == 0x7F) {
-        s.chars()
-            .filter(|&c| c >= '\u{20}' && c != '\u{7F}')
-            .collect()
+    fn banned(c: char) -> bool {
+        c < '\u{20}'
+            || ('\u{7F}'..='\u{9F}').contains(&c)
+            || ('\u{202A}'..='\u{202E}').contains(&c)
+            || ('\u{2066}'..='\u{2069}').contains(&c)
+            || ('\u{200B}'..='\u{200D}').contains(&c)
+            || c == '\u{FEFF}'
+    }
+    if s.chars().any(banned) {
+        s.chars().filter(|&c| !banned(c)).collect()
     } else {
         s
     }
@@ -348,7 +358,7 @@ fn media_to_enrichment(m: GqlMedia) -> Enrichment {
         title_romaji: strip_controls_opt(title.romaji).unwrap_or_default(),
         title_english: strip_controls_opt(title.english),
         title_native: strip_controls_opt(title.native),
-        cover_url: m.cover_image.and_then(|c| c.large),
+        cover_url: m.cover_image.and_then(|c| c.large).map(strip_controls),
         total_episodes: m.episodes,
         duration_minutes: m.duration,
         year: m.season_year,
@@ -427,21 +437,30 @@ fn classify_by_id(raw: &[u8]) -> Result<Option<Enrichment>, CatalogError> {
 
 pub struct AniList {
     http: reqwest::blocking::Client,
+    endpoint: String,
 }
 
 impl AniList {
     pub fn new() -> Result<AniList, CatalogError> {
+        AniList::with_endpoint(ENDPOINT.to_string())
+    }
+
+    fn with_endpoint(endpoint: String) -> Result<AniList, CatalogError> {
+        // Redirects off: a GraphQL POST to the fixed endpoint has no business
+        // redirecting, and following one would hand the request (downgraded
+        // to GET by reqwest) to whatever host Location names.
         let http = reqwest::blocking::Client::builder()
             .timeout(DEADLINE)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| CatalogError::Network)?;
-        Ok(AniList { http })
+        Ok(AniList { http, endpoint })
     }
 
     fn post(&self, body: serde_json::Value) -> Result<Vec<u8>, CatalogError> {
         let resp = self
             .http
-            .post(ENDPOINT)
+            .post(&self.endpoint)
             .header("Accept", "application/json")
             .json(&body)
             .send()
@@ -687,5 +706,74 @@ mod tests {
             strip_controls("葬送のフリーレン".into()),
             "葬送のフリーレン"
         );
+    }
+
+    #[test]
+    fn strip_controls_drops_c1_bidi_and_zero_width() {
+        assert_eq!(strip_controls("a\u{85}b\u{9F}c".into()), "abc");
+        assert_eq!(
+            strip_controls("title \u{202E}reversed".into()),
+            "title reversed"
+        );
+        assert_eq!(strip_controls("a\u{2066}b\u{2069}c".into()), "abc");
+        assert_eq!(strip_controls("a\u{200B}b\u{FEFF}c".into()), "abc");
+    }
+
+    /// One-shot HTTP responder; drains the request, writes `response`, closes.
+    fn serve_once(response: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let _ = std::io::Write::write_all(&mut sock, &response);
+        });
+        format!("http://{addr}/")
+    }
+
+    fn response_with_body(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut r = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    fn post_against(response: Vec<u8>) -> Result<Vec<u8>, CatalogError> {
+        let client = AniList::with_endpoint(serve_once(response)).unwrap();
+        client.post(json!({"query": "{}"}))
+    }
+
+    #[test]
+    fn transport_429_is_rate_limited() {
+        let got = post_against(response_with_body("429 Too Many Requests", b"{}"));
+        assert!(matches!(got, Err(CatalogError::RateLimited)));
+    }
+
+    #[test]
+    fn transport_non_success_is_http_status() {
+        let got = post_against(response_with_body("500 Internal Server Error", b"{}"));
+        assert!(matches!(got, Err(CatalogError::Http { status: 500 })));
+    }
+
+    #[test]
+    fn transport_redirect_is_refused_not_followed() {
+        let redirect = b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let got = post_against(redirect);
+        assert!(matches!(got, Err(CatalogError::Http { status: 302 })));
+    }
+
+    #[test]
+    fn transport_body_at_cap_is_accepted_one_over_is_refused() {
+        let at_cap = vec![b'x'; MAX_RESPONSE_BYTES as usize];
+        let got = post_against(response_with_body("200 OK", &at_cap)).unwrap();
+        assert_eq!(got.len() as u64, MAX_RESPONSE_BYTES);
+
+        let over = vec![b'x'; MAX_RESPONSE_BYTES as usize + 1];
+        let got = post_against(response_with_body("200 OK", &over));
+        assert!(matches!(got, Err(CatalogError::Decode(_))));
     }
 }

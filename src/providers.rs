@@ -164,16 +164,10 @@ impl ProviderRegistry {
         out
     }
 
+    /// Construction-order walk; the tier-C sweep and prewarm candidates in
+    /// ROD-436 consume this.
     pub fn iter(&self) -> impl Iterator<Item = &dyn StreamProvider> {
         self.providers.iter().map(|p| p.as_ref())
-    }
-
-    pub fn len(&self) -> usize {
-        self.providers.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
     }
 }
 
@@ -350,6 +344,15 @@ mod tests {
         let reg = registry();
         assert_eq!(
             names(&reg.ordered(Some("megaplay"))),
+            vec!["megaplay", "senshi", "allanime"]
+        );
+    }
+
+    #[test]
+    fn iter_walks_construction_order() {
+        let reg = registry();
+        assert_eq!(
+            reg.iter().map(|p| p.name()).collect::<Vec<_>>(),
             vec!["megaplay", "senshi", "allanime"]
         );
     }
