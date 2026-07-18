@@ -152,7 +152,8 @@ pub fn open_history(world: &dyn ResolveWorld, rec: &HistoryRecord) -> HistoryOpe
                 return HistoryOpen::PinBinding { provider: pin, id };
             }
         } else {
-            let routed = route_preferred(world, aid, rec.canonical);
+            debug_assert_eq!(aid, rec.canonical.anilist_id);
+            let routed = route_preferred(world, rec.canonical);
             if !matches!(routed.action, RouteAction::None) {
                 return HistoryOpen::Routed(routed);
             }
@@ -198,11 +199,12 @@ pub enum RouteAction {
 /// (returns `None`). When the show already settled under the live pref, its
 /// binding opens directly with no re-stamp. When stale or never settled, the
 /// pref is forced once through its own tier 0 / A / C, stamping first.
-pub fn route_preferred(
-    world: &dyn ResolveWorld,
-    anilist_id: i64,
-    canonical: &Enrichment,
-) -> RouteOutcome {
+pub fn route_preferred(world: &dyn ResolveWorld, canonical: &Enrichment) -> RouteOutcome {
+    // Single-source the id from the canonical. A separate id parameter would
+    // let the stamp/lookups run under one show while the forced Walk (which
+    // reads canonical.anilist_id) runs under another, minting a binding on the
+    // wrong show (ROD-436 review).
+    let anilist_id = canonical.anilist_id;
     let none = RouteOutcome {
         stamp: None,
         action: RouteAction::None,
@@ -340,6 +342,11 @@ impl Walk {
 
     /// Path 3 manual pin flip (03 §5.3): single-provider walk on the target,
     /// probing through fresh absence. A miss keeps the pin.
+    ///
+    /// PRECONDITION: `target` must be a live registry name. Unlike
+    /// `route_preferred`, this takes no world and cannot check `registered`, so
+    /// the caller (the `v`-flip UI, ROD-437) must only pass providers the
+    /// registry offers, or `advance` will search a name the store cannot key.
     pub fn pin_flip(canonical: Enrichment, target: String) -> Walk {
         let anilist_id = canonical.anilist_id;
         Walk {
@@ -364,6 +371,7 @@ impl Walk {
     ) -> Walk {
         let anilist_id = canonical.anilist_id;
         let providers = world.ordered(effective_pref(world, anilist_id).as_deref());
+        debug_assert!(providers.len() <= MAX_TRACKED_PROVIDERS);
         let tried = mark(&providers, failed_provider);
         Walk {
             canonical,
@@ -382,6 +390,14 @@ impl Walk {
         self.origin
     }
 
+    /// Skip-mask read that can never overflow the shift. A provider past
+    /// `MAX_TRACKED_PROVIDERS` is simply not skip-tracked (visited rather than
+    /// aliased onto an earlier bit); the constructors `debug_assert` the
+    /// registry stays within range, so this only degrades in an absurd build.
+    fn is_tried(&self, idx: usize) -> bool {
+        idx < MAX_TRACKED_PROVIDERS && self.tried & (1 << idx) != 0
+    }
+
     /// Advance one hop, or report why the walk exhausted. Per hop (03 §6.4):
     /// a bound id fetches; else fresh absence is skipped (unless manual); else
     /// a tier-A key fetches (minting on success); else a tier-C search. A K-2
@@ -390,7 +406,7 @@ impl Walk {
         if self.bindings_first && !self.swept_bindings {
             self.swept_bindings = true;
             for (i, p) in self.providers.iter().enumerate() {
-                if self.tried & (1 << i) != 0 {
+                if self.is_tried(i) {
                     continue;
                 }
                 if let Some(id) = world.binding(self.anilist_id, p) {
@@ -406,7 +422,7 @@ impl Walk {
         while self.next < self.providers.len() {
             let idx = self.next;
             self.next += 1;
-            if self.tried & (1 << idx) != 0 {
+            if self.is_tried(idx) {
                 continue;
             }
             let p = &self.providers[idx];
@@ -444,6 +460,7 @@ impl Walk {
             WalkOrigin::ForcedPreferred => {
                 let pref = self.providers.first().map(String::as_str);
                 let providers = world.ordered(pref);
+                debug_assert!(providers.len() <= MAX_TRACKED_PROVIDERS);
                 let tried = mark(&providers, pref);
                 Exhausted::Continue(Box::new(Walk {
                     canonical: self.canonical.clone(),
@@ -463,12 +480,17 @@ impl Walk {
     }
 }
 
-/// Bit mask of `providers` positions equal to `name` (by stable name). Refuses
-/// to mark past 64 providers by construction (the registry is a handful).
+/// Providers beyond this cannot be tracked in the u64 skip mask. The registry
+/// is a handful (3 at freeze), so this is a sanity ceiling the constructors
+/// `debug_assert`, not a real limit; `Walk::is_tried` degrades safely past it.
+const MAX_TRACKED_PROVIDERS: usize = 64;
+
+/// Bit mask of `providers` positions equal to `name` (by stable name). Capped
+/// at `MAX_TRACKED_PROVIDERS` so the shift cannot overflow.
 fn mark(providers: &[String], name: Option<&str>) -> u64 {
     let Some(name) = name else { return 0 };
     let mut m = 0u64;
-    for (i, p) in providers.iter().enumerate().take(64) {
+    for (i, p) in providers.iter().enumerate().take(MAX_TRACKED_PROVIDERS) {
         if p == name {
             m |= 1 << i;
         }
@@ -749,11 +771,11 @@ mod tests {
     fn route_pin_and_empty_pref_are_noops() {
         let c = canon(1);
         assert_eq!(
-            route_preferred(&FakeWorld::new(&REG), 1, &c).action,
+            route_preferred(&FakeWorld::new(&REG), &c).action,
             RouteAction::None
         );
         let pinned = FakeWorld::new(&REG).global("senshi").pin(1, "megaplay");
-        assert_eq!(route_preferred(&pinned, 1, &c).action, RouteAction::None);
+        assert_eq!(route_preferred(&pinned, &c).action, RouteAction::None);
     }
 
     #[test]
@@ -763,7 +785,7 @@ mod tests {
             .global("senshi")
             .route(1, "senshi")
             .bind(1, "senshi", "s-id");
-        let o = route_preferred(&w, 1, &c);
+        let o = route_preferred(&w, &c);
         assert_eq!(o.stamp, None);
         assert_eq!(
             o.action,
@@ -775,7 +797,7 @@ mod tests {
 
         // Settled but pref never bound: no route, caller opens existing state.
         let unbound = FakeWorld::new(&REG).global("senshi").route(1, "senshi");
-        assert_eq!(route_preferred(&unbound, 1, &c).action, RouteAction::None);
+        assert_eq!(route_preferred(&unbound, &c).action, RouteAction::None);
     }
 
     #[test]
@@ -786,7 +808,7 @@ mod tests {
             .global("senshi")
             .route(1, "megaplay")
             .key("senshi", 1, "s-key");
-        let o = route_preferred(&w, 1, &c);
+        let o = route_preferred(&w, &c);
         assert_eq!(
             o.stamp.as_deref(),
             Some("senshi"),
@@ -806,7 +828,7 @@ mod tests {
     fn route_stale_retired_pref_does_not_force() {
         let c = canon(1);
         let w = FakeWorld::new(&REG).global("gogo"); // not in registry
-        assert_eq!(route_preferred(&w, 1, &c).action, RouteAction::None);
+        assert_eq!(route_preferred(&w, &c).action, RouteAction::None);
     }
 
     #[test]
@@ -816,7 +838,7 @@ mod tests {
         // does not force forever.
         let c = canon(1);
         let mut w = FakeWorld::new(&REG).global("senshi"); // no binding, no key
-        let first = route_preferred(&w, 1, &c);
+        let first = route_preferred(&w, &c);
         assert_eq!(first.stamp.as_deref(), Some("senshi"));
         assert!(matches!(first.action, RouteAction::Walk(_)));
 
@@ -824,7 +846,7 @@ mod tests {
         w.routes.insert(1, "senshi".to_string());
         // Second open: settled under the live pref, pref still unbound → no
         // forcing, no walk. The loop is broken.
-        assert_eq!(route_preferred(&w, 1, &c).action, RouteAction::None);
+        assert_eq!(route_preferred(&w, &c).action, RouteAction::None);
     }
 
     // ── the walk + K-2 law ──────────────────────────────────────────────────
@@ -895,7 +917,7 @@ mod tests {
             .global("senshi")
             .bind(1, "allanime", "aa-id");
         // route_preferred forces a single-provider senshi walk (no binding, no key).
-        let RouteAction::Walk(mut walk) = route_preferred(&w, 1, &c).action else {
+        let RouteAction::Walk(mut walk) = route_preferred(&w, &c).action else {
             panic!("expected forced walk");
         };
         assert_eq!(walk.origin(), WalkOrigin::ForcedPreferred);
@@ -934,7 +956,7 @@ mod tests {
             .global("senshi")
             .absent(1, "megaplay")
             .key("allanime", 1, "aa-key");
-        let RouteAction::Walk(mut walk) = route_preferred(&w, 1, &c).action else {
+        let RouteAction::Walk(mut walk) = route_preferred(&w, &c).action else {
             panic!("expected forced walk");
         };
         assert_eq!(
@@ -992,5 +1014,30 @@ mod tests {
                 anilist_id: 1
             })
         );
+    }
+
+    #[test]
+    fn walk_bitmask_is_overflow_safe_at_the_registry_ceiling() {
+        // Walking the full 64-provider ceiling must not overflow the shift
+        // (ROD-436 review: the old `1 << idx` panicked in debug / aliased in
+        // release past index 63). p0 is pre-tried; the rest search-miss.
+        let names: Vec<String> = (0..MAX_TRACKED_PROVIDERS)
+            .map(|i| format!("p{i}"))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let w = FakeWorld::new(&refs);
+        let mut walk = Walk::fallback(&w, canon(1), Some("p0"));
+        let mut hops = 0;
+        loop {
+            match walk.advance(&w) {
+                Ok(_) => hops += 1,
+                Err(Exhausted::DeadEnd) => break,
+                Err(other) => panic!("unexpected exhaust: {other:?}"),
+            }
+        }
+        assert_eq!(hops, MAX_TRACKED_PROVIDERS - 1); // all but the pre-tried p0
+        // The skip mask short-circuits past the ceiling instead of shifting.
+        assert!(!walk.is_tried(MAX_TRACKED_PROVIDERS));
+        assert!(!walk.is_tried(1_000));
     }
 }

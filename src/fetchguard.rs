@@ -50,9 +50,12 @@ pub fn guard_fetch_url(raw: &str) -> Result<(), GuardError> {
     }
 }
 
-/// IPv4 spelling that survived host parsing as a domain (`0x` prefix or
-/// all-numeric dotted labels). One resolver quirk away from being an address,
-/// and no real hostname looks like this.
+/// IPv4 spelling that reached the `Host::Domain` arm instead of parsing as an
+/// address. The `url` crate's WHATWG host parser already canonicalizes
+/// `2130706433`, `0x7f000001`, `127.1` to `Host::Ipv4` upstream, so this is
+/// defense-in-depth against a future parser change, not the live guard (that
+/// is the `Host::Ipv4` match). The `0x` prefix arm is the one still reachable
+/// today, via malformed hex like `0x7g` that stays a domain.
 fn numeric_spelling(domain: &str) -> bool {
     if domain.len() >= 2 && (domain.starts_with("0x") || domain.starts_with("0X")) {
         return true;
@@ -93,7 +96,13 @@ fn private_v6(ip: Ipv6Addr) -> bool {
     if (s[0] & 0xfe00) == 0xfc00 {
         return true;
     }
-    if let Some(v4) = ip.to_ipv4_mapped() {
+    // Deliberate widen past freeze (ratified ROD-436, backport owed): `to_ipv4`
+    // covers BOTH the mapped `::ffff:a.b.c.d` and the legacy IPv4-compatible
+    // `::a.b.c.d` forms. zigoku checks only the mapped prefix, so
+    // `::169.254.169.254` reaches cloud metadata there; here it recurses into
+    // the v4 denylist. The `::/96` range (`::`..`::ff`) also lands in `0/8`,
+    // which `private_v4` blocks.
+    if let Some(v4) = ip.to_ipv4() {
         return private_v4(v4);
     }
     false
@@ -137,6 +146,12 @@ mod tests {
         assert!(private_v6("fd00::1".parse().unwrap()));
         assert!(private_v6("fc00::1".parse().unwrap()));
         assert!(private_v6("::ffff:127.0.0.1".parse().unwrap()));
+        // IPv4-compatible `::a.b.c.d` (widen past freeze, ROD-436): the legacy
+        // form, distinct from the `::ffff:` mapped form above.
+        assert!(private_v6("::127.0.0.1".parse().unwrap()));
+        assert!(private_v6("::169.254.169.254".parse().unwrap()));
+        assert!(private_v6("::10.0.0.1".parse().unwrap()));
+        assert!(private_v6("::2".parse().unwrap())); // ::/96 lands in 0/8
         assert!(!private_v6("2001:4860:4860::8888".parse().unwrap()));
         assert!(!private_v6("::ffff:8.8.8.8".parse().unwrap()));
     }
@@ -166,6 +181,8 @@ mod tests {
             "http://[::1]/x",
             "http://[fe80::1]/x",
             "http://10.0.0.5/x",
+            "http://[::169.254.169.254]/latest/meta-data/",
+            "http://[::127.0.0.1]/x",
         ] {
             assert_eq!(
                 guard_fetch_url(blocked),

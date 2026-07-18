@@ -155,9 +155,12 @@ struct SResp {
 /// letters are size/kind; digits are the id. None for the MAL CDN (~13%) and
 /// unknown shapes (caller falls back to title match).
 ///
-/// TRUST: assumes the thumb truthfully names the show. Same trust as
-/// title/streams; the id is a claim into tier B, and the resolver's mis-stamp
-/// veto is the guard.
+/// TRUST: assumes the thumb truthfully names the show. The mined id is only a
+/// tier-B claim; `best_id_match`'s contradiction veto (eps/year) catches an
+/// ACCIDENTAL mis-stamp, but a fully hostile source that forges a thumb naming
+/// the victim id AND matching eps/year clears the veto (no title floor on tier
+/// B by design, ROD-342). That is the provider trust model, freeze-parity: a
+/// compromised allanime can already mis-serve streams. Documented, not closed.
 fn anilist_id_from_thumb(url: Option<&str>) -> Option<i64> {
     let url = url?;
     if !url.contains("anilistcdn/media/anime/cover/") {
