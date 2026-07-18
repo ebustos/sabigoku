@@ -7,6 +7,7 @@
 pub mod allanime;
 pub mod hls;
 pub mod http;
+pub mod senshi;
 
 use crate::domain::{Enrichment, Quality, StreamLink, Translation};
 
