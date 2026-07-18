@@ -62,10 +62,8 @@ fn map_anime(s: SAnime) -> SearchHit {
         title_english: s.title_english,
         title_native: None, // senshi has no separate native field
         anilist_id: None,
-        // Real MAL ids are small positive ints; the u64->i64 cast only wraps
-        // for a hostile id > i64::MAX, and mal_id is a non-key match hint (02).
-        // Landmine for the future AniSkip caller: validate before splicing a
-        // wrapped-negative id into an external URL.
+        // u64->i64 wraps only for a hostile id > i64::MAX; mal_id is a non-key
+        // hint (02), but the AniSkip caller must validate before URL-splicing.
         mal_id: Some(s.id as i64),
         total_episodes: if is_still_airing(status.as_deref()) {
             None
