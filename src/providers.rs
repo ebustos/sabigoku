@@ -4,6 +4,8 @@
 //! single provider with a seam. Imports domain (+ own http helpers); NEVER
 //! tui or store (01 §5, keeps backends testable offline).
 
+pub mod http;
+
 use crate::domain::{Enrichment, Quality, StreamLink, Translation};
 
 /// Full page for Browse search and provider tier-C pagination (03 §2.1, ROD-201).
