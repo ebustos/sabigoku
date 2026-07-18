@@ -26,8 +26,9 @@ const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MEDIA_FIELDS: &str = "id idMal title{romaji english native} episodes duration averageScore status season seasonYear startDate{year month day} format source countryOfOrigin genres studios(isMain:true){nodes{name}} rankings{rank type year allTime} nextAiringEpisode{episode airingAt} description(asHtml:false) coverImage{large}";
 
 fn search_query() -> String {
-    // pageInfo is a port adaptation: sabigoku Browse load-more is AniList-fed
-    // (zigoku's was provider-fed), so search needs hasNextPage too.
+    // pageInfo is a port adaptation: zigoku search load-more gates next-page
+    // on the short-page heuristic (len % 26); explicit hasNextPage matches
+    // the discover exhaustion law (ROD-336) instead.
     format!(
         "query($search:String!,$perPage:Int!,$page:Int!){{Page(page:$page,perPage:$perPage){{pageInfo{{hasNextPage}} media(search:$search,type:ANIME,sort:SEARCH_MATCH){{{MEDIA_FIELDS}}}}}}}"
     )
@@ -108,9 +109,7 @@ struct GqlPageData {
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct GqlPage {
-    #[serde(default)]
     page_info: Option<GqlPageInfo>,
-    #[serde(default)]
     media: Option<Vec<GqlMedia>>,
 }
 
@@ -136,73 +135,47 @@ struct GqlMediaData {
 #[serde(rename_all = "camelCase")]
 struct GqlMedia {
     id: i64,
-    #[serde(default)]
     id_mal: Option<i64>,
-    #[serde(default)]
     title: Option<GqlTitle>,
-    #[serde(default)]
     episodes: Option<u32>,
-    #[serde(default)]
     duration: Option<u32>,
-    #[serde(default)]
     average_score: Option<u32>,
-    #[serde(default)]
     status: Option<String>,
-    #[serde(default)]
     season: Option<String>,
-    #[serde(default)]
     season_year: Option<u32>,
-    #[serde(default)]
     start_date: Option<GqlStartDate>,
-    #[serde(default)]
     format: Option<String>,
-    #[serde(default)]
     source: Option<String>,
-    #[serde(default)]
     country_of_origin: Option<String>,
-    #[serde(default)]
     genres: Option<Vec<Option<String>>>,
-    #[serde(default)]
     studios: Option<GqlStudios>,
-    #[serde(default)]
     rankings: Option<Vec<GqlRanking>>,
-    #[serde(default)]
     next_airing_episode: Option<GqlNextAiring>,
-    #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
     cover_image: Option<GqlCoverImage>,
 }
 
 #[derive(Deserialize, Default)]
 struct GqlTitle {
-    #[serde(default)]
     romaji: Option<String>,
-    #[serde(default)]
     english: Option<String>,
-    #[serde(default)]
     native: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct GqlStartDate {
-    #[serde(default)]
     year: Option<u32>,
-    #[serde(default)]
     month: Option<u32>,
-    #[serde(default)]
     day: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
 struct GqlStudios {
-    #[serde(default)]
     nodes: Option<Vec<GqlStudioNode>>,
 }
 
 #[derive(Deserialize)]
 struct GqlStudioNode {
-    #[serde(default)]
     name: Option<String>,
 }
 
@@ -211,9 +184,8 @@ struct GqlStudioNode {
 struct GqlRanking {
     #[serde(default)]
     rank: u32,
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type")]
     kind: Option<String>,
-    #[serde(default)]
     year: Option<u32>,
     #[serde(default)]
     all_time: bool,
@@ -222,15 +194,12 @@ struct GqlRanking {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GqlNextAiring {
-    #[serde(default)]
     episode: Option<u32>,
-    #[serde(default)]
     airing_at: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
 struct GqlCoverImage {
-    #[serde(default)]
     large: Option<String>,
 }
 
@@ -265,6 +234,80 @@ fn select_rank(rankings: &[GqlRanking]) -> Option<SelectedRank> {
         kind: b.kind.clone(),
         year: if b.all_time { None } else { b.year },
     })
+}
+
+/// Fuzzy title score (higher = closer; large negative = no overlap).
+/// Normalizes then folds season forms. Shared with resolver tier C (ROD-328)
+/// so both match directions use one rule.
+pub(crate) fn title_score(a: &str, b: Option<&str>) -> i32 {
+    let Some(b) = b else { return -5000 };
+    if a.is_empty() || b.is_empty() {
+        return -5000;
+    }
+    let na = canon_season(&normalize_title(a));
+    let nb = canon_season(&normalize_title(b));
+    if na.is_empty() || nb.is_empty() {
+        return -5000;
+    }
+    if na == nb {
+        return 1600;
+    }
+    if nb.starts_with(&na) || na.starts_with(&nb) {
+        return 1250;
+    }
+    if nb.contains(na.as_str()) || na.contains(nb.as_str()) {
+        return 900;
+    }
+    -5000
+}
+
+/// Explicit "Season N" / "Nth Season" in a normalized title → `s<N>`
+/// (ROD-181). Bare trailing numbers untouched ("86", "Ranma 1/2"); "season"
+/// with no adjacent number is left alone.
+fn canon_season(s: &str) -> String {
+    let Some(idx) = s.find("season") else {
+        return s.to_string();
+    };
+    let before = &s[..idx];
+    let after = &s[idx + "season".len()..];
+
+    // Form A: digits directly after the keyword ("season2").
+    let dlen = after.bytes().take_while(u8::is_ascii_digit).count();
+    let (base_pre, num, tail) = if dlen > 0 {
+        (before, &after[..dlen], &after[dlen..])
+    } else {
+        // Form B: digits (+ ordinal) directly before the keyword ("2ndseason").
+        let mut b = before;
+        for ord in ["st", "nd", "rd", "th"] {
+            if let Some(stripped) = b.strip_suffix(ord) {
+                b = stripped;
+                break;
+            }
+        }
+        let digits = b.bytes().rev().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return s.to_string();
+        }
+        let dstart = b.len() - digits;
+        (&b[..dstart], &b[dstart..], after)
+    };
+    format!("{base_pre}s{num}{tail}")
+}
+
+/// ASCII: keep alphanumerics lowercased, drop the rest. Non-ASCII bytes pass
+/// verbatim, so multi-byte sequences stay intact.
+fn normalize_title(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    for &c in s.as_bytes() {
+        if c < 0x80 {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    String::from_utf8(out).expect("removing whole ascii bytes keeps utf-8 valid")
 }
 
 /// Drop terminal-hostile codepoints from AniList free text before they can
@@ -719,28 +762,52 @@ mod tests {
         assert_eq!(strip_controls("a\u{200B}b\u{FEFF}c".into()), "abc");
     }
 
-    /// One-shot HTTP responder; drains the request, writes `response`, closes.
-    fn serve_once(response: Vec<u8>) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 8192];
-            let _ = std::io::Read::read(&mut sock, &mut buf);
-            let _ = std::io::Write::write_all(&mut sock, &response);
-        });
-        format!("http://{addr}/")
+    #[test]
+    fn title_score_prefers_exact_over_prefix_over_substring() {
+        assert!(
+            title_score("Frieren", Some("Frieren"))
+                > title_score("Frieren", Some("Frieren Season 2"))
+        );
+        assert!(
+            title_score("Frieren", Some("Frieren Season 2"))
+                > title_score("Frieren", Some("The World of Frieren"))
+        );
+        assert_eq!(title_score("Frieren", None), -5000);
+        assert_eq!(title_score("", Some("Frieren")), -5000);
+        assert_eq!(title_score("Frieren", Some("Naruto")), -5000);
     }
 
-    fn response_with_body(status: &str, body: &[u8]) -> Vec<u8> {
-        let mut r = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        r.extend_from_slice(body);
-        r
+    #[test]
+    fn canon_season_reconciles_season_forms_leaves_the_rest() {
+        assert_eq!(canon_season("frierenseason2"), "frierens2");
+        assert_eq!(canon_season("frieren2ndseason"), "frierens2");
+        assert_eq!(canon_season("k3rdseason"), "ks3");
+        assert_eq!(canon_season("title2season"), "titles2");
+        assert_eq!(canon_season("frieren"), "frieren");
+        assert_eq!(canon_season("loghorizon2"), "loghorizon2");
+        assert_eq!(canon_season("seasonsoflife"), "seasonsoflife");
     }
+
+    #[test]
+    fn title_score_reconciles_season_n_vs_nth_season() {
+        assert_eq!(
+            title_score(
+                "Sousou no Frieren Season 2",
+                Some("Sousou no Frieren 2nd Season")
+            ),
+            1600
+        );
+        assert!(title_score("Frieren Season 2", Some("Frieren")) < 1600);
+    }
+
+    #[test]
+    fn normalize_title_lowercases_ascii_keeps_unicode() {
+        assert_eq!(normalize_title("Re:Zero 2nd Season"), "rezero2ndseason");
+        assert_eq!(normalize_title("葬送のフリーレン"), "葬送のフリーレン");
+        assert_eq!(normalize_title("  !!  "), "");
+    }
+
+    use crate::testutil::{response_with_body, serve_once};
 
     fn post_against(response: Vec<u8>) -> Result<Vec<u8>, CatalogError> {
         let client = AniList::with_endpoint(serve_once(response)).unwrap();

@@ -5,12 +5,15 @@ pub mod anilist;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod fetchguard;
 pub mod paths;
 pub mod player;
 pub mod providers;
 pub mod resolve;
 pub mod resolver;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod tui;
 
 pub use error::Error;

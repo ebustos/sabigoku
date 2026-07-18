@@ -4,6 +4,10 @@
 //! single provider with a seam. Imports domain (+ own http helpers); NEVER
 //! tui or store (01 §5, keeps backends testable offline).
 
+pub mod allanime;
+pub mod hls;
+pub mod http;
+
 use crate::domain::{Enrichment, Quality, StreamLink, Translation};
 
 /// Full page for Browse search and provider tier-C pagination (03 §2.1, ROD-201).
@@ -55,15 +59,21 @@ pub struct SearchOptions {
     pub page: u32,
 }
 
-/// Tier-C candidate. Ids and totals feed the tier-B/C scorers (03 §4.2);
-/// they are provider claims, not truth.
-#[derive(Debug, Clone, PartialEq)]
+/// Tier-C candidate. Ids, titles, and counts feed the tier-B/C scorers
+/// (03 §4.2); they are provider claims, not truth.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SearchHit {
     pub provider_id: String,
     pub title: String,
+    pub title_english: Option<String>,
+    pub title_native: Option<String>,
     pub anilist_id: Option<i64>,
     pub mal_id: Option<i64>,
+    /// Catalog total claim; per-track listing counts below are the fallback
+    /// episode signal when absent (0 = unknown).
     pub total_episodes: Option<u32>,
+    pub eps_sub: u32,
+    pub eps_dub: u32,
     pub year: Option<u32>,
 }
 
@@ -110,7 +120,9 @@ pub trait StreamProvider: Send + Sync {
         quality: Quality,
     ) -> Result<StreamLink, ProviderError>;
 
-    fn cover_request(&self, cover_ref: &str) -> CoverRequest;
+    /// Err = ref unusable (empty, oversize, header-injection bytes); callers
+    /// skip the fetch, never "sanitize" and proceed.
+    fn cover_request(&self, cover_ref: &str) -> Result<CoverRequest, ProviderError>;
 }
 
 /// Process-immutable provider set. Construction order IS the default fallback
@@ -262,12 +274,12 @@ mod tests {
         ) -> Result<StreamLink, ProviderError> {
             Err(ProviderError::Unsupported)
         }
-        fn cover_request(&self, cover_ref: &str) -> CoverRequest {
-            CoverRequest {
+        fn cover_request(&self, cover_ref: &str) -> Result<CoverRequest, ProviderError> {
+            Ok(CoverRequest {
                 url: cover_ref.to_string(),
                 referer: None,
                 user_agent: None,
-            }
+            })
         }
     }
 
