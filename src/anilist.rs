@@ -26,8 +26,9 @@ const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MEDIA_FIELDS: &str = "id idMal title{romaji english native} episodes duration averageScore status season seasonYear startDate{year month day} format source countryOfOrigin genres studios(isMain:true){nodes{name}} rankings{rank type year allTime} nextAiringEpisode{episode airingAt} description(asHtml:false) coverImage{large}";
 
 fn search_query() -> String {
-    // pageInfo is a port adaptation: sabigoku Browse load-more is AniList-fed
-    // (zigoku's was provider-fed), so search needs hasNextPage too.
+    // pageInfo is a port adaptation: zigoku search load-more gates next-page
+    // on the short-page heuristic (len % 26); explicit hasNextPage matches
+    // the discover exhaustion law (ROD-336) instead.
     format!(
         "query($search:String!,$perPage:Int!,$page:Int!){{Page(page:$page,perPage:$perPage){{pageInfo{{hasNextPage}} media(search:$search,type:ANIME,sort:SEARCH_MATCH){{{MEDIA_FIELDS}}}}}}}"
     )
@@ -108,9 +109,7 @@ struct GqlPageData {
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct GqlPage {
-    #[serde(default)]
     page_info: Option<GqlPageInfo>,
-    #[serde(default)]
     media: Option<Vec<GqlMedia>>,
 }
 
@@ -136,73 +135,47 @@ struct GqlMediaData {
 #[serde(rename_all = "camelCase")]
 struct GqlMedia {
     id: i64,
-    #[serde(default)]
     id_mal: Option<i64>,
-    #[serde(default)]
     title: Option<GqlTitle>,
-    #[serde(default)]
     episodes: Option<u32>,
-    #[serde(default)]
     duration: Option<u32>,
-    #[serde(default)]
     average_score: Option<u32>,
-    #[serde(default)]
     status: Option<String>,
-    #[serde(default)]
     season: Option<String>,
-    #[serde(default)]
     season_year: Option<u32>,
-    #[serde(default)]
     start_date: Option<GqlStartDate>,
-    #[serde(default)]
     format: Option<String>,
-    #[serde(default)]
     source: Option<String>,
-    #[serde(default)]
     country_of_origin: Option<String>,
-    #[serde(default)]
     genres: Option<Vec<Option<String>>>,
-    #[serde(default)]
     studios: Option<GqlStudios>,
-    #[serde(default)]
     rankings: Option<Vec<GqlRanking>>,
-    #[serde(default)]
     next_airing_episode: Option<GqlNextAiring>,
-    #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
     cover_image: Option<GqlCoverImage>,
 }
 
 #[derive(Deserialize, Default)]
 struct GqlTitle {
-    #[serde(default)]
     romaji: Option<String>,
-    #[serde(default)]
     english: Option<String>,
-    #[serde(default)]
     native: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct GqlStartDate {
-    #[serde(default)]
     year: Option<u32>,
-    #[serde(default)]
     month: Option<u32>,
-    #[serde(default)]
     day: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
 struct GqlStudios {
-    #[serde(default)]
     nodes: Option<Vec<GqlStudioNode>>,
 }
 
 #[derive(Deserialize)]
 struct GqlStudioNode {
-    #[serde(default)]
     name: Option<String>,
 }
 
@@ -211,9 +184,8 @@ struct GqlStudioNode {
 struct GqlRanking {
     #[serde(default)]
     rank: u32,
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type")]
     kind: Option<String>,
-    #[serde(default)]
     year: Option<u32>,
     #[serde(default)]
     all_time: bool,
@@ -222,15 +194,12 @@ struct GqlRanking {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GqlNextAiring {
-    #[serde(default)]
     episode: Option<u32>,
-    #[serde(default)]
     airing_at: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
 struct GqlCoverImage {
-    #[serde(default)]
     large: Option<String>,
 }
 
