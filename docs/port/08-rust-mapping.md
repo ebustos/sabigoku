@@ -153,6 +153,7 @@ last (zigoku `failureClassCopy` pattern).
 |---|---|
 | 2026-07-17 | Initial lean from SPIKES + chapters 01–07 |
 | 2026-07-17 | ROD-430 round 1: verified against SPIKES/Cargo.toml/source; zero factual corrections needed. This chapter now **owns** the config/auth format decision (06 O1): lean TOML, decide at M1 start |
+| 2026-07-18 | ROD-435 ratifications: 03 O2 settled as `dyn StreamProvider` trait objects. Non-sync AniList 429 gets a distinct `CatalogError::RateLimited` (no client retry; caller policy) instead of freeze's collapse-to-no-answer (06 §8b OPEN). `strip_controls` widened beyond freeze C0+DEL to C1 + bidi controls + zero-width. Redirects disabled on the catalog client. Search query carries `pageInfo{hasNextPage}` (Browse is AniList-fed here, provider-fed at freeze) |
 
 When M1 picks config format, image crate, or channel crate, add a row here rather
 than rewriting product chapters.
