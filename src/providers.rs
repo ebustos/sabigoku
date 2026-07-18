@@ -4,6 +4,8 @@
 //! single provider with a seam. Imports domain (+ own http helpers); NEVER
 //! tui or store (01 §5, keeps backends testable offline).
 
+pub mod allanime;
+pub mod hls;
 pub mod http;
 
 use crate::domain::{Enrichment, Quality, StreamLink, Translation};
@@ -118,7 +120,9 @@ pub trait StreamProvider: Send + Sync {
         quality: Quality,
     ) -> Result<StreamLink, ProviderError>;
 
-    fn cover_request(&self, cover_ref: &str) -> CoverRequest;
+    /// Err = ref unusable (empty, oversize, header-injection bytes); callers
+    /// skip the fetch, never "sanitize" and proceed.
+    fn cover_request(&self, cover_ref: &str) -> Result<CoverRequest, ProviderError>;
 }
 
 /// Process-immutable provider set. Construction order IS the default fallback
@@ -270,12 +274,12 @@ mod tests {
         ) -> Result<StreamLink, ProviderError> {
             Err(ProviderError::Unsupported)
         }
-        fn cover_request(&self, cover_ref: &str) -> CoverRequest {
-            CoverRequest {
+        fn cover_request(&self, cover_ref: &str) -> Result<CoverRequest, ProviderError> {
+            Ok(CoverRequest {
                 url: cover_ref.to_string(),
                 referer: None,
                 user_agent: None,
-            }
+            })
         }
     }
 

@@ -1,0 +1,165 @@
+{
+  "data": {
+    "shows": {
+      "pageInfo": {
+        "total": 24632
+      },
+      "edges": [
+        {
+          "_id": "ddcCSGNtxd4uLzoxK",
+          "name": "Sousou no Frieren: ●● no Mahou Part 3",
+          "englishName": null,
+          "nativeName": "葬送のフリーレン ～●●の魔法～ 3クール",
+          "slugTime": null,
+          "thumbnail": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/medium/b206425-WOwXsfDbHZwb.jpg",
+          "lastEpisodeInfo": {
+            "sub": {
+              "episodeString": "6"
+            }
+          },
+          "lastEpisodeDate": {
+            "sub": {
+              "hour": 13,
+              "minute": 16,
+              "year": 2026,
+              "month": 4,
+              "date": 22
+            },
+            "dub": {},
+            "raw": {}
+          },
+          "type": "ONA",
+          "season": {
+            "quarter": "Winter",
+            "year": 2026
+          },
+          "score": null,
+          "airedStart": {
+            "year": 2026,
+            "month": 1,
+            "day": 19
+          },
+          "availableEpisodes": {
+            "sub": 6,
+            "dub": 0,
+            "raw": 0
+          },
+          "episodeDuration": "60000",
+          "episodeCount": null,
+          "lastUpdateEnd": "2026-07-18T06:49:10.791Z",
+          "characterCount": "9"
+        },
+        {
+          "_id": "qpeexkeTa7DzLjRnp",
+          "name": "Sousou no Frieren 2nd Season",
+          "englishName": "Frieren: Beyond Journey's End Season 2",
+          "nativeName": "葬送のフリーレン 第2期",
+          "slugTime": null,
+          "thumbnail": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx182255-butzrqd4I0aC.jpg",
+          "lastEpisodeInfo": {
+            "sub": {
+              "episodeString": "10"
+            },
+            "dub": {
+              "episodeString": "10"
+            }
+          },
+          "lastEpisodeDate": {
+            "sub": {
+              "hour": 15,
+              "minute": 11,
+              "year": 2026,
+              "month": 2,
+              "date": 27
+            },
+            "dub": {
+              "hour": 15,
+              "minute": 10,
+              "year": 2026,
+              "month": 3,
+              "date": 10
+            },
+            "raw": {}
+          },
+          "type": "TV",
+          "season": {
+            "quarter": "Winter",
+            "year": 2026
+          },
+          "score": 8.86,
+          "airedStart": {
+            "year": 2026,
+            "month": 0,
+            "date": 16,
+            "hour": 14,
+            "minute": 0
+          },
+          "availableEpisodes": {
+            "sub": 10,
+            "dub": 10,
+            "raw": 0
+          },
+          "episodeDuration": "1440000",
+          "episodeCount": "10",
+          "lastUpdateEnd": "2026-07-18T09:31:27.516Z",
+          "characterCount": "71"
+        },
+        {
+          "_id": "ReHMC7TQnch3C6z8j",
+          "name": "Sousou no Frieren",
+          "englishName": "Frieren: Beyond Journey’s End",
+          "nativeName": "葬送のフリーレン",
+          "slugTime": null,
+          "thumbnail": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx154587-qQTzQnEJJ3oB.jpg",
+          "lastEpisodeInfo": {
+            "sub": {
+              "episodeString": "28"
+            },
+            "dub": {
+              "episodeString": "28"
+            }
+          },
+          "lastEpisodeDate": {
+            "sub": {
+              "hour": 15,
+              "minute": 44,
+              "year": 2024,
+              "month": 2,
+              "date": 22
+            },
+            "dub": {
+              "hour": 20,
+              "minute": 20,
+              "year": 2024,
+              "month": 3,
+              "date": 5
+            },
+            "raw": {}
+          },
+          "type": "TV",
+          "season": {
+            "quarter": "Fall",
+            "year": 2023
+          },
+          "score": 9.26,
+          "airedStart": {
+            "year": 2023,
+            "month": 8,
+            "date": 29,
+            "hour": 14,
+            "minute": 0
+          },
+          "availableEpisodes": {
+            "sub": 28,
+            "dub": 28,
+            "raw": 0
+          },
+          "episodeDuration": "1440000",
+          "episodeCount": "28",
+          "lastUpdateEnd": "2026-07-18T10:06:57.757Z",
+          "characterCount": "100"
+        }
+      ]
+    }
+  }
+}

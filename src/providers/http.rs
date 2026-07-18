@@ -39,6 +39,9 @@ pub struct Request<'a> {
     pub user_agent: &'a str,
     pub extra_headers: &'a [(&'a str, &'a str)],
     pub accept: Accept,
+    /// Per-request override of the 10s rail (allanime long-tail GETs carry
+    /// the freeze 20s cap, ROD-153).
+    pub deadline: Option<Duration>,
 }
 
 pub struct HttpClient {
@@ -68,6 +71,9 @@ impl HttpClient {
             builder = builder
                 .header("Content-Type", content_type)
                 .body(body.to_vec());
+        }
+        if let Some(deadline) = req.deadline {
+            builder = builder.timeout(deadline);
         }
         let resp = builder.send().map_err(|_| ProviderError::Network)?;
         let status = resp.status().as_u16();
@@ -105,6 +111,7 @@ mod tests {
             user_agent: "sabigoku-test",
             extra_headers: &[],
             accept,
+            deadline: None,
         })
     }
 
@@ -154,6 +161,7 @@ mod tests {
             user_agent: "sabigoku-test",
             extra_headers: &[],
             accept: Accept::Any2xx,
+            deadline: None,
         });
         assert!(matches!(got, Err(ProviderError::Network)));
     }
@@ -187,6 +195,7 @@ mod tests {
             user_agent: "sabigoku-test",
             extra_headers: &[("Referer", "https://ref.example/")],
             accept: Accept::OkOnly,
+            deadline: None,
         });
         assert_eq!(got.unwrap(), b"ok");
         let seen = handle.join().unwrap();
