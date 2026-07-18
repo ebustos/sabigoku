@@ -250,6 +250,39 @@ pub struct Date {
     pub day: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cour {
+    pub season: Season,
+    pub year: u32,
+}
+
+/// Cour at a wall-clock instant; anchors the This Season discover axis.
+/// December carries the from_month year roll into next-year winter (ROD-186).
+pub fn current_cour(unix_secs: i64) -> Cour {
+    let days = unix_secs.max(0).div_euclid(86_400);
+    let (year, month, _) = civil_from_days(days);
+    let year = if month == 12 { year + 1 } else { year };
+    Cour {
+        season: Season::from_month(month),
+        year,
+    }
+}
+
+/// Days since 1970-01-01 to (year, month, day), proleptic Gregorian
+/// (Howard Hinnant's civil_from_days). Valid for any date this app can see.
+fn civil_from_days(z: i64) -> (u32, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year as u32, month as u32, day as u32)
+}
+
 /// Primary title form (ROD-205). No separate Auto: english already falls back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleLanguage {
@@ -592,5 +625,56 @@ mod tests {
         assert_eq!(Translation::parse("dub"), Some(Translation::Dub));
         assert_eq!(Translation::parse("raw"), None);
         assert_eq!(Translation::Sub.as_str(), "sub");
+    }
+
+    #[test]
+    fn current_cour_mid_year() {
+        // 2026-07-18
+        let c = current_cour(1_784_332_800);
+        assert_eq!(
+            c,
+            Cour {
+                season: Season::Summer,
+                year: 2026
+            }
+        );
+    }
+
+    #[test]
+    fn current_cour_december_rolls_into_next_winter() {
+        // 2025-12-15
+        let c = current_cour(1_765_756_800);
+        assert_eq!(
+            c,
+            Cour {
+                season: Season::Winter,
+                year: 2026
+            }
+        );
+    }
+
+    #[test]
+    fn current_cour_pre_epoch_clamps_to_1970_winter() {
+        let c = current_cour(-1);
+        assert_eq!(
+            c,
+            Cour {
+                season: Season::Winter,
+                year: 1970
+            }
+        );
+    }
+
+    #[test]
+    fn current_cour_january_stays_in_its_year() {
+        // 2026-01-05
+        let c = current_cour(1_767_571_200);
+        assert_eq!(
+            c,
+            Cour {
+                season: Season::Winter,
+                year: 2026
+            }
+        );
     }
 }

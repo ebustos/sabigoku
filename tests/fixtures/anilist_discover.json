@@ -1,0 +1,207 @@
+{
+  "data": {
+    "Page": {
+      "pageInfo": {
+        "hasNextPage": true
+      },
+      "media": [
+        {
+          "id": 182205,
+          "idMal": 59970,
+          "title": {
+            "romaji": "Tensei Shitara Slime Datta Ken 4th Season",
+            "english": "That Time I Got Reincarnated as a Slime Season 4",
+            "native": "転生したらスライムだった件 第4期"
+          },
+          "episodes": null,
+          "duration": 24,
+          "averageScore": 82,
+          "status": "RELEASING",
+          "season": "SPRING",
+          "seasonYear": 2026,
+          "startDate": {
+            "year": 2026,
+            "month": 4,
+            "day": 3
+          },
+          "format": "TV",
+          "source": "LIGHT_NOVEL",
+          "countryOfOrigin": "JP",
+          "genres": [
+            "Action",
+            "Adventure",
+            "Comedy",
+            "Fantasy"
+          ],
+          "studios": {
+            "nodes": [
+              {
+                "name": "8-bit"
+              }
+            ]
+          },
+          "rankings": [
+            {
+              "rank": 190,
+              "type": "RATED",
+              "year": null,
+              "allTime": true
+            },
+            {
+              "rank": 16,
+              "type": "RATED",
+              "year": 2026,
+              "allTime": false
+            },
+            {
+              "rank": 8,
+              "type": "POPULAR",
+              "year": 2026,
+              "allTime": false
+            },
+            {
+              "rank": 5,
+              "type": "RATED",
+              "year": 2026,
+              "allTime": false
+            },
+            {
+              "rank": 3,
+              "type": "POPULAR",
+              "year": 2026,
+              "allTime": false
+            }
+          ],
+          "nextAiringEpisode": {
+            "episode": 16,
+            "airingAt": 1784901600
+          },
+          "description": "The fourth season of <i>Tensei Shitara Slime Datta Ken</i>.<br><br>\nDemon Lord Rimuru's dream of creating an alliance between humans and monsters takes a step closer to being realized. As Tempest continues to prosper, Granville Rozzo and his granddaughter, Maribel Rozzo, clash with Demon Lord Rimuru over their plan to protect mankind by ruling over them. Meanwhile, in El Dorado, Demon Lord Leon works toward goals of his own. The awakening of a new Hero draws near!<br><br>\n\n(Source: Crunchyroll News)",
+          "coverImage": {
+            "large": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/medium/bx182205-q2AeO1owuQbO.jpg"
+          }
+        },
+        {
+          "id": 209983,
+          "idMal": 63817,
+          "title": {
+            "romaji": "Hell Mode: Yarikomi-zuki no Gamer wa Haisettei no Isekai de Musou Suru 2nd Season",
+            "english": "HELL MODE: The Hardcore Gamer Dominates in Another World with Garbage Balancing Season 2",
+            "native": "ヘルモード ～やり込み好きのゲーマーは廃設定の異世界で無双する～ 2nd Season"
+          },
+          "episodes": 13,
+          "duration": 25,
+          "averageScore": 72,
+          "status": "RELEASING",
+          "season": "SUMMER",
+          "seasonYear": 2026,
+          "startDate": {
+            "year": 2026,
+            "month": 7,
+            "day": 4
+          },
+          "format": "TV",
+          "source": "LIGHT_NOVEL",
+          "countryOfOrigin": "JP",
+          "genres": [
+            "Action",
+            "Adventure",
+            "Fantasy"
+          ],
+          "studios": {
+            "nodes": [
+              {
+                "name": "Yokohama Animation Lab"
+              }
+            ]
+          },
+          "rankings": [
+            {
+              "rank": 61,
+              "type": "RATED",
+              "year": 2026,
+              "allTime": false
+            },
+            {
+              "rank": 73,
+              "type": "POPULAR",
+              "year": 2026,
+              "allTime": false
+            },
+            {
+              "rank": 20,
+              "type": "RATED",
+              "year": 2026,
+              "allTime": false
+            },
+            {
+              "rank": 22,
+              "type": "POPULAR",
+              "year": 2026,
+              "allTime": false
+            }
+          ],
+          "nextAiringEpisode": {
+            "episode": 4,
+            "airingAt": 1784908800
+          },
+          "description": "The second season of <i>Hell Mode</i>.",
+          "coverImage": {
+            "large": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/medium/bx209983-sFOcKyqMufxb.jpg"
+          }
+        },
+        {
+          "id": 199748,
+          "idMal": 62617,
+          "title": {
+            "romaji": "Koko wa Ore ni Makasete Saki ni Ike to Ittekara 10-nen ga Tattara Densetsu ni Natteita.",
+            "english": "I Became a Legend After My 10 Year-Long Last Stand",
+            "native": "ここは俺に任せて先に行けと言ってから１０年がたったら伝説になっていた。"
+          },
+          "episodes": 12,
+          "duration": 23,
+          "averageScore": 66,
+          "status": "RELEASING",
+          "season": "SUMMER",
+          "seasonYear": 2026,
+          "startDate": {
+            "year": 2026,
+            "month": 7,
+            "day": 3
+          },
+          "format": "ONA",
+          "source": "LIGHT_NOVEL",
+          "countryOfOrigin": "JP",
+          "genres": [
+            "Action",
+            "Adventure",
+            "Fantasy"
+          ],
+          "studios": {
+            "nodes": [
+              {
+                "name": "Gekkou"
+              }
+            ]
+          },
+          "rankings": [
+            {
+              "rank": 18,
+              "type": "POPULAR",
+              "year": 2026,
+              "allTime": false
+            }
+          ],
+          "nextAiringEpisode": {
+            "episode": 4,
+            "airingAt": 1784899800
+          },
+          "description": "Luck, an S-rank mage in the hero’s party, makes a last stand against the Demon King to save his companions. When he finally returns victorious, ten years have passed, and the world praises him as a legendary hero who died in battle. Unable to reclaim his former life, Luck conceals his identity and begins again as “Lock,” an F-rank adventurer forging a future in a world that moved on without him.<br><br>\n(Source: Crunchyroll)\n<br><br>\n\n<i>Note: Koko wa Ore ni Makasete Saki ni Ike to Ittekara 10-nen ga Tattara Densetsu ni Natteita is streaming 3 days in advance of the TV broadcast on Prime Video beginning July 3rd, 2026. Regular broadcasting began on July 6th, 2026.</i>",
+          "coverImage": {
+            "large": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/medium/bx199748-PAFk9pGSUmFL.png"
+          }
+        }
+      ]
+    }
+  }
+}
