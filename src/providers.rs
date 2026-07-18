@@ -57,15 +57,21 @@ pub struct SearchOptions {
     pub page: u32,
 }
 
-/// Tier-C candidate. Ids and totals feed the tier-B/C scorers (03 §4.2);
-/// they are provider claims, not truth.
-#[derive(Debug, Clone, PartialEq)]
+/// Tier-C candidate. Ids, titles, and counts feed the tier-B/C scorers
+/// (03 §4.2); they are provider claims, not truth.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SearchHit {
     pub provider_id: String,
     pub title: String,
+    pub title_english: Option<String>,
+    pub title_native: Option<String>,
     pub anilist_id: Option<i64>,
     pub mal_id: Option<i64>,
+    /// Catalog total claim; per-track listing counts below are the fallback
+    /// episode signal when absent (0 = unknown).
     pub total_episodes: Option<u32>,
+    pub eps_sub: u32,
+    pub eps_dub: u32,
     pub year: Option<u32>,
 }
 

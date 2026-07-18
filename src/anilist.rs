@@ -236,6 +236,80 @@ fn select_rank(rankings: &[GqlRanking]) -> Option<SelectedRank> {
     })
 }
 
+/// Fuzzy title score (higher = closer; large negative = no overlap).
+/// Normalizes then folds season forms. Shared with resolver tier C (ROD-328)
+/// so both match directions use one rule.
+pub(crate) fn title_score(a: &str, b: Option<&str>) -> i32 {
+    let Some(b) = b else { return -5000 };
+    if a.is_empty() || b.is_empty() {
+        return -5000;
+    }
+    let na = canon_season(&normalize_title(a));
+    let nb = canon_season(&normalize_title(b));
+    if na.is_empty() || nb.is_empty() {
+        return -5000;
+    }
+    if na == nb {
+        return 1600;
+    }
+    if nb.starts_with(&na) || na.starts_with(&nb) {
+        return 1250;
+    }
+    if nb.contains(na.as_str()) || na.contains(nb.as_str()) {
+        return 900;
+    }
+    -5000
+}
+
+/// Explicit "Season N" / "Nth Season" in a normalized title → `s<N>`
+/// (ROD-181). Bare trailing numbers untouched ("86", "Ranma 1/2"); "season"
+/// with no adjacent number is left alone.
+fn canon_season(s: &str) -> String {
+    let Some(idx) = s.find("season") else {
+        return s.to_string();
+    };
+    let before = &s[..idx];
+    let after = &s[idx + "season".len()..];
+
+    // Form A: digits directly after the keyword ("season2").
+    let dlen = after.bytes().take_while(u8::is_ascii_digit).count();
+    let (base_pre, num, tail) = if dlen > 0 {
+        (before, &after[..dlen], &after[dlen..])
+    } else {
+        // Form B: digits (+ ordinal) directly before the keyword ("2ndseason").
+        let mut b = before;
+        for ord in ["st", "nd", "rd", "th"] {
+            if let Some(stripped) = b.strip_suffix(ord) {
+                b = stripped;
+                break;
+            }
+        }
+        let digits = b.bytes().rev().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return s.to_string();
+        }
+        let dstart = b.len() - digits;
+        (&b[..dstart], &b[dstart..], after)
+    };
+    format!("{base_pre}s{num}{tail}")
+}
+
+/// ASCII: keep alphanumerics lowercased, drop the rest. Non-ASCII bytes pass
+/// verbatim, so multi-byte sequences stay intact.
+fn normalize_title(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    for &c in s.as_bytes() {
+        if c < 0x80 {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    String::from_utf8(out).expect("removing whole ascii bytes keeps utf-8 valid")
+}
+
 /// Drop terminal-hostile codepoints from AniList free text before they can
 /// reach terminal cells: C0 + DEL (ROD-247 CLONE) plus C1, bidi overrides,
 /// and zero-width chars (ratified ROD-435 widening; zigoku left those open
@@ -686,6 +760,51 @@ mod tests {
         );
         assert_eq!(strip_controls("a\u{2066}b\u{2069}c".into()), "abc");
         assert_eq!(strip_controls("a\u{200B}b\u{FEFF}c".into()), "abc");
+    }
+
+    #[test]
+    fn title_score_prefers_exact_over_prefix_over_substring() {
+        assert!(
+            title_score("Frieren", Some("Frieren"))
+                > title_score("Frieren", Some("Frieren Season 2"))
+        );
+        assert!(
+            title_score("Frieren", Some("Frieren Season 2"))
+                > title_score("Frieren", Some("The World of Frieren"))
+        );
+        assert_eq!(title_score("Frieren", None), -5000);
+        assert_eq!(title_score("", Some("Frieren")), -5000);
+        assert_eq!(title_score("Frieren", Some("Naruto")), -5000);
+    }
+
+    #[test]
+    fn canon_season_reconciles_season_forms_leaves_the_rest() {
+        assert_eq!(canon_season("frierenseason2"), "frierens2");
+        assert_eq!(canon_season("frieren2ndseason"), "frierens2");
+        assert_eq!(canon_season("k3rdseason"), "ks3");
+        assert_eq!(canon_season("title2season"), "titles2");
+        assert_eq!(canon_season("frieren"), "frieren");
+        assert_eq!(canon_season("loghorizon2"), "loghorizon2");
+        assert_eq!(canon_season("seasonsoflife"), "seasonsoflife");
+    }
+
+    #[test]
+    fn title_score_reconciles_season_n_vs_nth_season() {
+        assert_eq!(
+            title_score(
+                "Sousou no Frieren Season 2",
+                Some("Sousou no Frieren 2nd Season")
+            ),
+            1600
+        );
+        assert!(title_score("Frieren Season 2", Some("Frieren")) < 1600);
+    }
+
+    #[test]
+    fn normalize_title_lowercases_ascii_keeps_unicode() {
+        assert_eq!(normalize_title("Re:Zero 2nd Season"), "rezero2ndseason");
+        assert_eq!(normalize_title("葬送のフリーレン"), "葬送のフリーレン");
+        assert_eq!(normalize_title("  !!  "), "");
     }
 
     use crate::testutil::{response_with_body, serve_once};

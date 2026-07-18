@@ -340,6 +340,17 @@ pub fn episode_label_cmp(a: &str, b: &str) -> Ordering {
     episode_sort_key(a).total_cmp(&episode_sort_key(b))
 }
 
+/// Map an episode onto another provider's grid (03 §6.6): exact raw label,
+/// else 1-based ordinal into the sorted list. Aligns with L1: string equality
+/// is identity; ordinal is best-effort hop UX, never a second progress key.
+pub fn map_episode_index<S: AsRef<str>>(episodes: &[S], raw: &str, ordinal: u32) -> Option<usize> {
+    if let Some(i) = episodes.iter().position(|e| e.as_ref() == raw) {
+        return Some(i);
+    }
+    let i = ordinal.checked_sub(1)? as usize;
+    if i < episodes.len() { Some(i) } else { None }
+}
+
 /// The AniList-shaped enrichment fieldset, shared verbatim by the library
 /// `show` row and `catalog_cache` (02 §3.3: column parity is intentional so
 /// promote-to-library is a straight copy). No user state lives here, ever.
@@ -532,6 +543,17 @@ mod tests {
         let mut labels = ["2", "1.5", "SP1", "1", "10"];
         labels.sort_by(|a, b| episode_label_cmp(a, b));
         assert_eq!(labels, ["1", "1.5", "2", "10", "SP1"]);
+    }
+
+    #[test]
+    fn map_episode_index_prefers_raw_falls_back_to_ordinal_else_none() {
+        let eps = ["1", "2", "SP1"];
+        assert_eq!(map_episode_index(&eps, "2", 3), Some(1));
+        assert_eq!(map_episode_index(&eps, "SP1", 1), Some(2));
+        assert_eq!(map_episode_index(&eps, "7", 2), Some(1));
+        assert_eq!(map_episode_index(&eps, "7", 9), None);
+        assert_eq!(map_episode_index(&eps, "7", 0), None);
+        assert_eq!(map_episode_index::<&str>(&[], "1", 1), None);
     }
 
     #[test]
