@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, named_
 
 use crate::domain::{
     Date, Enrichment, ListStatus, Season, Show, Translation, WATCHED_RATIO, episode_label_cmp,
-    is_still_airing,
+    is_still_airing, natural_end,
 };
 use crate::error::Error;
 
@@ -757,6 +757,23 @@ pub struct Resume {
     pub position_secs: f64,
     pub duration_secs: f64,
     pub fully_watched: bool,
+}
+
+impl Resume {
+    /// The 03 §6.3.1 resume start rule: restart at 0 when fully watched, past
+    /// natural end, or the saved position is unusable; else back up by
+    /// `resume_offset_sec`, saturating at 0. zigoku parity: an unknown (0)
+    /// duration resumes, only a real ratio restarts.
+    pub fn start_secs(&self, resume_offset_sec: u32) -> f64 {
+        if self.fully_watched
+            || natural_end(self.position_secs, self.duration_secs)
+            || !self.position_secs.is_finite()
+            || self.position_secs <= 0.0
+        {
+            return 0.0;
+        }
+        (self.position_secs - f64::from(resume_offset_sec)).max(0.0)
+    }
 }
 
 /// One push-work row for AniList list sync (ROD-284 shape on the show PK).
@@ -2190,6 +2207,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last.as_deref(), Some("senshi"));
+    }
+
+    #[test]
+    fn resume_start_rule() {
+        let resume = |position_secs, duration_secs, fully_watched| Resume {
+            position_secs,
+            duration_secs,
+            fully_watched,
+        };
+        assert_eq!(resume(100.0, 1000.0, true).start_secs(5), 0.0);
+        assert_eq!(resume(800.0, 1000.0, false).start_secs(5), 0.0);
+        assert_eq!(resume(-3.0, 1000.0, false).start_secs(5), 0.0);
+        assert_eq!(resume(0.0, 1000.0, false).start_secs(5), 0.0);
+        assert_eq!(resume(f64::NAN, 1000.0, false).start_secs(5), 0.0);
+        assert_eq!(resume(100.0, 1000.0, false).start_secs(5), 95.0);
+        assert_eq!(resume(3.0, 1000.0, false).start_secs(5), 0.0);
+        // Unknown duration resumes; only a real ratio restarts.
+        assert_eq!(resume(500.0, 0.0, false).start_secs(5), 495.0);
     }
 
     #[test]

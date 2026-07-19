@@ -11,6 +11,13 @@ pub const MAX_EPISODE_HINT: u32 = 10_000;
 pub const WATCHED_RATIO: f64 = 0.95;
 pub const NATURAL_END_RATIO: f64 = 0.80;
 
+/// The 02 §4b natural-end tier: ratchets progress, never marks fully_watched.
+/// Duration 0 (unknown) can never be a natural end; mirror the store's watched
+/// derivation, do not let a zero divide into a restart.
+pub fn natural_end(position_secs: f64, duration_secs: f64) -> bool {
+    duration_secs > 0.0 && position_secs / duration_secs >= NATURAL_END_RATIO
+}
+
 /// Scheme check only, no site knowledge (ROD-267). Case-sensitive on purpose:
 /// it must agree with the store's `GLOB 'http*'` cover guard, and GLOB is
 /// case-sensitive.
@@ -702,5 +709,15 @@ mod tests {
                 year: 2026
             }
         );
+    }
+
+    #[test]
+    fn natural_end_is_the_080_tier() {
+        assert!(natural_end(8.0, 10.0));
+        assert!(natural_end(9.9, 10.0));
+        assert!(!natural_end(7.9, 10.0));
+        assert!(!natural_end(500.0, 0.0));
+        assert!(!natural_end(500.0, -1.0));
+        assert!(!natural_end(f64::NAN, 10.0));
     }
 }
