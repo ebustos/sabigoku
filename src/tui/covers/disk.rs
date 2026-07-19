@@ -12,10 +12,12 @@ use super::MAX_ENCODED_BYTES;
 
 static TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// hex-16 of the first 8 SHA-256 bytes of `url`; a collision costs one refetch.
+/// Full SHA-256 hex of `url`. Deliberate widen from zigoku's hex-16: refs
+/// cross the provider trust boundary, and a truncated key gives a resourced
+/// attacker a ~2^64 birthday bound to silently alias another show's art.
 fn stem(url: &str) -> String {
     let digest = Sha256::digest(url.as_bytes());
-    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn cover_path(dir: &Path, url: &str) -> PathBuf {
@@ -74,9 +76,9 @@ mod tests {
     }
 
     #[test]
-    fn stem_is_stable_hex16_and_urls_do_not_collide() {
+    fn stem_is_stable_full_hex_and_urls_do_not_collide() {
         let s = stem("https://cdn.example/a.png");
-        assert_eq!(s.len(), 16);
+        assert_eq!(s.len(), 64);
         assert!(s.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(s, stem("https://cdn.example/a.png"));
         assert_ne!(s, stem("https://cdn.example/b.png"));

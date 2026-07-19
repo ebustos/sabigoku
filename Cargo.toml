@@ -29,7 +29,18 @@ aes-gcm = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 # spike_cover (ROD-417): TUI stack + cover art. ratatui-image renders Kitty
-# graphics or halfblocks; `image` brings the codec zoo (and most of the tree).
+# graphics or halfblocks. Codec list is deliberately closed (ROD-438 review):
+# cover CDNs serve jpeg/png/webp/gif; every extra default codec is reachable
+# attack surface via magic-byte sniffing, so do not reopen `image/default`
+# (ratatui-image's default features would, hence the explicit list there too).
 ratatui = "0.30.2"
-ratatui-image = "11.0.6"
-image = "0.25.10"
+ratatui-image = { version = "11.0.6", default-features = false, features = [
+    "crossterm",
+    "chafa-dyn",
+] }
+image = { version = "0.25.10", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+] }

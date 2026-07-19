@@ -7,8 +7,6 @@
 
 use std::time::Instant;
 
-use image::DynamicImage;
-
 use super::RETRY_COOLDOWN;
 
 /// Slot pool cap, ~two large pages. Visible or in-flight slots are never
@@ -27,7 +25,9 @@ pub enum SlotStatus {
 pub struct CoverSlot {
     url: String,
     status: SlotStatus,
-    pixels: Option<DynamicImage>,
+    /// Flag only; pixels live in the caches and the protocol pool. A copy
+    /// per slot would sit outside every byte cap (04 §7.3 RAM rail).
+    has_pixels: bool,
     failed_at: Option<Instant>,
     /// Last pump the url was in the window; eviction recency.
     last_seen_frame: u64,
@@ -38,7 +38,7 @@ impl CoverSlot {
         CoverSlot {
             url: url.to_string(),
             status: SlotStatus::Idle,
-            pixels: None,
+            has_pixels: false,
             failed_at: None,
             last_seen_frame: 0,
         }
@@ -48,8 +48,8 @@ impl CoverSlot {
         self.status
     }
 
-    pub fn pixels(&self) -> Option<&DynamicImage> {
-        self.pixels.as_ref()
+    pub fn has_pixels(&self) -> bool {
+        self.has_pixels
     }
 }
 
@@ -80,10 +80,11 @@ impl DiscoverCovers {
         }
     }
 
-    /// Adopt pixels for `url`, wherever the grid moved meanwhile.
-    pub fn accept_pixels(&mut self, url: &str, img: DynamicImage) {
+    /// Adopt a landed cover for `url`, wherever the grid moved meanwhile.
+    /// The caller installs the image in the render store; this is the record.
+    pub fn adopt(&mut self, url: &str) {
         let slot = self.ensure_slot(url);
-        slot.pixels = Some(img);
+        slot.has_pixels = true;
         slot.status = SlotStatus::Ready;
         slot.failed_at = None;
     }
@@ -159,7 +160,7 @@ impl DiscoverCovers {
         let Some(slot) = self.get(url) else {
             return true;
         };
-        if slot.pixels.is_some() || slot.status == SlotStatus::Loading {
+        if slot.has_pixels || slot.status == SlotStatus::Loading {
             return false;
         }
         match slot.failed_at {
@@ -193,10 +194,6 @@ impl DiscoverCovers {
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    fn img() -> DynamicImage {
-        DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
-    }
 
     /// urls u0..uN as owned strings; tests borrow windows from this.
     fn urls(n: usize) -> Vec<String> {
@@ -235,7 +232,7 @@ mod tests {
         let now = Instant::now();
         let mut dc = DiscoverCovers::default();
         let u = urls(4);
-        dc.accept_pixels(&u[0], img());
+        dc.adopt(&u[0]);
         let first = dc.pump(&window(&u[..2]), now, 8, 0);
         assert_eq!(first, vec![u[1].clone()], "ready slot skipped");
         let again = dc.pump(&window(&u[..2]), now, 8, 0);
@@ -267,7 +264,7 @@ mod tests {
         dc.pump(&window(&u), now, 8, 0);
         dc.reset_loading(&u[0]);
         assert_eq!(dc.get(&u[0]).unwrap().status(), SlotStatus::Idle);
-        dc.accept_pixels(&u[0], img());
+        dc.adopt(&u[0]);
         dc.reset_loading(&u[0]);
         assert_eq!(dc.get(&u[0]).unwrap().status(), SlotStatus::Ready);
     }
@@ -279,10 +276,10 @@ mod tests {
         dc.pump(&window(&u), Instant::now(), 8, 0);
         dc.evict(&u[0]);
         assert!(dc.get(&u[0]).is_none());
-        dc.accept_pixels(&u[0], img());
+        dc.adopt(&u[0]);
         let slot = dc.get(&u[0]).unwrap();
         assert_eq!(slot.status(), SlotStatus::Ready);
-        assert!(slot.pixels().is_some());
+        assert!(slot.has_pixels());
     }
 
     #[test]
@@ -291,7 +288,7 @@ mod tests {
         let mut dc = DiscoverCovers::default();
         let u = urls(1);
         dc.note_failure(&u[0], now);
-        dc.accept_pixels(&u[0], img());
+        dc.adopt(&u[0]);
         let slot = dc.get(&u[0]).unwrap();
         assert_eq!(slot.status(), SlotStatus::Ready);
         assert!(slot.failed_at.is_none());

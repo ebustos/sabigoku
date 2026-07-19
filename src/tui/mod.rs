@@ -85,6 +85,9 @@ pub struct App {
     ticks: u64,
     term: (u16, u16),
     cover_art: bool,
+    /// Startup snapshot. Freeze law is live cap re-read each pump (ROD-240);
+    /// safe only while nothing mutates config at runtime. The Settings view
+    /// (ROD-439) must replace this with a live read or the law breaks.
     cover_cap: usize,
     cards: Vec<DemoCard>,
     feed: Feed,
@@ -185,17 +188,23 @@ impl App {
         self.dirty = true;
     }
 
-    /// ~100ms cadence (04 §8): spinner frame and the cover pump ride it.
+    /// ~100ms cadence (04 §8): spinner frame, the cover pump, and the detail
+    /// retry ride it (the single-flight gate defers superseded fetches to
+    /// the next tick instead of joining, 04 §6).
     fn on_tick(&mut self, now: Instant, tx: &EventTx) {
         self.ticks += 1;
         self.pump_covers(now, tx);
+        if self.detail_open {
+            self.sync_detail_cover(now, tx);
+        }
         self.dirty = true;
     }
 
-    /// Detail art landed; the keep-check lives in `CoverState` (04 §6).
+    /// Detail art landed; the keep-check lives in `CoverState` (04 §6). On
+    /// accept the buffer moves straight into the render store, no clones.
     fn on_cover_done(&mut self, for_id: i64, img: DynamicImage) {
-        if self.detail_cover.on_done(for_id, img.clone()) {
-            self.pool.set(DETAIL_KEY, &img);
+        if self.detail_cover.on_done(for_id) {
+            self.pool.set(DETAIL_KEY, img);
         }
         self.dirty = true;
     }
@@ -206,10 +215,11 @@ impl App {
         self.dirty = true;
     }
 
-    /// Slot adopts by url wherever the grid moved meanwhile (04 §4.4).
+    /// Slot adopts by url wherever the grid moved meanwhile (04 §4.4). The
+    /// buffer moves straight into the render store, no clones.
     fn on_discover_cover_done(&mut self, url: &str, img: DynamicImage) {
-        self.covers.accept_pixels(url, img.clone());
-        self.pool.ensure(url, &img);
+        self.covers.adopt(url);
+        self.pool.ensure(url, img);
         self.dirty = true;
     }
 
@@ -298,6 +308,13 @@ impl App {
                 self.pool.remove(DETAIL_KEY);
             }
             Action::Fetch => {
+                // Single-flight: one detail fetch at a time, matching the
+                // zigoku one-thread semantic without its UI-blocking join
+                // (04 §6 forbids joins on the hot path). A selection storm
+                // defers to the tick retry instead of spawning per keystroke.
+                if self.cover_drain.inflight() > 0 {
+                    return;
+                }
                 let (id, url) = (target_id.unwrap(), target_url.unwrap().to_string());
                 self.detail_cover.begin_fetch(id, &url);
                 let spawned = workers::spawn_cover_fetch(
@@ -490,7 +507,7 @@ impl App {
             cover_w.min(inner.width),
             cover_h.min(inner.height),
         );
-        if self.detail_cover.pixels().is_some() && self.pool.render(frame, cover, DETAIL_KEY) {
+        if self.detail_cover.has_pixels() && self.pool.render(frame, cover, DETAIL_KEY) {
             return;
         }
         let msg = if self.detail_cover.is_loading() {
@@ -793,7 +810,7 @@ mod tests {
             now,
             &tx,
         );
-        assert!(app.detail_cover.pixels().is_none());
+        assert!(!app.detail_cover.has_pixels());
         assert!(!app.pool.contains(DETAIL_KEY));
         app.tick(
             Event::CoverDone {
@@ -803,8 +820,28 @@ mod tests {
             now,
             &tx,
         );
-        assert!(app.detail_cover.pixels().is_some());
+        assert!(app.detail_cover.has_pixels());
         assert!(app.pool.contains(DETAIL_KEY));
+        assert!(app.cover_drain.drain(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn detail_fetch_is_single_flight_with_tick_retry() {
+        let (mut app, tx, _rx, now) = sized("single-flight", 6);
+        // Hold the family busy: an artificial in-flight worker.
+        let held = app.cover_drain.begin();
+        app.tick(key(KeyCode::Enter), now, &tx);
+        assert!(!app.detail_cover.is_loading(), "gate must defer, not spawn");
+        // A selection storm while blocked must not spawn per keystroke.
+        for _ in 0..10 {
+            app.tick(key(KeyCode::Char('l')), now, &tx);
+        }
+        assert_eq!(app.cover_drain.inflight(), 1, "only the held guard");
+        drop(held);
+        // The tick retry fetches for the CURRENT selection, not the storm's.
+        app.tick(Event::Tick, now, &tx);
+        assert!(app.detail_cover.is_loading());
+        assert_eq!(app.detail_cover.for_id(), Some(6));
         assert!(app.cover_drain.drain(Duration::from_secs(5)));
     }
 

@@ -6,8 +6,6 @@
 
 use std::time::Instant;
 
-use image::DynamicImage;
-
 use super::RETRY_COOLDOWN;
 
 /// Outcome of reconciling held state with the current selection (05 §12).
@@ -33,7 +31,9 @@ struct Failure {
 
 #[derive(Debug, Default)]
 pub struct CoverState {
-    pixels: Option<DynamicImage>,
+    /// Flag only; the pixels themselves live in the caches and the protocol
+    /// pool. A copy here would sit outside every byte cap (04 §7.3 RAM rail).
+    has_pixels: bool,
     for_id: Option<i64>,
     loading: bool,
     failed: Option<Failure>,
@@ -43,8 +43,8 @@ pub struct CoverState {
 }
 
 impl CoverState {
-    pub fn pixels(&self) -> Option<&DynamicImage> {
-        self.pixels.as_ref()
+    pub fn has_pixels(&self) -> bool {
+        self.has_pixels
     }
 
     pub fn is_loading(&self) -> bool {
@@ -68,7 +68,7 @@ impl CoverState {
                 _ => Action::None,
             };
         };
-        if self.for_id == Some(target_id) && (self.loading || self.pixels.is_some()) {
+        if self.for_id == Some(target_id) && (self.loading || self.has_pixels) {
             return Action::UpToDate;
         }
         // Failure records survive navigation; only cooldown expiry, a url
@@ -94,15 +94,16 @@ impl CoverState {
     }
 
     /// Worker success. False means stale (wrong id): state untouched, pixels
-    /// dropped by the caller (04 §6).
-    pub fn on_done(&mut self, for_id: i64, img: DynamicImage) -> bool {
+    /// dropped by the caller (04 §6). True commits the caller to installing
+    /// the image in the render store; this flag is the only record of it.
+    pub fn on_done(&mut self, for_id: i64) -> bool {
         if self.for_id != Some(for_id) {
             return false;
         }
         self.loading = false;
         self.failed = None;
         self.inflight_url = None;
-        self.pixels = Some(img);
+        self.has_pixels = true;
         true
     }
 
@@ -124,7 +125,7 @@ impl CoverState {
     /// Drop held art and in-flight attribution; the failure record survives
     /// (it has its own lifecycle, see `decide`).
     pub fn clear(&mut self) {
-        self.pixels = None;
+        self.has_pixels = false;
         self.for_id = None;
         self.inflight_url = None;
         self.loading = false;
@@ -135,10 +136,6 @@ impl CoverState {
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    fn img() -> DynamicImage {
-        DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
-    }
 
     const URL: &str = "https://cdn.example/a.png";
 
@@ -157,7 +154,7 @@ mod tests {
         let mut state = CoverState::default();
         assert_eq!(state.decide(Some(7), None, now), Action::None);
         state.begin_fetch(7, URL);
-        assert!(state.on_done(7, img()));
+        assert!(state.on_done(7));
         assert_eq!(state.decide(Some(7), None, now), Action::None);
         assert_eq!(state.decide(Some(8), None, now), Action::Clear);
     }
@@ -168,7 +165,7 @@ mod tests {
         let mut state = CoverState::default();
         state.begin_fetch(7, URL);
         assert_eq!(state.decide(Some(7), Some(URL), now), Action::UpToDate);
-        assert!(state.on_done(7, img()));
+        assert!(state.on_done(7));
         assert_eq!(state.decide(Some(7), Some(URL), now), Action::UpToDate);
         assert_eq!(state.decide(Some(8), Some(URL), now), Action::Fetch);
     }
@@ -217,7 +214,7 @@ mod tests {
         assert_eq!(state.decide(Some(7), Some(URL), now), Action::Suppress);
         // A successful fetch supersedes it (live pixels win, 05 §12).
         state.begin_fetch(7, URL);
-        assert!(state.on_done(7, img()));
+        assert!(state.on_done(7));
         state.clear();
         assert_eq!(state.decide(Some(7), Some(URL), now), Action::Fetch);
     }
@@ -234,13 +231,24 @@ mod tests {
     }
 
     #[test]
+    fn failure_record_never_leaks_into_the_urlless_branch() {
+        let now = Instant::now();
+        let mut state = CoverState::default();
+        state.begin_fetch(7, URL);
+        assert!(state.on_error(7, now));
+        // No target art: the record must not suppress or clear anything.
+        assert_eq!(state.decide(Some(7), None, now), Action::None);
+        assert_eq!(state.decide(Some(8), None, now), Action::None);
+    }
+
+    #[test]
     fn stale_done_and_error_are_dropped_untouched() {
         let now = Instant::now();
         let mut state = CoverState::default();
         state.begin_fetch(7, URL);
-        assert!(!state.on_done(9, img()), "stale cover_done discarded");
+        assert!(!state.on_done(9), "stale cover_done discarded");
         assert!(state.is_loading());
-        assert!(state.pixels().is_none());
+        assert!(!state.has_pixels());
         assert!(!state.on_error(9, now), "stale cover_error discarded");
         assert!(state.is_loading());
         assert_eq!(state.for_id(), Some(7));

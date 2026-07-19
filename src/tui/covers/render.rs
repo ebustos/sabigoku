@@ -85,8 +85,9 @@ impl ProtocolPool {
     }
 
     /// Keep an existing protocol: keys are content-stable (a url names one
-    /// image). For keys that change images, `set`.
-    pub fn ensure(&mut self, key: &str, img: &DynamicImage) {
+    /// image), so a duplicate arrival just drops. For keys that change
+    /// images, `set`.
+    pub fn ensure(&mut self, key: &str, img: DynamicImage) {
         if self.slots.contains_key(key) {
             return;
         }
@@ -94,9 +95,11 @@ impl ProtocolPool {
     }
 
     /// Replace unconditionally (the detail slot re-keys per selection).
-    pub fn set(&mut self, key: &str, img: &DynamicImage) {
+    /// Takes the buffer by value: the pool is the render store, and this is
+    /// the image's final home (no clone on the ingest path).
+    pub fn set(&mut self, key: &str, img: DynamicImage) {
         let (req_tx, req_rx) = mpsc::channel();
-        let proto = ThreadProtocol::new(req_tx, Some(self.picker.new_resize_protocol(img.clone())));
+        let proto = ThreadProtocol::new(req_tx, Some(self.picker.new_resize_protocol(img)));
         self.slots.insert(key.to_string(), Slot { proto, req_rx });
     }
 
@@ -197,7 +200,7 @@ mod tests {
     fn encode_roundtrip_applies_off_thread_result() {
         let drain = Drain::default();
         let (mut pool, rx) = pool(&drain);
-        pool.ensure("u1", &img());
+        pool.ensure("u1", img());
         // First draw emits the resize request; drain forwards it tagged.
         draw(&mut pool, "u1");
         pool.drain_requests();
@@ -217,7 +220,7 @@ mod tests {
     fn response_for_an_evicted_key_is_dropped() {
         let drain = Drain::default();
         let (mut pool, rx) = pool(&drain);
-        pool.ensure("u1", &img());
+        pool.ensure("u1", img());
         draw(&mut pool, "u1");
         pool.drain_requests();
         assert_eq!(
@@ -233,11 +236,11 @@ mod tests {
     fn ensure_keeps_but_set_replaces() {
         let drain = Drain::default();
         let (mut pool, _rx) = pool(&drain);
-        pool.ensure("u1", &img());
-        pool.ensure("u1", &img());
+        pool.ensure("u1", img());
+        pool.ensure("u1", img());
         assert_eq!(pool.slots.len(), 1);
-        pool.set("detail", &img());
-        pool.set("detail", &img());
+        pool.set("detail", img());
+        pool.set("detail", img());
         assert_eq!(pool.slots.len(), 2);
         pool.retain(|k| k == "detail");
         assert!(!pool.contains("u1"));
