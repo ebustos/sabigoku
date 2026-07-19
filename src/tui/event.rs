@@ -10,15 +10,6 @@ use ratatui::crossterm::event::{self as ct, KeyEvent};
 
 use super::workers::{CancelFlag, Drain};
 
-/// One demo grid card (ROD-438 shell); the real DiscoverState rows replace
-/// this in ROD-439.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DemoCard {
-    pub anilist_id: i64,
-    pub title: String,
-    pub cover_url: Option<String>,
-}
-
 /// No `Eq`: cover events carry pixel payloads (`DynamicImage` is `PartialEq`
 /// only).
 #[derive(Debug, Clone, PartialEq)]
@@ -52,13 +43,6 @@ pub enum Event {
     /// the pool's own channel (ratatui-image types are not comparable, so
     /// they stay out of this enum); tick applies it on the UI thread.
     CoverEncodeReady,
-    /// Demo feed for the ROD-438 shell grid; DiscoverFeed replaces it (439).
-    DemoFeedLoaded {
-        cards: Vec<DemoCard>,
-    },
-    DemoFeedFailed {
-        cause: String,
-    },
 }
 
 pub type EventRx = mpsc::Receiver<Event>;

@@ -11,10 +11,9 @@ use std::time::{Duration, Instant};
 use crate::domain::Translation;
 use crate::error::Error;
 use crate::player::Position;
-use crate::providers::{CatalogProvider, DiscoverAxis};
 use crate::store::Store;
 use crate::tui::covers::{self, CoverCaches};
-use crate::tui::event::{DemoCard, Event, EventTx};
+use crate::tui::event::{Event, EventTx};
 
 /// The 02 §4b post-play gate, the one owner of the finish writes (01 §3 glue).
 /// No meaningful position, no writes of any kind; the player already collapsed
@@ -82,33 +81,6 @@ pub fn spawn_discover_cover_fetch(
         let event = match covers::load_cover_pixels(None, &url, &caches, &covers_dir) {
             Ok(img) => Event::DiscoverCoverDone { url, img },
             Err(_) => Event::DiscoverCoverError { url },
-        };
-        tx.post(event);
-    })
-}
-
-/// Demo feed for the ROD-438 shell: one trending page. The per-axis
-/// DiscoverFeed worker with catalog_cache upsert replaces this (ROD-439).
-#[must_use]
-pub fn spawn_demo_feed(drain: &Drain, tx: EventTx) -> bool {
-    drain.spawn("demo-feed", move || {
-        let page =
-            crate::anilist::AniList::new().and_then(|api| api.discover(DiscoverAxis::Trending, 1));
-        let event = match page {
-            Ok(page) => Event::DemoFeedLoaded {
-                cards: page
-                    .entries
-                    .into_iter()
-                    .map(|e| DemoCard {
-                        anilist_id: e.anilist_id,
-                        title: e.title_romaji,
-                        cover_url: e.cover_url,
-                    })
-                    .collect(),
-            },
-            Err(cause) => Event::DemoFeedFailed {
-                cause: cause.to_string(),
-            },
         };
         tx.post(event);
     })
