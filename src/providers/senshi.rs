@@ -417,7 +417,10 @@ impl Senshi {
             }
         }
         let src = pick_sub_track(&tracks?)?;
-        (is_absolute_url(&src) && clean_arg(&src)).then_some(src)
+        // The picked src goes to mpv --sub-file, bypassing the proxy that guards
+        // the stream: SSRF-guard it, argv-vet alone is host-blind. Follow-up fix
+        // to merged ROD-441, ratified ROD-445 (backport owed, both providers).
+        (is_absolute_url(&src) && clean_arg(&src) && guard_fetch_url(&src).is_ok()).then_some(src)
     }
 }
 

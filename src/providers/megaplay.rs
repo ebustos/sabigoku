@@ -66,6 +66,7 @@ struct SourcesResp {
 
 /// A getSources track that survived argv-vetting (non-null, absolute, clean
 /// file). `kind` "thumbnails" is the seekbar sprite, not a subtitle.
+#[derive(Clone)]
 struct Track {
     file: String,
     label: Option<String>,
@@ -109,8 +110,13 @@ fn map_sources(raw: &[u8], tt: Translation) -> Result<Sources, ProviderError> {
         });
     }
 
+    // The picked sub_url goes straight to mpv --sub-file, bypassing the proxy
+    // that SSRF-guards the stream. Guard it here or drop it (play raw): argv-vet
+    // alone is host-blind, so a track aimed at loopback/metadata would otherwise
+    // reach mpv. Deviation past freeze, ratified ROD-445 (backport owed, both
+    // providers).
     let sub_url = if tt == Translation::Sub {
-        pick_subtitle(&tracks)
+        pick_subtitle(&tracks).filter(|u| guard_fetch_url(u).is_ok())
     } else {
         None
     };
@@ -389,8 +395,9 @@ impl StreamProvider for MegaPlay {
     ) -> Result<StreamLink, ProviderError> {
         guard_show_id(provider_id)?;
         // Own mint is 1-based integers. A foreign fractional label ("13.5") has
-        // no MAL-route address; a u32 parse rejects it (and the sign/dot chars)
-        // before any network, so the splice is digits-only.
+        // no MAL-route address; a u32 parse rejects it before any network. Splice
+        // the parsed `n` back, not the raw label: parse accepts "+1"/"007", so
+        // the canonical form is what reaches the URL.
         let n: u32 = episode
             .parse()
             .map_err(|_| ProviderError::Decode("invalid episode".into()))?;
@@ -398,7 +405,7 @@ impl StreamProvider for MegaPlay {
             return Err(ProviderError::Decode("invalid episode".into()));
         }
 
-        let embed = embed_url(&self.host, provider_id, episode, tt);
+        let embed = embed_url(&self.host, provider_id, &n.to_string(), tt);
         let html = self.embed_get(&embed)?;
         let text = String::from_utf8_lossy(&html);
         // Past-end or missing track (the sub/dub fork lives here), not a
@@ -578,6 +585,24 @@ mod tests {
         assert_eq!(s.link.sub_url, None);
     }
 
+    #[test]
+    fn map_sources_drops_a_sub_url_aimed_at_a_private_host() {
+        // The picked sub_url bypasses the proxy and reaches mpv --sub-file; a
+        // default track pointing at cloud metadata / loopback must not survive
+        // the SSRF guard, while the stream itself (proxy-guarded) still plays.
+        for host in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:9/pwn.vtt",
+        ] {
+            let raw = format!(
+                r#"{{"sources":{{"file":"https://cdn/ok.m3u8"}},"tracks":[{{"file":"{host}","label":"English","kind":"captions","default":true}}]}}"#
+            );
+            let s = map_sources(raw.as_bytes(), Translation::Sub).unwrap();
+            assert_eq!(s.link.sub_url, None, "{host} must be guarded out");
+            assert_eq!(s.link.url, "https://cdn/ok.m3u8");
+        }
+    }
+
     fn track(file: &str, label: Option<&str>, kind: Option<&str>, default: bool) -> Track {
         Track {
             file: file.to_string(),
@@ -610,35 +635,18 @@ mod tests {
         );
         let bare = track("https://c/bare.vtt", None, None, false);
 
+        // Host default beats an earlier english; english beats first; thumbnails
+        // never qualify.
         assert_eq!(
-            pick_subtitle(&[thumbs, english, eng_default]).as_deref(),
+            pick_subtitle(&[thumbs.clone(), english.clone(), eng_default]).as_deref(),
             Some("https://c/eng2.vtt")
         );
-        let spanish2 = track(
-            "https://c/spa.vtt",
-            Some("Spanish"),
-            Some("captions"),
-            false,
-        );
-        let english2 = track(
-            "https://c/eng.vtt",
-            Some("English - CR"),
-            Some("captions"),
-            false,
-        );
         assert_eq!(
-            pick_subtitle(&[spanish2, english2]).as_deref(),
+            pick_subtitle(&[spanish.clone(), english]).as_deref(),
             Some("https://c/eng.vtt")
         );
-        let thumbs2 = track("https://c/thumbs.vtt", None, Some("thumbnails"), true);
-        let spanish3 = track(
-            "https://c/spa.vtt",
-            Some("Spanish"),
-            Some("captions"),
-            false,
-        );
         assert_eq!(
-            pick_subtitle(&[thumbs2, spanish3]).as_deref(),
+            pick_subtitle(&[thumbs, spanish]).as_deref(),
             Some("https://c/spa.vtt")
         );
         assert_eq!(

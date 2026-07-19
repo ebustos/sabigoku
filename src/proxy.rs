@@ -25,19 +25,12 @@
 //! 083abd3 freeze. Recorded in 08 §10.
 //!
 //! Lifecycle is one playback: `engage` starts the proxy when the link is
-//! flagged and hands back a guard; 437's `player::play` points mpv at the guard
-//! url and drops the guard on mpv exit, which tears the proxy down. Every hop is
-//! re-guarded against SSRF (03 §6.7): a hostile playlist cannot bounce the proxy
-//! at a private IP.
-//!
-//! Deviation from zigoku (seam shape, ratifiable): zigoku's `proxy.play` wraps
-//! `player.play` and brackets it with `defer p.stop()`. Here the bracket is
-//! RAII: `engage` returns a `Decloak` guard whose `Drop` stops the proxy, so
-//! the mpv path (ROD-437) stays the sole owner of spawn/IPC and just holds the
-//! guard for the process lifetime. Rust's `Arc<Proxy>` also retires zigoku's
-//! `Gate` refcount + leak-not-free `stop()` choreography: a detached handler
-//! holding an `Arc` keeps the object alive by construction, no manual free, no
-//! use-after-free window.
+//! flagged and hands back a `Decloak` guard; the mpv path (ROD-437) points mpv
+//! at the guard url and drops the guard on exit, tearing the proxy down. Every
+//! hop is re-guarded against SSRF (03 §6.7): a hostile playlist cannot bounce
+//! the proxy at a private IP. The RAII-guard seam (vs zigoku's `proxy.play`
+//! wrapper) and the `Arc<Proxy>` teardown (vs zigoku's Gate refcount +
+//! leak-not-free dance) are recorded in 08 §10.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -62,6 +55,16 @@ const MAX_REDIRECTS: u8 = 5;
 /// Wall-clock ceiling on one upstream fetch (redirect chain + body). Without it a
 /// CDN that accepts then goes silent parks a handler thread forever.
 const FETCH_DEADLINE: Duration = Duration::from_secs(30);
+/// Per-socket idle timeout on the client-facing (mpv) side. A stalled or
+/// slow-trickling local client is dropped instead of pinning its handler thread
+/// (and the `Arc<Proxy>` it holds) for the port's lifetime. std has the
+/// per-socket timeout zigoku's Io lacked. Safe against mpv keep-alive: a closed
+/// idle connection is just reopened on the next segment.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ceiling on one request head (line + headers). Bounds memory against a hostile
+/// local client streaming an endless header; a head past this hits EOF mid-parse
+/// and the connection closes.
+const MAX_HEAD_BYTES: u64 = 16 * 1024;
 
 /// Loopback request path + query prefix. The `.ts` suffix is deliberate: it sits
 /// in ffmpeg's default extension allowlist, so mpv never trips the HLS extension
@@ -217,6 +220,11 @@ impl Proxy {
     }
 
     fn handle_conn(&self, stream: TcpStream) {
+        // Drop a stalled/slow client instead of pinning this thread (and its
+        // Arc<Proxy>) for the port's lifetime. Read bounds a client that never
+        // sends; write bounds one that stops reading our response body.
+        let _ = stream.set_read_timeout(Some(CLIENT_IDLE_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(CLIENT_IDLE_TIMEOUT));
         let Ok(read_half) = stream.try_clone() else {
             return;
         };
@@ -260,31 +268,38 @@ impl Proxy {
             Ok(fetched) => fetched,
             Err(_) => return close_with(writer, STATUS_BAD_GATEWAY),
         };
-        if is_playlist(&fetched.body) {
-            // is_playlist already proved a text `#EXTM3U` head with no NUL;
-            // a body that still is not utf-8 is malformed, 502 it.
-            let Ok(text) = std::str::from_utf8(&fetched.body) else {
-                return close_with(writer, STATUS_BAD_GATEWAY);
-            };
-            let rewritten = rewrite_playlist(text, &fetched.final_url, self.port);
-            write_response(
-                writer,
-                STATUS_OK,
-                CONTENT_TYPE_M3U8,
-                rewritten.as_bytes(),
-                true,
-            )?;
-        } else {
-            write_response(
-                writer,
-                STATUS_OK,
-                CONTENT_TYPE_TS,
-                decloak(&fetched.body),
-                true,
-            )?;
-        }
-        Ok(KeepAlive::Yes)
+        respond(writer, &fetched.body, &fetched.final_url, self.port)
     }
+}
+
+/// Dispatch a fetched upstream body to the client: a playlist is rewritten to
+/// loopback refs, a segment is de-cloaked. Split from `serve` so the dispatch
+/// composition is unit-testable without a live upstream (the SSRF guard blocks a
+/// loopback mock, so the full wire path can only be exercised piecewise).
+fn respond(
+    writer: &mut impl Write,
+    body: &[u8],
+    final_url: &str,
+    port: u16,
+) -> io::Result<KeepAlive> {
+    if is_playlist(body) {
+        // is_playlist already proved a text `#EXTM3U` head with no NUL; a body
+        // that still is not utf-8 is malformed, 502 it.
+        let Ok(text) = std::str::from_utf8(body) else {
+            return close_with(writer, STATUS_BAD_GATEWAY);
+        };
+        let rewritten = rewrite_playlist(text, final_url, port);
+        write_response(
+            writer,
+            STATUS_OK,
+            CONTENT_TYPE_M3U8,
+            rewritten.as_bytes(),
+            true,
+        )?;
+    } else {
+        write_response(writer, STATUS_OK, CONTENT_TYPE_TS, decloak(body), true)?;
+    }
+    Ok(KeepAlive::Yes)
 }
 
 /// Write an empty-body error response that closes the connection, and report it
@@ -304,14 +319,18 @@ enum KeepAlive {
 /// consumed to the blank line but ignored: the client is local mpv, which only
 /// ever sends bodiless GETs, so there is no body to frame.
 fn read_request_target<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    // Bound the whole head: a hostile local client streaming an endless line or
+    // header run hits the Take limit (read_line returns 0) instead of growing
+    // memory. An oversized head yields a target that fails the path match -> 404.
+    let mut head = reader.take(MAX_HEAD_BYTES);
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    if head.read_line(&mut line)? == 0 {
         return Ok(None);
     }
     let target = line.split(' ').nth(1).unwrap_or("").to_string();
     loop {
         let mut header = String::new();
-        let n = reader.read_line(&mut header)?;
+        let n = head.read_line(&mut header)?;
         if n == 0 || header == "\r\n" || header == "\n" {
             break;
         }
@@ -833,5 +852,70 @@ mod tests {
         );
         drop(client);
         drop(guard); // must return, not hang
+    }
+
+    #[test]
+    fn respond_dispatches_playlist_to_rewrite_and_segment_to_decloak() {
+        // Playlist: every URI re-pointed to loopback, m3u8 type, keep-alive.
+        let mut out = Vec::new();
+        let ka = respond(
+            &mut out,
+            b"#EXTM3U\n480/index.m3u8\n",
+            "https://cdn.example/hls/master.m3u8",
+            4444,
+        )
+        .unwrap();
+        assert!(matches!(ka, KeepAlive::Yes));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Content-Type: application/vnd.apple.mpegurl"));
+        assert!(text.contains("Connection: keep-alive"));
+        assert!(text.contains("http://127.0.0.1:4444/r.ts?u="));
+        assert!(!text.contains("\n480/index.m3u8")); // relative variant rewritten
+
+        // Segment: decoy prefix stripped to the TS sync, mp2t type, exact length.
+        let mut seg = vec![0u8; 70 + 3 * TS_PACKET];
+        seg[0] = 0x89;
+        seg[70] = 0x47;
+        seg[70 + TS_PACKET] = 0x47;
+        seg[70 + 2 * TS_PACKET] = 0x47;
+        let mut out2 = Vec::new();
+        respond(&mut out2, &seg, "https://cdn.example/seg/0.ts", 4444).unwrap();
+        let head_end = out2.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let (head, sent_body) = out2.split_at(head_end);
+        let head = std::str::from_utf8(head).unwrap();
+        assert!(head.contains("Content-Type: video/mp2t"));
+        assert!(head.contains(&format!("Content-Length: {}", 3 * TS_PACKET)));
+        assert_eq!(sent_body.len(), 3 * TS_PACKET);
+        assert_eq!(sent_body[0], 0x47);
+    }
+
+    #[test]
+    fn read_request_target_reads_sequential_requests_on_one_connection() {
+        // Two pipelined requests off one buffer prove the keep-alive read loop
+        // yields both targets in order, then None at EOF.
+        let raw: &[u8] = b"GET /r.ts?u=abc HTTP/1.1\r\nHost: x\r\n\r\nGET /second HTTP/1.1\r\n\r\n";
+        let mut reader = BufReader::new(raw);
+        assert_eq!(
+            read_request_target(&mut reader).unwrap().as_deref(),
+            Some("/r.ts?u=abc")
+        );
+        assert_eq!(
+            read_request_target(&mut reader).unwrap().as_deref(),
+            Some("/second")
+        );
+        assert_eq!(read_request_target(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn read_request_target_bounds_an_oversized_head() {
+        // An unterminated header far past MAX_HEAD_BYTES must not grow memory or
+        // hang: the head is capped and the call returns the parsed request line.
+        let mut raw = Vec::from(*b"GET /r.ts?u=x HTTP/1.1\r\n");
+        raw.extend(std::iter::repeat_n(b'a', MAX_HEAD_BYTES as usize * 2));
+        let mut reader = BufReader::new(raw.as_slice());
+        assert_eq!(
+            read_request_target(&mut reader).unwrap().as_deref(),
+            Some("/r.ts?u=x")
+        );
     }
 }
