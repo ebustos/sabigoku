@@ -275,6 +275,11 @@ pub enum BottomBar<'a> {
     },
     /// 800ms unknown-command flash (DESIGN 3.5).
     CommandError,
+    /// Armed hard-delete prompt (DESIGN 4.2, 6.5); `title` is the show under
+    /// the axe.
+    Confirm {
+        title: &'a str,
+    },
 }
 
 pub fn draw_bottom_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, bar: &BottomBar<'_>) {
@@ -356,6 +361,31 @@ pub fn draw_bottom_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, bar
                     "[!] unknown command",
                     Style::new().fg(palette.hot).add_modifier(Modifier::BOLD),
                 ),
+            ];
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        }
+        BottomBar::Confirm { title } => {
+            // DESIGN 4.2: the title truncates against the fixed tail so the
+            // y/esc hints never scroll off.
+            let tail_cols = 48usize;
+            let budget = (area.width as usize).saturating_sub(tail_cols).max(8);
+            let muted = Style::new().fg(palette.fg2);
+            let key = Style::new().fg(palette.fg2).add_modifier(Modifier::BOLD);
+            let sep = Style::new().fg(palette.fg3);
+            let spans = vec![
+                Span::styled("[!] ", Style::new().fg(palette.hot)),
+                Span::styled("delete \"", muted),
+                Span::styled(
+                    super::render::truncate_to_width(title, budget).into_owned(),
+                    Style::new().fg(palette.fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("\"? episode history gone", muted),
+                Span::styled(" · ", sep),
+                Span::styled("y", key),
+                Span::styled(" confirm", muted),
+                Span::styled(" · ", sep),
+                Span::styled("esc", key),
+                Span::styled(" cancel", muted),
             ];
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
         }

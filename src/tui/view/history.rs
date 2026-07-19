@@ -64,6 +64,9 @@ impl HistoryState {
     pub fn load(&mut self, store: &Store) {
         match store.list_history() {
             Ok(rows) => {
+                // Anchor from the OUTGOING rows: `order` indexes them, and
+                // the incoming set may be shorter (a delete).
+                let anchor = self.anchor_aid();
                 self.load_failed = false;
                 self.resume = rows
                     .iter()
@@ -76,10 +79,17 @@ impl HistoryState {
                     })
                     .collect();
                 self.rows = rows;
-                self.rebuild();
+                self.rebuild_with(anchor);
             }
             Err(_) => self.load_failed = true,
         }
+    }
+
+    fn anchor_aid(&self) -> Option<i64> {
+        self.order
+            .get(self.cursor)
+            .and_then(|&ix| self.rows.get(ix))
+            .map(|s| s.enrichment.anilist_id)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -99,13 +109,57 @@ impl HistoryState {
         self.order.get(self.cursor).map(|&ix| &self.rows[ix])
     }
 
+    pub fn show_by_aid(&self, anilist_id: i64) -> Option<&Show> {
+        self.rows
+            .iter()
+            .find(|s| s.enrichment.anilist_id == anilist_id)
+    }
+
+    /// The resume-landing target (05 §10.6): the most-recently-watched row.
+    /// The load sorts played rows first, so it is the head or nothing.
+    pub fn first_played(&self) -> Option<i64> {
+        self.rows
+            .first()
+            .filter(|s| s.last_watched_at.is_some())
+            .map(|s| s.enrichment.anilist_id)
+    }
+
+    /// Move the cursor onto a show by identity; false when it is not in the
+    /// current nav order.
+    pub fn select_aid(&mut self, anilist_id: i64, visible: usize) -> bool {
+        let Some(pos) = self
+            .order
+            .iter()
+            .position(|&ix| self.rows[ix].enrichment.anilist_id == anilist_id)
+        else {
+            return false;
+        };
+        self.cursor = pos;
+        self.scroll_into_view(visible);
+        true
+    }
+
+    /// Recompute-to-0 clears the row's resume marker (05 §4); in-memory
+    /// only, the next real watch re-derives it.
+    pub fn clear_resume_marker(&mut self, anilist_id: i64) {
+        if let Some(ix) = self
+            .rows
+            .iter()
+            .position(|s| s.enrichment.anilist_id == anilist_id)
+            && let Some(slot) = self.resume.get_mut(ix)
+        {
+            *slot = None;
+        }
+    }
+
     /// Rebuild the nav order; the cursor follows the focused show's identity
     /// across the reorder, clamping when it fell out (05 §2 setHistory).
     fn rebuild(&mut self) {
-        let anchor = self
-            .order
-            .get(self.cursor)
-            .map(|&ix| self.rows[ix].enrichment.anilist_id);
+        let anchor = self.anchor_aid();
+        self.rebuild_with(anchor);
+    }
+
+    fn rebuild_with(&mut self, anchor: Option<i64>) {
         self.order.clear();
         for status in GROUP_ORDER {
             for (ix, show) in self.rows.iter().enumerate() {

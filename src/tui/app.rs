@@ -55,6 +55,18 @@ pub struct App {
     mode: InputMode,
     command: String,
     command_flash: Option<Instant>,
+    /// Armed hard-delete, keyed by show identity, never a row index
+    /// (DESIGN 6.5: a reload cancels it rather than trusting a stale row).
+    confirm_delete: Option<i64>,
+    /// Single-level status undo: `(show, status, progress)` captured before
+    /// the mutation (05 §4). Keys off the captured id, not the cursor.
+    undo: Option<(i64, domain::ListStatus, u32)>,
+    /// `last_watched` landing: open this show's detail once the first real
+    /// size arrives (05 §10.6); armed only on the initial load.
+    resume_pending: bool,
+    /// The auto-opened show whose walk exhaust demotes back to the list
+    /// (ROD-229); user-driven opens never arm this.
+    resume_demote: Option<i64>,
     toasts: Toasts,
     palette: &'static Palette,
     config: Config,
@@ -98,6 +110,10 @@ impl App {
             mode: InputMode::Normal,
             command: String::new(),
             command_flash: None,
+            confirm_delete: None,
+            undo: None,
+            resume_pending: false,
+            resume_demote: None,
             toasts: Toasts::default(),
             palette: theme::by_name(&config.palette),
             config: config.clone(),
@@ -117,6 +133,11 @@ impl App {
         // A synchronous local read, not a worker (a deliberate deviation from
         // 04 §4.2's load events; recorded on the ticket).
         app.history.load(&app.store);
+        // Resolved once, on the initial load only (DESIGN 8.3); never-played
+        // history simply lands on History. The freeze's second arming call
+        // site (the sync fallback, 04 §3) joins with AniList sync (ROD-448).
+        app.resume_pending =
+            config.landing == "last_watched" && app.history.first_played().is_some();
         app
     }
 
@@ -124,7 +145,7 @@ impl App {
     pub(super) fn tick(&mut self, event: Event, now: Instant, tx: &EventTx) {
         match event {
             Event::Key(key) => self.on_key(key, now, tx),
-            Event::Resize(w, h) => self.on_resize(w, h),
+            Event::Resize(w, h) => self.on_resize(w, h, now, tx),
             Event::FocusGained | Event::FocusLost => {}
             // No keys can ever arrive again; quit clean instead of zombieing.
             Event::InputClosed => self.quit = true,
@@ -163,6 +184,13 @@ impl App {
             self.quit = true;
             return;
         }
+        // An armed delete freezes everything below it, F-keys and `q`
+        // included; only Ctrl-C stays an emergency exit (DESIGN 6.5).
+        if self.confirm_delete.is_some() {
+            self.on_confirm_key(key, now);
+            self.dirty = true;
+            return;
+        }
         if let KeyCode::F(n @ 1..=4) = key.code {
             self.on_fkey(n, now);
             return;
@@ -195,6 +223,13 @@ impl App {
             KeyCode::Char('G') => self.on_jump(false, now),
             KeyCode::Char('v') => self.on_pin_cycle(now, tx),
             KeyCode::Char('P') => self.on_plan(now),
+            KeyCode::Char('p') => self.on_status_key(domain::ListStatus::Paused, now),
+            KeyCode::Char('x') => self.on_status_key(domain::ListStatus::Dropped, now),
+            KeyCode::Char('c') => self.on_status_key(domain::ListStatus::Completed, now),
+            KeyCode::Char('w') => self.on_status_key(domain::ListStatus::Watching, now),
+            KeyCode::Char('u') => self.on_undo(now),
+            KeyCode::Char('r') => self.on_recompute(now),
+            KeyCode::Char('X') => self.on_arm_delete(),
             KeyCode::Char(']') => self.on_axis_cycle(1),
             KeyCode::Char('[') => self.on_axis_cycle(-1),
             KeyCode::Char(c @ '1'..='4') => self.on_axis_select(c),
@@ -453,9 +488,15 @@ impl App {
     }
 
     /// `P` "plan it" (DESIGN 6.1): saves the highlighted Discover card or
-    /// Browse result as planning (the show row's default list status);
-    /// History's fifth transition joins in chunk 5.
+    /// Browse result as planning; in the History list it is the fifth manual
+    /// transition (re-plan, with undo).
     fn on_plan(&mut self, now: Instant) {
+        if self.view == View::History {
+            if self.pane == Pane::List {
+                self.on_status_key(domain::ListStatus::Planning, now);
+            }
+            return;
+        }
         let entry = match self.view {
             View::Discover => self.discover.selected_entry(),
             View::Browse if self.pane == Pane::List => self.browse.selected(),
@@ -469,6 +510,117 @@ impl App {
             Err(_) => self
                 .toasts
                 .push(Kind::Error, "couldn't add to watchlist", now),
+        }
+    }
+
+    /// History status transitions (05 §4): store + memory move together (the
+    /// reload re-groups and the cursor follows the show's identity). The
+    /// single-level undo captures the pre-mutation state.
+    fn on_status_key(&mut self, status: domain::ListStatus, now: Instant) {
+        if self.view != View::History || self.pane != Pane::List {
+            return;
+        }
+        let Some(show) = self.history.selected() else {
+            return;
+        };
+        let aid = show.enrichment.anilist_id;
+        let before = (aid, show.list_status, show.progress);
+        if self.store.set_list_status(aid, status, unix_now()).is_err() {
+            self.toasts.push(Kind::Error, "couldn't update status", now);
+            return;
+        }
+        self.undo = Some(before);
+        self.reload_history(now);
+    }
+
+    /// `u` undoes the last status mutation (05 §4), keyed off the captured
+    /// row id, never the cursor (freeze parity).
+    fn on_undo(&mut self, now: Instant) {
+        if self.view != View::History || self.pane != Pane::List {
+            return;
+        }
+        let Some((aid, status, progress)) = self.undo.take() else {
+            return;
+        };
+        if self
+            .store
+            .restore_list_status(aid, status, progress, unix_now())
+            .is_ok()
+        {
+            self.toasts.push(Kind::Info, "undone", now);
+        }
+        self.reload_history(now);
+    }
+
+    /// `r` recomputes progress from episode_progress (05 §4). The recompute
+    /// survives a pending undo (c-then-r-then-u law), and recompute-to-0
+    /// clears the row's resume marker.
+    fn on_recompute(&mut self, now: Instant) {
+        if self.view != View::History || self.pane != Pane::List {
+            return;
+        }
+        let Some(show) = self.history.selected() else {
+            return;
+        };
+        let aid = show.enrichment.anilist_id;
+        let translation = Translation::parse(&self.config.translation).unwrap_or(Translation::Sub);
+        match self.store.recompute_progress(aid, translation) {
+            Ok(high_water) => {
+                self.undo = None;
+                self.reload_history(now);
+                if high_water == 0 {
+                    self.history.clear_resume_marker(aid);
+                }
+                self.toasts.push(Kind::Success, "progress reset", now);
+            }
+            Err(_) => self
+                .toasts
+                .push(Kind::Error, "couldn't reset progress", now),
+        }
+    }
+
+    /// `X` arms the hard-delete confirm (DESIGN 6.5); a no-op off the History
+    /// list or with no entry under the cursor.
+    fn on_arm_delete(&mut self) {
+        if self.view != View::History || self.pane != Pane::List {
+            return;
+        }
+        if let Some(show) = self.history.selected() {
+            self.confirm_delete = Some(show.enrichment.anilist_id);
+        }
+    }
+
+    /// Armed-confirm key table (DESIGN 6.5): only `y` fires; a repeat `X`
+    /// stays armed so a key storm can't self-confirm; anything else cancels
+    /// (`q` included, swallowed).
+    fn on_confirm_key(&mut self, key: KeyEvent, now: Instant) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let Some(aid) = self.confirm_delete.take() else {
+                    return;
+                };
+                // The currently-playing refusal joins with playback (chunk 6).
+                let _ = self.store.delete_show(aid);
+                // A stale undo pointing at the deleted row is cleared.
+                if self.undo.map(|(a, _, _)| a) == Some(aid) {
+                    self.undo = None;
+                }
+                // Cursor holds its ordinal via the reload clamp; deleting the
+                // last show falls to the 8.3 empty state naturally.
+                self.reload_history(now);
+            }
+            KeyCode::Char('X') => {}
+            _ => self.confirm_delete = None,
+        }
+    }
+
+    /// One reload path: re-read, cancel any armed confirm (its row identity
+    /// can no longer be trusted, DESIGN 6.5), refresh the preview.
+    fn reload_history(&mut self, now: Instant) {
+        self.history.load(&self.store);
+        self.confirm_delete = None;
+        if self.view == View::History {
+            self.push_history_selection(false, now);
         }
     }
 
@@ -603,13 +755,47 @@ impl App {
         self.toasts.push(Kind::Error, "unknown command", now);
     }
 
-    fn on_resize(&mut self, w: u16, h: u16) {
+    fn on_resize(&mut self, w: u16, h: u16, now: Instant, tx: &EventTx) {
         self.term = (w, h);
         if !self.two_pane() {
             // Below the split there is only one column (DESIGN 7.3).
             self.pane = Pane::List;
         }
+        // The last_watched landing waits for the first real geometry: only
+        // then is pane-vs-zoom decidable (DESIGN 8.3).
+        if self.resume_pending && w > 0 {
+            self.resume_pending = false;
+            self.open_resume_landing(now, tx);
+        }
         self.dirty = true;
+    }
+
+    /// Auto-open the most-recently-watched show parked on its resume episode
+    /// (05 §10.6). Arms the demote: only THIS session's walk exhaust falls
+    /// back to the list; user-driven opens never arm it.
+    fn open_resume_landing(&mut self, now: Instant, tx: &EventTx) {
+        let Some(aid) = self.history.first_played() else {
+            return;
+        };
+        self.history.select_aid(aid, self.list_visible());
+        self.resume_demote = Some(aid);
+        if self.two_pane() {
+            self.pane = Pane::Detail;
+            self.push_history_selection(true, now);
+            self.engage_detail(now, tx);
+        } else {
+            self.open_history_zoom(now, tx);
+        }
+    }
+
+    /// The failed auto-open demotes to the History list (05 §10.6); the walk
+    /// already toasted its failure classes on the way down.
+    fn demote_resume_landing(&mut self) {
+        self.resume_demote = None;
+        if self.view == View::Detail {
+            self.view = View::History;
+        }
+        self.pane = Pane::List;
     }
 
     /// ~100ms cadence (04 §8): toast TTL, the command flash, the search
@@ -763,8 +949,17 @@ impl App {
     }
 
     /// One handler for the four episode-session results: route into the
-    /// session, then toast whatever it reports.
+    /// session, then toast whatever it reports; the resume-landing demote
+    /// rides the outcome (exhaust demotes, a landed grid clears the arm,
+    /// intermediate hops keep it).
     fn on_episode_event(&mut self, event: Event, now: Instant, tx: &EventTx) {
+        let event_aid = match &event {
+            Event::EpisodesDone { anilist_id, .. }
+            | Event::EpisodesError { anilist_id, .. }
+            | Event::ProviderSearchDone { anilist_id, .. }
+            | Event::ProviderSearchError { anilist_id, .. } => Some(*anilist_id),
+            _ => None,
+        };
         let fb = {
             let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
             let session = &mut self.detail.episodes;
@@ -797,7 +992,16 @@ impl App {
                 _ => Vec::new(),
             }
         };
+        let dead_end = fb.iter().any(|f| matches!(f, Feedback::DeadEnd));
         self.apply_episode_feedback(fb, now);
+        if self.resume_demote.is_some() && self.resume_demote == event_aid {
+            if dead_end {
+                self.demote_resume_landing();
+            } else if self.detail.episodes.has_grid() {
+                // Successful load clears the demote arm (05 §10.6).
+                self.resume_demote = None;
+            }
+        }
         self.dirty = true;
     }
 
@@ -1077,6 +1281,19 @@ impl App {
     }
 
     fn bottom_bar(&self, now: Instant) -> BottomBar<'_> {
+        if let Some(show) = self
+            .confirm_delete
+            .and_then(|aid| self.history.show_by_aid(aid))
+        {
+            return BottomBar::Confirm {
+                title: domain::preferred_title(
+                    &show.enrichment.title_romaji,
+                    show.enrichment.title_english.as_deref(),
+                    show.enrichment.title_native.as_deref(),
+                    TitleLanguage::parse(&self.config.title_language),
+                ),
+            };
+        }
         if self.command_flash.is_some_and(|until| now < until) {
             return BottomBar::CommandError;
         }
@@ -1119,8 +1336,8 @@ impl App {
 }
 
 /// Landing seeds from config; History is the default and the fallback for any
-/// unrecognized value. `last_watched` demotes to History until the resume arm
-/// lands (chunk 5); that demotion is also its specced no-resume fallback
+/// unrecognized value. `last_watched` also lands on History: the resume
+/// auto-open then promotes its detail surface once geometry arrives
 /// (DESIGN 8.3).
 fn landing_view(landing: &str) -> View {
     match landing {
@@ -2337,6 +2554,236 @@ mod tests {
             Some(9),
             "the zoom opens on the focused record"
         );
+    }
+
+    #[test]
+    fn history_status_keys_transition_store_and_memory_with_undo() {
+        use crate::domain::ListStatus;
+        let (mut app, tx, now) = sized("history-status", 100, 30);
+        seed_history(&mut app, &[(1, "Alpha", ListStatus::Watching)]);
+        let status = |app: &App| app.store.get_show(1).unwrap().unwrap().list_status;
+
+        app.tick(ch('c'), now, &tx);
+        assert_eq!(status(&app), ListStatus::Completed);
+        assert_eq!(
+            app.store.get_show(1).unwrap().unwrap().progress,
+            12,
+            "completed ratchets to total"
+        );
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("complete (1)"), "memory moved with the store");
+
+        app.tick(ch('u'), now, &tx);
+        assert_eq!(status(&app), ListStatus::Watching, "undo restores status");
+        assert_eq!(
+            app.store.get_show(1).unwrap().unwrap().progress,
+            0,
+            "undo restores the captured progress"
+        );
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("undone"), "{text}");
+        app.tick(ch('u'), now, &tx);
+        assert_eq!(status(&app), ListStatus::Watching, "undo is single-level");
+
+        for (key_char, expected) in [
+            ('p', ListStatus::Paused),
+            ('w', ListStatus::Watching),
+            ('x', ListStatus::Dropped),
+            ('P', ListStatus::Planning),
+        ] {
+            app.tick(ch(key_char), now, &tx);
+            assert_eq!(status(&app), expected, "{key_char} transition");
+        }
+    }
+
+    #[test]
+    fn recompute_survives_a_pending_undo() {
+        use crate::domain::ListStatus;
+        let (mut app, tx, now) = sized("history-recompute", 100, 30);
+        seed_history(&mut app, &[(1, "Alpha", ListStatus::Watching)]);
+        app.tick(ch('c'), now, &tx);
+        assert_eq!(app.store.get_show(1).unwrap().unwrap().progress, 12);
+        // r: no fully-watched rows exist, so progress recomputes to 0.
+        app.tick(ch('r'), now, &tx);
+        assert_eq!(app.store.get_show(1).unwrap().unwrap().progress, 0);
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("progress reset"), "{text}");
+        // u after r: the recompute survives, the undo is a no-op (05 §4).
+        app.tick(ch('u'), now, &tx);
+        let show = app.store.get_show(1).unwrap().unwrap();
+        assert_eq!(show.list_status, ListStatus::Completed);
+        assert_eq!(show.progress, 0, "recompute survives");
+    }
+
+    #[test]
+    fn hard_delete_confirm_freezes_fires_and_cancels() {
+        use crate::domain::ListStatus;
+        let (mut app, tx, now) = sized("history-delete", 100, 30);
+        seed_history(
+            &mut app,
+            &[
+                (1, "Alpha", ListStatus::Watching),
+                (2, "Beta", ListStatus::Watching),
+            ],
+        );
+        app.tick(ch('X'), now, &tx);
+        assert_eq!(app.confirm_delete, Some(1));
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("delete \"Alpha\""), "{text}");
+        assert!(text.contains("y confirm"), "{text}");
+
+        // Frozen: every non-y key cancels WITHOUT acting: q does not quit,
+        // j does not move the cursor, F1 does not switch views.
+        app.tick(ch('q'), now, &tx);
+        assert!(!app.quit, "q is swallowed while armed");
+        assert!(app.confirm_delete.is_none(), "q cancels like any non-y key");
+        press(&mut app, &tx, now, &[ch('X'), ch('j')]);
+        assert_eq!(
+            app.history.selected().unwrap().enrichment.anilist_id,
+            1,
+            "cursor keys never reach the frozen list"
+        );
+        press(&mut app, &tx, now, &[ch('X')]);
+        app.tick(key(KeyCode::F(1)), now, &tx);
+        assert_eq!(app.view, View::History, "view switches are swallowed");
+        app.tick(ch('X'), now, &tx);
+        app.tick(ch('X'), now, &tx);
+        assert_eq!(app.confirm_delete, Some(1), "repeat X stays armed");
+        app.tick(key(KeyCode::Esc), now, &tx);
+        assert_eq!(app.confirm_delete, None, "esc cancels");
+        assert!(app.store.get_show(1).unwrap().is_some(), "nothing deleted");
+
+        // y fires the cascade; the cursor holds its ordinal (now Beta).
+        press(&mut app, &tx, now, &[ch('X'), ch('y')]);
+        assert!(app.store.get_show(1).unwrap().is_none(), "row deleted");
+        assert_eq!(app.history.selected().unwrap().enrichment.anilist_id, 2);
+        // Deleting the last show falls to the empty state.
+        press(&mut app, &tx, now, &[ch('X'), ch('y')]);
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("nothing watched yet"), "{text}");
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_while_the_confirm_is_armed() {
+        use crate::domain::ListStatus;
+        let (mut app, tx, now) = sized("delete-ctrlc", 100, 30);
+        seed_history(&mut app, &[(1, "Alpha", ListStatus::Watching)]);
+        app.tick(ch('X'), now, &tx);
+        app.tick(
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            now,
+            &tx,
+        );
+        assert!(app.quit, "Ctrl-C stays the emergency exit");
+    }
+
+    fn landing_harness(
+        name: &str,
+        registry: Arc<ProviderRegistry>,
+        seed: impl FnOnce(&Store),
+    ) -> (App, EventTx, super::super::event::EventRx, Instant) {
+        let covers_dir = std::env::temp_dir().join("sabigoku-app-tests").join(name);
+        let store = Store::open_memory().unwrap();
+        seed(&store);
+        let config = Config {
+            landing: "last_watched".into(),
+            ..Config::default()
+        };
+        let (tx, rx) = super::super::event::channel();
+        let app = App::new(
+            &config,
+            store,
+            StubCatalog::inert(),
+            registry,
+            covers_dir,
+            Picker::halfblocks(),
+            &tx,
+        );
+        (app, tx, rx, Instant::now())
+    }
+
+    fn seed_played(store: &Store, aid: i64, title: &str) {
+        let e = Enrichment {
+            anilist_id: aid,
+            title_romaji: title.to_string(),
+            total_episodes: Some(12),
+            mal_id: Some(500 + aid),
+            ..Enrichment::default()
+        };
+        store.add_to_library(&e, 100).unwrap();
+        store
+            .record_finish(
+                aid,
+                crate::domain::Translation::Sub,
+                "1",
+                1,
+                1400.0,
+                1420.0,
+                None,
+                200,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn last_watched_landing_opens_the_resume_detail() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into(), "3".into()])),
+        ]);
+        let (mut app, tx, rx, now) = landing_harness("landing-open", registry, |store| {
+            seed_played(store, 1, "Alpha");
+        });
+        assert!(app.resume_pending);
+        app.tick(Event::Resize(100, 30), now, &tx);
+        assert_eq!(app.view, View::History);
+        assert_eq!(app.pane, Pane::Detail, "60-99+ opens in-pane, never zoom");
+        assert_eq!(app.detail.shown().map(|e| e.anilist_id), Some(1));
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(app.detail.episodes.grid().len(), 3);
+        assert_eq!(
+            app.detail.episodes.cursor(),
+            1,
+            "parked past the watched episode"
+        );
+        assert_eq!(app.resume_demote, None, "successful load clears the arm");
+    }
+
+    #[test]
+    fn last_watched_landing_demotes_when_the_walk_exhausts() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay").with_key("505"),
+        ]);
+        let (mut app, tx, rx, now) = landing_harness("landing-demote", registry, |store| {
+            seed_played(store, 1, "Alpha");
+        });
+        app.tick(Event::Resize(100, 30), now, &tx);
+        assert_eq!(app.pane, Pane::Detail);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(app.pane, Pane::List, "exhaust demotes to the list");
+        assert_eq!(app.view, View::History);
+        assert_eq!(app.resume_demote, None);
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("no source found"), "{text}");
+    }
+
+    #[test]
+    fn last_watched_landing_with_no_plays_stays_on_history() {
+        let (mut app, tx, _rx, now) =
+            landing_harness("landing-neverplayed", teststub::inert_registry(), |store| {
+                let e = Enrichment {
+                    anilist_id: 1,
+                    title_romaji: "Alpha".into(),
+                    ..Enrichment::default()
+                };
+                store.add_to_library(&e, 100).unwrap();
+            });
+        assert!(!app.resume_pending, "never-played history never arms");
+        app.tick(Event::Resize(100, 30), now, &tx);
+        assert_eq!(app.view, View::History);
+        assert_eq!(app.pane, Pane::List);
+        assert!(!app.detail.episodes.engaged_for(1), "no auto fetch");
     }
 
     #[test]
