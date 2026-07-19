@@ -7,16 +7,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::domain::{Translation, natural_end};
+use crate::domain::Translation;
 use crate::error::Error;
 use crate::player::Position;
 use crate::store::Store;
 
 /// The 02 §4b post-play gate, the one owner of the finish writes (01 §3 glue).
 /// No meaningful position, no writes of any kind; the player already collapsed
-/// that judgment into `PlayOutcome::position`. Progress row first, then
-/// engagement, so a resume point never trails its History entry. Returns
-/// whether the play was recorded.
+/// that judgment into `PlayOutcome::position`. The resume row and the
+/// engagement/ratchet land atomically inside `record_finish`. Returns whether
+/// the play was recorded.
 #[allow(clippy::too_many_arguments)]
 pub fn finish_playback(
     store: &Store,
@@ -31,20 +31,14 @@ pub fn finish_playback(
     let Some(position) = position else {
         return Ok(false);
     };
-    let duration = position.duration.unwrap_or(0.0);
-    store.save_progress(
+    store.record_finish(
         anilist_id,
         translation,
         episode_label,
-        position.secs,
-        duration,
-        provider,
-        now,
-    )?;
-    store.record_play(
-        anilist_id,
         episode_index,
-        natural_end(position.secs, duration),
+        position.secs,
+        position.duration.unwrap_or(0.0),
+        provider,
         now,
     )?;
     Ok(true)

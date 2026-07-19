@@ -3,7 +3,7 @@
 //! 02 §4b gate has one owner (tui::workers glue, 01 §3). Owns the proxy engage
 //! guard for exactly the mpv process lifetime (08 §10).
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -24,6 +24,10 @@ const BACKOFF: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(4)];
 /// Connect budget ~2s (03 §6.3.1): mpv creates the socket after argv parse.
 const IPC_CONNECT_TRIES: u32 = 40;
 const IPC_CONNECT_STEP: Duration = Duration::from_millis(50);
+/// Ceiling on one IPC line. Real property-change events are ~100 bytes; a peer
+/// that streams an endless line would otherwise grow the read buffer to a
+/// process-wide OOM abort. proxy.rs caps its request head for the same reason.
+const MAX_IPC_LINE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Position {
@@ -163,6 +167,11 @@ where
     let socket = socket_path(opts.socket_dir);
     let argv = build_argv(link, decloak.url(), opts, &socket)?;
 
+    // Clear a stale or pre-planted file so mpv binds its own socket; a same-uid
+    // squatter answering our watcher could otherwise forge positions. This
+    // shuts the pre-planted race; the same-instant one wants peer-cred (ROD-447).
+    let _ = std::fs::remove_file(&socket);
+
     // Null stdio or mpv fights the TUI for the terminal it inherited.
     let mut child = Command::new(opts.mpv_path)
         .args(&argv)
@@ -175,11 +184,12 @@ where
             source,
         })?;
 
+    let child_pid = child.id();
     let observed = Mutex::new(Observed::default());
     let gone = AtomicBool::new(false);
     let exit = thread::scope(|s| {
         s.spawn(|| {
-            if let Some(stream) = connect_ipc(&socket, &gone) {
+            if let Some(stream) = connect_ipc(&socket, &gone, child_pid) {
                 watch_ipc(stream, &observed, on_event);
             }
         });
@@ -187,6 +197,7 @@ where
         gone.store(true, Ordering::Relaxed);
         exit
     });
+    // Best-effort: the socket is dead once mpv exits; a leftover file is inert.
     let _ = std::fs::remove_file(&socket);
     let exit = exit.map_err(PlayError::Wait)?;
     let observed = observed.into_inner().unwrap();
@@ -253,12 +264,14 @@ fn build_argv(
 }
 
 /// Provider bytes an argv element may carry: printable ASCII, no space. Catches
-/// CR/LF (header injection, ROD-92) and >= 0x80 in one range check.
+/// CR/LF (header injection, ROD-92) and >= 0x80 in one range check. Empty is
+/// allowed: a blank optional field (referer/sub) yields an inert flag value.
 fn arg_clean(s: &str) -> bool {
     s.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
-/// UAs are the one field with legitimate spaces.
+/// UAs are the one field with legitimate spaces, and must be non-empty: an
+/// empty `--user-agent=` blanks mpv's UA and defeats the CF bot-score workaround.
 fn ua_clean(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
@@ -293,10 +306,18 @@ fn meaningful(secs: f64) -> bool {
     secs.is_finite() && secs > 0.0
 }
 
-fn connect_ipc(path: &Path, gone: &AtomicBool) -> Option<UnixStream> {
+fn connect_ipc(path: &Path, gone: &AtomicBool, child_pid: u32) -> Option<UnixStream> {
     for _ in 0..IPC_CONNECT_TRIES {
         if let Ok(stream) = UnixStream::connect(path) {
-            return Some(stream);
+            // Bind trust to the child, not the path: a same-uid squatter that
+            // won the socket would otherwise feed the watcher forged positions
+            // straight into the history DB. Reject any peer that is not our mpv.
+            if peer_pid(&stream) == Some(child_pid) {
+                return Some(stream);
+            }
+            // An impostor holds the path; keep probing until it or the budget
+            // gives out (mpv failed to bind, so a real peer will not appear,
+            // but rejecting still beats adopting the forger).
         }
         // A fast exit-2 mpv never creates the socket; stop burning the budget.
         if gone.load(Ordering::Relaxed) {
@@ -305,6 +326,34 @@ fn connect_ipc(path: &Path, gone: &AtomicBool) -> Option<UnixStream> {
         thread::sleep(IPC_CONNECT_STEP);
     }
     None
+}
+
+/// PID of the process on the other end of a Unix socket (Linux SO_PEERCRED).
+/// None if the kernel cannot answer, which is treated as "not our child".
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes a ucred no larger than `len` into `cred` and
+    // updates `len`; both outlive the call and the fd is owned by `stream`.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 && cred.pid > 0 {
+        Some(cred.pid as u32)
+    } else {
+        None
+    }
 }
 
 /// Subscribe then blocking-read property-change events until EOF (mpv exit
@@ -318,9 +367,26 @@ fn watch_ipc(stream: UnixStream, observed: &Mutex<Observed>, on_event: impl Fn(P
             return;
         }
     }
-    for line in BufReader::new(&stream).lines() {
-        let Ok(line) = line else { return };
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+    let mut reader = BufReader::new(&stream);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        // Per-line cap, not a whole-session one: a Take over &mut reader bounds
+        // only this read_until while the BufReader position persists across
+        // iterations, so a long playback's many small events still flow.
+        let n = match (&mut reader)
+            .take(MAX_IPC_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) | Err(_) => return, // EOF (mpv exit) or a dead socket
+            Ok(n) => n,
+        };
+        // A full-cap read with no newline is an oversize or newline-starved
+        // line; drop the peer rather than keep reading it.
+        if n as u64 == MAX_IPC_LINE_BYTES && !line.ends_with(b"\n") {
+            return;
+        }
+        let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
         if msg.get("event").and_then(|e| e.as_str()) != Some("property-change") {
@@ -693,6 +759,29 @@ mod tests {
         assert!(meaningful(0.001));
     }
 
+    #[test]
+    fn ipc_rejects_a_peer_that_is_not_our_child() {
+        use std::os::unix::net::UnixListener;
+
+        let path = std::env::temp_dir().join(format!("sabigoku-peer-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // A same-uid squatter: the socket exists and answers, but its peer pid
+        // is this test process, never the mpv child we would be expecting.
+        let _squatter = UnixListener::bind(&path).unwrap();
+
+        // gone=true bounds the loop to one reject-then-bail pass.
+        let gone = AtomicBool::new(true);
+        assert!(
+            connect_ipc(&path, &gone, std::process::id().wrapping_add(1)).is_none(),
+            "a peer whose pid is not the child must be refused"
+        );
+        // The same socket is adopted when the expected pid matches its peer.
+        let gone = AtomicBool::new(false);
+        assert!(connect_ipc(&path, &gone, std::process::id()).is_some());
+
+        std::fs::remove_file(&path).ok();
+    }
+
     // ── play() edges ────────────────────────────────────────────────────
 
     #[test]
@@ -735,5 +824,56 @@ mod tests {
         };
         let err = play(&opts, || Err("hash rotated".into()), |_| {}).unwrap_err();
         assert!(matches!(err, PlayError::Resolve(_)));
+    }
+
+    /// The ROD-445 seam under real spawn: a decloak link must reach mpv with
+    /// the loopback proxy url as the positional, never the raw upstream. A fake
+    /// mpv records its argv so a future `link.url` regression here fails loudly
+    /// instead of resting on the pure-`build_argv` tests (which never see the
+    /// engage wiring).
+    #[test]
+    fn decloak_url_not_upstream_reaches_the_spawned_argv() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sabigoku-e2e-{}-{}",
+            std::process::id(),
+            socket_path(Path::new("/"))
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv_dump = dir.join("argv");
+        let fake_mpv = dir.join("mpv.sh");
+        std::fs::write(
+            &fake_mpv,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nexit 0\n",
+                argv_dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_mpv, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut link = full_link();
+        link.decloak_segments = true;
+        let opts = PlayOpts {
+            mpv_path: fake_mpv.to_str().unwrap(),
+            socket_dir: &dir,
+            title: "t",
+            start_secs: 0.0,
+        };
+        let outcome = play(&opts, || Ok(link.clone()), |_| {}).unwrap();
+        assert_eq!(outcome.attempts, 1);
+
+        let dumped = std::fs::read_to_string(&argv_dump).unwrap();
+        let positional = dumped.lines().last().unwrap();
+        assert!(
+            positional.starts_with("http://127.0.0.1:"),
+            "positional was {positional:?}, expected the loopback proxy url"
+        );
+        assert_ne!(positional, link.url, "raw upstream must not reach mpv");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
