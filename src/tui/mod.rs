@@ -200,11 +200,20 @@ impl App {
         self.dirty = true;
     }
 
-    /// Detail art landed; the keep-check lives in `CoverState` (04 §6). On
-    /// accept the buffer moves straight into the render store, no clones.
+    /// Detail art landed. Dual keep-check (zigoku ROD-156 #2): the state id
+    /// match alone is blind to a selection that moved while the single-flight
+    /// gate deferred `begin_fetch`, so the live selection re-validates before
+    /// install; a miss clears and the tick retry refetches the live target.
+    /// `on_cover_error` needs no twin: it only records a cooldown keyed by
+    /// the id that actually failed, never touching the render store.
     fn on_cover_done(&mut self, for_id: i64, img: DynamicImage) {
         if self.detail_cover.on_done(for_id) {
-            self.pool.set(DETAIL_KEY, img);
+            let live = self.cards.get(self.selected).map(|c| c.anilist_id);
+            if live == Some(for_id) {
+                self.pool.set(DETAIL_KEY, img);
+            } else {
+                self.detail_cover.clear();
+            }
         }
         self.dirty = true;
     }
@@ -842,6 +851,37 @@ mod tests {
         app.tick(Event::Tick, now, &tx);
         assert!(app.detail_cover.is_loading());
         assert_eq!(app.detail_cover.for_id(), Some(6));
+        assert!(app.cover_drain.drain(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn gated_stale_result_never_installs_for_a_moved_selection() {
+        let (mut app, tx, _rx, now) = sized("gated-stale", 4);
+        app.tick(key(KeyCode::Enter), now, &tx);
+        assert_eq!(app.detail_cover.for_id(), Some(1));
+        // Gate every re-sync while the card-1 fetch is nominally in flight.
+        let held = app.cover_drain.begin();
+        app.tick(key(KeyCode::Char('l')), now, &tx);
+        app.tick(key(KeyCode::Char('l')), now, &tx);
+        assert_eq!(app.detail_cover.for_id(), Some(1), "gated: id stays pinned");
+        // The stale fetch lands: state accepts, live check must refuse it.
+        app.tick(
+            Event::CoverDone {
+                for_id: 1,
+                img: img(),
+            },
+            now,
+            &tx,
+        );
+        assert!(!app.pool.contains(DETAIL_KEY), "stale art must not install");
+        assert!(!app.detail_cover.has_pixels());
+        // Self-heal: the tick retry fetches for the live selection. Settle
+        // the real worker from the opening Enter first or the gate re-fires.
+        drop(held);
+        assert!(app.cover_drain.drain(Duration::from_secs(5)));
+        app.tick(Event::Tick, now, &tx);
+        assert!(app.detail_cover.is_loading());
+        assert_eq!(app.detail_cover.for_id(), Some(3));
         assert!(app.cover_drain.drain(Duration::from_secs(5)));
     }
 
