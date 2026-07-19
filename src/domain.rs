@@ -418,6 +418,10 @@ pub struct StreamLink {
     pub user_agent: Option<String>,
     /// HLS segments cloaked as .jpg (ROD-301); player must relax its demuxer gate.
     pub cloaked_segments: bool,
+    /// Segments carry a decoy image-header prefix before the real TS (ROD-443);
+    /// no ffmpeg flag reaches the inner demuxer, so playback routes through the
+    /// local stripping proxy (`proxy::engage`) instead of handing mpv the url.
+    pub decloak_segments: bool,
     /// External WebVTT softsub (ROD-354); None if hardsub or none.
     pub sub_url: Option<String>,
 }

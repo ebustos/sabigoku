@@ -9,6 +9,7 @@ pub mod fetchguard;
 pub mod paths;
 pub mod player;
 pub mod providers;
+pub mod proxy;
 pub mod resolve;
 pub mod resolver;
 pub mod store;
