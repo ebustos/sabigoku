@@ -19,11 +19,11 @@
 //! Keys: q quit · arrows/hjkl select · enter/d detail overlay · p cycle protocol
 //!       r hard redraw
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::widgets::{Block, Clear, Paragraph};
-use ratatui::Frame;
 use ratatui_image::errors::Errors;
 use ratatui_image::picker::{Capability, Picker, ProtocolType};
 use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
@@ -70,7 +70,7 @@ enum AppEvent {
     Cover(usize, image::DynamicImage, Duration),
     CoverFailed(usize, String),
     /// card index + resize+encode result from the worker, with the encode wall time
-    Encoded(usize, Result<ResizeResponse, Errors>, Duration),
+    Encoded(usize, Box<Result<ResizeResponse, Errors>>, Duration),
     Tick,
 }
 
@@ -98,9 +98,17 @@ struct Tier {
 
 fn tier(term_w: u16) -> Tier {
     if term_w >= 80 {
-        Tier { large: true, cover_w: 20, slot_w: 22 }
+        Tier {
+            large: true,
+            cover_w: 20,
+            slot_w: 22,
+        }
     } else {
-        Tier { large: false, cover_w: 14, slot_w: 16 }
+        Tier {
+            large: false,
+            cover_w: 14,
+            slot_w: 16,
+        }
     }
 }
 
@@ -193,7 +201,10 @@ fn main() {
         while let Ok((i, req)) = rx_worker.recv() {
             let t0 = Instant::now();
             let res = req.resize_encode();
-            if tx.send(AppEvent::Encoded(i, res, t0.elapsed())).is_err() {
+            if tx
+                .send(AppEvent::Encoded(i, Box::new(res), t0.elapsed()))
+                .is_err()
+            {
                 break;
             }
         }
@@ -215,18 +226,20 @@ fn main() {
 
     // Input thread; polls so the probe timer can tick even with no input.
     let tx = tx_main.clone();
-    thread::spawn(move || loop {
-        let ev = match event::poll(Duration::from_millis(100)) {
-            Ok(true) => match event::read() {
-                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => AppEvent::Key(k.code),
-                Ok(_) => AppEvent::Tick,
+    thread::spawn(move || {
+        loop {
+            let ev = match event::poll(Duration::from_millis(100)) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => AppEvent::Key(k.code),
+                    Ok(_) => AppEvent::Tick,
+                    Err(_) => break,
+                },
+                Ok(false) => AppEvent::Tick,
                 Err(_) => break,
-            },
-            Ok(false) => AppEvent::Tick,
-            Err(_) => break,
-        };
-        if tx.send(ev).is_err() {
-            break;
+            };
+            if tx.send(ev).is_err() {
+                break;
+            }
         }
     });
 
@@ -235,7 +248,14 @@ fn main() {
             .into_iter()
             .map(|m| {
                 let (req_tx, req_rx) = mpsc::channel();
-                Card { title: m.title.romaji, proto: None, img: None, error: None, req_tx, req_rx }
+                Card {
+                    title: m.title.romaji,
+                    proto: None,
+                    img: None,
+                    error: None,
+                    req_tx,
+                    req_rx,
+                }
             })
             .collect(),
         picker,
@@ -291,7 +311,7 @@ fn main() {
                 app.cards[i].img = Some(img);
             }
             Ok(AppEvent::CoverFailed(i, e)) => app.cards[i].error = Some(e),
-            Ok(AppEvent::Encoded(i, res, took)) => match res {
+            Ok(AppEvent::Encoded(i, res, took)) => match *res {
                 Ok(done) => {
                     app.stats.encodes += 1;
                     app.stats.last_encode = took;
@@ -370,7 +390,11 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         app.picker.protocol_type(),
         font.width,
         font.height,
-        if app.geometry { "reported" } else { "unreported" },
+        if app.geometry {
+            "reported"
+        } else {
+            "unreported"
+        },
         if t.large { "large" } else { "small" },
         t.cover_w,
         cover_h,
@@ -393,7 +417,10 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         app.stats.encodes,
         app.stats.encode_errors,
     );
-    f.render_widget(Paragraph::new(head).style(Style::new().fg(Color::Cyan)), rect_row(area, 0));
+    f.render_widget(
+        Paragraph::new(head).style(Style::new().fg(Color::Cyan)),
+        rect_row(area, 0),
+    );
     f.render_widget(Paragraph::new(stat).dim(), rect_row(area, 1));
 
     // Card grid, DESIGN 3.8 geometry: 2-cell left margin, cols = (w-2)/slot_w.
@@ -403,7 +430,10 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     let vis_rows = (grid_h / slot_h).max(1) as usize;
 
     let sel_row = app.selected / cols;
-    app.scroll_row = app.scroll_row.min(sel_row).max(sel_row.saturating_sub(vis_rows - 1));
+    app.scroll_row = app
+        .scroll_row
+        .min(sel_row)
+        .max(sel_row.saturating_sub(vis_rows - 1));
 
     for (i, card) in app.cards.iter_mut().enumerate() {
         let (row, col) = (i / cols, i % cols);
@@ -440,7 +470,12 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         let block = Block::bordered().title(format!(" {} · {}x{} ", card.title, dw, dh));
         let inner = block.inner(overlay);
         f.render_widget(block, overlay);
-        let cover = Rect::new(inner.x + 1, inner.y + 1, dw.min(inner.width), dh.min(inner.height));
+        let cover = Rect::new(
+            inner.x + 1,
+            inner.y + 1,
+            dw.min(inner.width),
+            dh.min(inner.height),
+        );
         draw_cover(f, cover, card);
     }
 }
@@ -460,7 +495,9 @@ fn draw_cover(f: &mut Frame<'_>, cover: Rect, card: &mut Card) {
         }
         (None, None) => {
             f.render_widget(
-                Paragraph::new("…loading").dim().block(Block::new().style(Style::new().bg(Color::Rgb(30, 30, 40)))),
+                Paragraph::new("…loading")
+                    .dim()
+                    .block(Block::new().style(Style::new().bg(Color::Rgb(30, 30, 40)))),
                 cover,
             );
         }
@@ -492,11 +529,31 @@ fn report(app: &App) {
     println!("spike_cover report (ROD-417)");
     println!("  protocol        {:?}", app.picker.protocol_type());
     println!("  capabilities    {:?}", app.picker.capabilities());
-    println!("  cell px         {}x{} ({})", font.width, font.height, if app.geometry { "reported" } else { "unreported -> fixed floors" });
+    println!(
+        "  cell px         {}x{} ({})",
+        font.width,
+        font.height,
+        if app.geometry {
+            "reported"
+        } else {
+            "unreported -> fixed floors"
+        }
+    );
     println!("  tmux            {}", std::env::var("TMUX").is_ok());
-    println!("  covers loaded   {}/{} (mean download+decode {:?})", app.stats.decodes, app.cards.len(), mean_dec);
-    println!("  frames          {} (last {:?}, worst {:?})", app.stats.frames, app.stats.last_frame, app.stats.worst_frame);
-    println!("  encodes         {} (last {:?}, mean {:?}, errors {})", app.stats.encodes, app.stats.last_encode, mean_enc, app.stats.encode_errors);
+    println!(
+        "  covers loaded   {}/{} (mean download+decode {:?})",
+        app.stats.decodes,
+        app.cards.len(),
+        mean_dec
+    );
+    println!(
+        "  frames          {} (last {:?}, worst {:?})",
+        app.stats.frames, app.stats.last_frame, app.stats.worst_frame
+    );
+    println!(
+        "  encodes         {} (last {:?}, mean {:?}, errors {})",
+        app.stats.encodes, app.stats.last_encode, mean_enc, app.stats.encode_errors
+    );
     for c in &app.cards {
         if let Some(e) = &c.error {
             println!("  cover error     {}: {}", c.title, e);

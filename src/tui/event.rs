@@ -22,8 +22,13 @@ pub enum Event {
     InputClosed,
     /// Shell demo worker (ROD-433): generation-tagged so the loop demonstrates
     /// the 04 §6 stale drop. Dies when real subsystem events land (ROD-434+).
-    DemoProgress { token: u64, percent: u8 },
-    DemoDone { token: u64 },
+    DemoProgress {
+        token: u64,
+        percent: u8,
+    },
+    DemoDone {
+        token: u64,
+    },
 }
 
 pub type EventRx = mpsc::Receiver<Event>;

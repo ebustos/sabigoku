@@ -110,7 +110,10 @@ mod tests {
 
     #[test]
     fn missing_file_is_defaults() {
-        assert_eq!(Config::load(Path::new("/nonexistent/config.toml")), Config::default());
+        assert_eq!(
+            Config::load(Path::new("/nonexistent/config.toml")),
+            Config::default()
+        );
     }
 
     #[test]
@@ -151,7 +154,10 @@ mod tests {
 
     #[test]
     fn cover_concurrency_clamps_at_read() {
-        let mut cfg = Config { discover_cover_concurrency: 0, ..Config::default() };
+        let mut cfg = Config {
+            discover_cover_concurrency: 0,
+            ..Config::default()
+        };
         assert_eq!(cfg.effective_cover_concurrency(), 1);
         cfg.discover_cover_concurrency = 99;
         assert_eq!(cfg.effective_cover_concurrency(), 16);

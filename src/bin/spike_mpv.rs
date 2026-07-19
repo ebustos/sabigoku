@@ -87,14 +87,22 @@ fn search(client: &reqwest::blocking::Client, query: &str) -> Result<Edge, Err> 
         .error_for_status()?
         .json()?;
 
-    let edges = resp.data.ok_or("search: data null (hash rotated?)")?.shows.edges;
+    let edges = resp
+        .data
+        .ok_or("search: data null (hash rotated?)")?
+        .shows
+        .edges;
     // Pick the best sub match: a name-contains bonus, then most episodes.
     edges
         .into_iter()
         .filter(|e| e.available.as_ref().and_then(|a| a.sub).unwrap_or(0) > 0)
         .max_by_key(|e| {
             let name = e.name.as_deref().unwrap_or("").to_lowercase();
-            let bonus = if name.contains(&query.to_lowercase()) { 1_000_000 } else { 0 };
+            let bonus = if name.contains(&query.to_lowercase()) {
+                1_000_000
+            } else {
+                0
+            };
             bonus + e.available.as_ref().and_then(|a| a.sub).unwrap_or(0)
         })
         .ok_or_else(|| "search: no show with sub episodes".into())
@@ -191,7 +199,7 @@ struct ClkHdr {
 
 // `--<hex>` provider path: hex pairs XOR 0x38 -> a clock API path.
 fn decipher_provider_path(hex: &str) -> Result<String, Err> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("odd-length hex".into());
     }
     let bytes: Result<Vec<u8>, _> = (0..hex.len())
@@ -225,7 +233,10 @@ fn consider(url: &str, referer: &str) -> Option<StreamLink> {
     if !clean_arg(url) {
         return None;
     }
-    Some(StreamLink { url: url.to_string(), referer: referer.to_string() })
+    Some(StreamLink {
+        url: url.to_string(),
+        referer: referer.to_string(),
+    })
 }
 
 fn safe_referer(r: Option<&str>) -> String {
@@ -281,12 +292,11 @@ fn resolve(
         if !allowed(&s.source_name) {
             continue;
         }
-        if let Some(url) = &s.source_url {
-            if url.contains("tools.fast4speed.rsvp") {
-                if let Some(sl) = consider(url, SITE) {
-                    return Ok(sl);
-                }
-            }
+        if let Some(url) = &s.source_url
+            && url.contains("tools.fast4speed.rsvp")
+            && let Some(sl) = consider(url, SITE)
+        {
+            return Ok(sl);
         }
     }
 
@@ -296,7 +306,9 @@ fn resolve(
             continue;
         }
         let Some(url) = &s.source_url else { continue };
-        let Some(hex) = url.strip_prefix("--") else { continue };
+        let Some(hex) = url.strip_prefix("--") else {
+            continue;
+        };
         match follow_provider(client, hex) {
             Ok(Some(sl)) => return Ok(sl),
             Ok(None) => {}
@@ -346,8 +358,15 @@ fn main() -> ExitCode {
     println!("resolved: {}\n  referer: {}", link.url, link.referer);
 
     let mut cmd = Command::new("mpv");
-    cmd.arg(format!("--referrer={}", link.referer)).arg(&link.url).args(&passthrough);
-    println!("spawning: mpv --referrer={} {} {}", link.referer, link.url, passthrough.join(" "));
+    cmd.arg(format!("--referrer={}", link.referer))
+        .arg(&link.url)
+        .args(&passthrough);
+    println!(
+        "spawning: mpv --referrer={} {} {}",
+        link.referer,
+        link.url,
+        passthrough.join(" ")
+    );
 
     match cmd.status() {
         Ok(s) if s.success() => {

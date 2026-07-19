@@ -20,7 +20,9 @@ impl Drain {
     /// which is exactly the required immediate finish (04 §5).
     pub fn begin(&self) -> FinishGuard {
         *self.state.0.lock().unwrap() += 1;
-        FinishGuard { state: Arc::clone(&self.state) }
+        FinishGuard {
+            state: Arc::clone(&self.state),
+        }
     }
 
     /// begin + detached spawn in the contract-correct order. Returns false if

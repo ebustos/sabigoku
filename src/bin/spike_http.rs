@@ -73,7 +73,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::new();
     let resp: Response = client
         .post(ENDPOINT)
-        .json(&Request { query: QUERY, variables: Variables { search: &search } })
+        .json(&Request {
+            query: QUERY,
+            variables: Variables { search: &search },
+        })
         .send()?
         .error_for_status()?
         .json()?;

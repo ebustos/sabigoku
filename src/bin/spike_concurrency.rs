@@ -17,8 +17,7 @@ use std::thread;
 use std::time::Instant;
 
 const ENDPOINT: &str = "https://graphql.anilist.co";
-const QUERY: &str =
-    "query($s:String){Page(perPage:1){media(search:$s,type:ANIME,sort:SEARCH_MATCH){title{romaji}}}}";
+const QUERY: &str = "query($s:String){Page(perPage:1){media(search:$s,type:ANIME,sort:SEARCH_MATCH){title{romaji}}}}";
 
 #[derive(Deserialize)]
 struct Response {
@@ -72,7 +71,13 @@ fn fetch_top(client: &reqwest::blocking::Client, search: &str) -> Result<String,
 }
 
 fn main() {
-    let queries = ["frieren", "bocchi the rock", "steins gate", "vinland saga", "chainsaw man"];
+    let queries = [
+        "frieren",
+        "bocchi the rock",
+        "steins gate",
+        "vinland saga",
+        "chainsaw man",
+    ];
     let (tx, rx) = mpsc::channel();
 
     for (idx, &query) in queries.iter().enumerate() {
@@ -83,18 +88,32 @@ fn main() {
             let start = Instant::now();
             let result = fetch_top(&client, query);
             // Ignore send errors: if the receiver is gone, we're shutting down.
-            let _ = tx.send(Msg { idx, query, result, ms: start.elapsed().as_millis() });
+            let _ = tx.send(Msg {
+                idx,
+                query,
+                result,
+                ms: start.elapsed().as_millis(),
+            });
         });
     }
     // Drop the original sender so the `for msg in rx` loop ends once every worker
     // (each holding a clone) has finished. Forget this and the loop hangs forever.
     drop(tx);
 
-    println!("spawned {} workers; results in COMPLETION order:\n", queries.len());
+    println!(
+        "spawned {} workers; results in COMPLETION order:\n",
+        queries.len()
+    );
     for msg in rx {
         match msg.result {
-            Ok(title) => println!("  #{} {:<16} -> {title} ({} ms)", msg.idx, msg.query, msg.ms),
-            Err(e) => println!("  #{} {:<16} -> ERR: {e} ({} ms)", msg.idx, msg.query, msg.ms),
+            Ok(title) => println!(
+                "  #{} {:<16} -> {title} ({} ms)",
+                msg.idx, msg.query, msg.ms
+            ),
+            Err(e) => println!(
+                "  #{} {:<16} -> ERR: {e} ({} ms)",
+                msg.idx, msg.query, msg.ms
+            ),
         }
     }
 }

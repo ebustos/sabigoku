@@ -52,7 +52,10 @@ fn main() -> rusqlite::Result<()> {
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(anilist_id) DO UPDATE SET
              title = excluded.title, episodes = excluded.episodes";
-    conn.execute(upsert_anime, params![154587, "Frieren: Beyond Journey's End", 28, "watching"])?;
+    conn.execute(
+        upsert_anime,
+        params![154587, "Frieren: Beyond Journey's End", 28, "watching"],
+    )?;
     conn.execute(upsert_anime, params![9253, "Steins;Gate", 24, "planning"])?;
 
     // Prove the ON CONFLICT upsert on progress: write episode 1 twice, last wins.

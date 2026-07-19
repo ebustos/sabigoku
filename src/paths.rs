@@ -97,7 +97,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn resolve(pairs: &[(&str, &str)]) -> Result<Paths, Error> {
@@ -151,14 +154,25 @@ mod tests {
     #[test]
     fn file_locations() {
         let p = resolve(&[("HOME", "/h")]).unwrap();
-        assert_eq!(p.config_file(), PathBuf::from("/h/.config/sabigoku/config.toml"));
-        assert_eq!(p.auth_file(), PathBuf::from("/h/.config/sabigoku/auth.toml"));
-        assert_eq!(p.db_file(), PathBuf::from("/h/.local/share/sabigoku/sabigoku.db"));
+        assert_eq!(
+            p.config_file(),
+            PathBuf::from("/h/.config/sabigoku/config.toml")
+        );
+        assert_eq!(
+            p.auth_file(),
+            PathBuf::from("/h/.config/sabigoku/auth.toml")
+        );
+        assert_eq!(
+            p.db_file(),
+            PathBuf::from("/h/.local/share/sabigoku/sabigoku.db")
+        );
     }
 
     #[test]
     fn ensure_dirs_creates_all_four() {
-        let root = std::env::temp_dir().join("sabigoku-paths-tests").join("ensure");
+        let root = std::env::temp_dir()
+            .join("sabigoku-paths-tests")
+            .join("ensure");
         let _ = std::fs::remove_dir_all(&root);
         let p = Paths {
             config: root.join("cfg"),
@@ -178,7 +192,10 @@ mod tests {
         let home = Path::new("/home/rod");
         assert_eq!(collapse_home(Path::new("/home/rod/x"), home), "~/x");
         assert_eq!(collapse_home(Path::new("/home/rod"), home), "~");
-        assert_eq!(collapse_home(Path::new("/home/rodney/x"), home), "/home/rodney/x");
+        assert_eq!(
+            collapse_home(Path::new("/home/rodney/x"), home),
+            "/home/rodney/x"
+        );
         assert_eq!(collapse_home(Path::new("/etc"), home), "/etc");
         assert_eq!(collapse_home(Path::new("/x"), Path::new("/")), "/x");
     }

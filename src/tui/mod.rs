@@ -28,7 +28,11 @@ const DEMO_STEP: Duration = Duration::from_millis(80);
 #[derive(Debug, PartialEq, Eq)]
 enum Demo {
     Idle,
-    Running { token: u64, percent: u8, started: AsyncStartEq },
+    Running {
+        token: u64,
+        percent: u8,
+        started: AsyncStartEq,
+    },
     Done,
     Cancelled,
 }
@@ -106,8 +110,8 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent, now: Instant, tx: &EventTx) {
-        let ctrl_c = key.code == KeyCode::Char('c')
-            && key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             _ if ctrl_c => self.quit = true,
@@ -138,7 +142,11 @@ impl App {
             tx.post(Event::DemoDone { token });
         });
         self.demo = if spawned {
-            Demo::Running { token, percent: 0, started: AsyncStartEq(AsyncStart::new(now)) }
+            Demo::Running {
+                token,
+                percent: 0,
+                started: AsyncStartEq(AsyncStart::new(now)),
+            }
         } else {
             Demo::Idle
         };
@@ -161,7 +169,9 @@ impl App {
     fn draw(&self, frame: &mut Frame<'_>, now: Instant) {
         let demo_line = match &self.demo {
             Demo::Idle => Line::from("demo: idle".dark_gray()),
-            Demo::Running { percent, started, .. } => {
+            Demo::Running {
+                percent, started, ..
+            } => {
                 let spin = started.0.frame(now, SPINNER.len());
                 let style = if started.0.is_slow(now) {
                     Style::new().fg(Color::Yellow)
@@ -304,12 +314,27 @@ mod tests {
         let (mut app, tx, _rx, now) = harness();
         let stale = app.demo_gen.bump();
         let current = app.demo_gen.bump();
-        app.demo = Demo::Running { token: current, percent: 0, started: AsyncStartEq(AsyncStart::new(now)) };
-        app.tick(Event::DemoProgress { token: stale, percent: 96 }, now, &tx);
+        app.demo = Demo::Running {
+            token: current,
+            percent: 0,
+            started: AsyncStartEq(AsyncStart::new(now)),
+        };
+        app.tick(
+            Event::DemoProgress {
+                token: stale,
+                percent: 96,
+            },
+            now,
+            &tx,
+        );
         assert_eq!(app.dropped_stale, 1);
         assert_eq!(
             app.demo,
-            Demo::Running { token: current, percent: 0, started: AsyncStartEq(AsyncStart::new(now)) }
+            Demo::Running {
+                token: current,
+                percent: 0,
+                started: AsyncStartEq(AsyncStart::new(now))
+            }
         );
         app.tick(Event::DemoDone { token: stale }, now, &tx);
         assert_eq!(app.dropped_stale, 2);
@@ -320,7 +345,11 @@ mod tests {
     fn current_demo_result_applies() {
         let (mut app, tx, _rx, now) = harness();
         let token = app.demo_gen.bump();
-        app.demo = Demo::Running { token, percent: 0, started: AsyncStartEq(AsyncStart::new(now)) };
+        app.demo = Demo::Running {
+            token,
+            percent: 0,
+            started: AsyncStartEq(AsyncStart::new(now)),
+        };
         app.tick(Event::DemoProgress { token, percent: 40 }, now, &tx);
         assert!(matches!(app.demo, Demo::Running { percent: 40, .. }));
         app.tick(Event::DemoDone { token }, now, &tx);
@@ -331,7 +360,11 @@ mod tests {
     fn cancel_flags_and_invalidates() {
         let (mut app, tx, _rx, now) = harness();
         let token = app.demo_gen.bump();
-        app.demo = Demo::Running { token, percent: 8, started: AsyncStartEq(AsyncStart::new(now)) };
+        app.demo = Demo::Running {
+            token,
+            percent: 8,
+            started: AsyncStartEq(AsyncStart::new(now)),
+        };
         let flag = app.demo_cancel.clone();
         app.tick(key(KeyCode::Char('c')), now, &tx);
         assert!(flag.is_cancelled());
@@ -355,21 +388,36 @@ mod tests {
         let (mut app, tx, rx, now) = harness();
         app.tick(key(KeyCode::Char('w')), now, &tx);
         assert_eq!(app.demo_drain.inflight(), 1);
-        let Demo::Running { token: old_token, .. } = app.demo else {
+        let Demo::Running {
+            token: old_token, ..
+        } = app.demo
+        else {
             panic!("demo not running after w");
         };
         app.tick(key(KeyCode::Char('w')), Instant::now(), &tx);
-        let Demo::Running { token: new_token, .. } = app.demo else {
+        let Demo::Running {
+            token: new_token, ..
+        } = app.demo
+        else {
             panic!("demo not running after second w");
         };
         assert_ne!(old_token, new_token);
-        app.tick(Event::DemoProgress { token: old_token, percent: 50 }, Instant::now(), &tx);
+        app.tick(
+            Event::DemoProgress {
+                token: old_token,
+                percent: 50,
+            },
+            Instant::now(),
+            &tx,
+        );
         assert_eq!(app.dropped_stale, 1);
         assert!(matches!(app.demo, Demo::Running { percent: 0, .. }));
         let deadline = Instant::now() + Duration::from_secs(10);
         while app.demo != Demo::Done {
             let left = deadline.saturating_duration_since(Instant::now());
-            let ev = rx.recv_timeout(left).expect("worker events before deadline");
+            let ev = rx
+                .recv_timeout(left)
+                .expect("worker events before deadline");
             app.tick(ev, Instant::now(), &tx);
         }
         assert!(app.demo_drain.drain(Duration::from_secs(5)));

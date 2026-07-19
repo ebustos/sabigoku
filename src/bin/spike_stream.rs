@@ -46,7 +46,7 @@ fn decrypt_tobeparsed(blob: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>>
 
 // `--<hex>` provider path: hex pairs XOR 0x38 -> a clock.json API path.
 fn decipher_provider_path(hex: &str) -> Result<String, Box<dyn std::error::Error>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("odd-length hex".into());
     }
     let bytes: Result<Vec<u8>, _> = (0..hex.len())
