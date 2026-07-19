@@ -7,6 +7,8 @@
 //! chunks.
 
 pub mod cache;
+pub mod detail;
+pub mod discover;
 pub mod disk;
 pub mod sizing;
 
@@ -29,6 +31,9 @@ pub const MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
 /// terminal with no pre-downscale, so this is the RAM rail. 2560 holds margin
 /// over the largest cover seen at freeze (~1635x2247).
 pub const MAX_COVER_DIMENSION: u32 = 2560;
+/// Same id+url (detail) or same url (discover) failure suppress window
+/// (zigoku ROD-110, 04 §8); a url change clears immediately.
+pub const RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 const FETCH_DEADLINE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
