@@ -1,2 +1,739 @@
-//! mpv spawn + IPC position polling (03 §7). StreamLink in, mpv out; imports
-//! domain and paths ONLY, glue lives in tui::workers (01 §5). Filled in ROD-438.
+//! mpv spawn, push-based IPC, and the play retry policy (03 §6.3.1, 04 §7.8).
+//! StreamLink in, position events out. Progress writes stay caller-side so the
+//! 02 §4b gate has one owner (tui::workers glue, 01 §3). Owns the proxy engage
+//! guard for exactly the mpv process lifetime (08 §10).
+
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
+
+use crate::domain::StreamLink;
+use crate::fetchguard::{GuardError, guard_fetch_url};
+use crate::proxy::{self, ProxyStartError};
+
+pub const MAX_PLAY_ATTEMPTS: u32 = 3;
+/// One entry per retry gap; indexing by attempt - 1 is safe only while
+/// len == MAX_PLAY_ATTEMPTS - 1. Keep them in lockstep.
+const BACKOFF: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(4)];
+
+/// Connect budget ~2s (03 §6.3.1): mpv creates the socket after argv parse.
+const IPC_CONNECT_TRIES: u32 = 40;
+const IPC_CONNECT_STEP: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Position {
+    pub secs: f64,
+    /// None until mpv learns it (never, for some live streams).
+    pub duration: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlayerEvent {
+    Position(Position),
+    /// A retry is scheduled (04 §7.8 PlayRetry toast); fired before the backoff
+    /// sleep so the UI shows it during the wait.
+    Retry {
+        attempt: u32,
+    },
+}
+
+#[derive(Debug)]
+pub struct PlayOutcome {
+    /// Last meaningful position (finite, > 0). None = the recordPlay gate
+    /// stays shut (02 §4b); zero store writes for this play.
+    pub position: Option<Position>,
+    pub attempts: u32,
+}
+
+pub struct PlayOpts<'a> {
+    pub mpv_path: &'a str,
+    /// IPC socket dir (paths.runtime); passed in so player stays path-agnostic.
+    pub socket_dir: &'a Path,
+    pub title: &'a str,
+    /// Resume start (03 §6.3.1 rule computed caller-side); emitted only when > 0.
+    pub start_secs: f64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PlayError {
+    #[error("resolve: {0}")]
+    Resolve(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("unsafe stream url: {0}")]
+    UnsafeUrl(#[from] GuardError),
+
+    #[error("unsafe argv field: {0}")]
+    UnsafeArg(&'static str),
+
+    #[error("proxy: {0}")]
+    Proxy(#[from] ProxyStartError),
+
+    #[error("spawn {mpv}: {source}")]
+    Spawn {
+        mpv: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("wait on mpv: {0}")]
+    Wait(#[source] io::Error),
+
+    #[error("mpv could not open the stream after {attempts} attempts")]
+    OpenFailed { attempts: u32 },
+
+    #[error("mpv exited ({status}) before any playback")]
+    Exit { status: ExitStatus },
+}
+
+/// One full play: resolve, guard, engage, spawn, observe, retry per 04 §7.8.
+/// `resolve` runs once per attempt so every retry fires on a fresh URL.
+/// `on_event` is cloned per attempt because the IPC watcher thread takes it
+/// by value; channel senders and their wrappers all satisfy the bound.
+pub fn play<F>(
+    opts: &PlayOpts,
+    mut resolve: impl FnMut() -> Result<StreamLink, Box<dyn std::error::Error + Send + Sync>>,
+    on_event: F,
+) -> Result<PlayOutcome, PlayError>
+where
+    F: Fn(PlayerEvent) + Send + Clone,
+{
+    run_attempts(
+        |_| {
+            let link = resolve().map_err(PlayError::Resolve)?;
+            attempt_play(&link, opts, on_event.clone())
+        },
+        |attempt| on_event(PlayerEvent::Retry { attempt }),
+        thread::sleep,
+    )
+}
+
+struct AttemptResult {
+    position: Option<Position>,
+    exit: ExitStatus,
+}
+
+/// Retry law (04 §7.8): only exit 2 (MpvOpenFailed) with no meaningful play
+/// yet retries; hard errors from the attempt abort immediately.
+fn run_attempts(
+    mut attempt: impl FnMut(u32) -> Result<AttemptResult, PlayError>,
+    mut on_retry: impl FnMut(u32),
+    mut backoff: impl FnMut(Duration),
+) -> Result<PlayOutcome, PlayError> {
+    for n in 1..=MAX_PLAY_ATTEMPTS {
+        let result = attempt(n)?;
+        let open_failed = result.exit.code() == Some(2) && result.position.is_none();
+        if !open_failed {
+            return match (&result.position, result.exit.success()) {
+                (None, false) => Err(PlayError::Exit {
+                    status: result.exit,
+                }),
+                _ => Ok(PlayOutcome {
+                    position: result.position,
+                    attempts: n,
+                }),
+            };
+        }
+        if n < MAX_PLAY_ATTEMPTS {
+            on_retry(n + 1);
+            backoff(BACKOFF[(n - 1) as usize]);
+        }
+    }
+    Err(PlayError::OpenFailed {
+        attempts: MAX_PLAY_ATTEMPTS,
+    })
+}
+
+fn attempt_play<F>(
+    link: &StreamLink,
+    opts: &PlayOpts,
+    on_event: F,
+) -> Result<AttemptResult, PlayError>
+where
+    F: Fn(PlayerEvent) + Send,
+{
+    // Guard the upstream url BEFORE engage: the decloak loopback url would
+    // (rightly) fail the guard, and the proxy re-guards its own hops.
+    guard_fetch_url(&link.url)?;
+    let decloak = proxy::engage(link)?;
+    let socket = socket_path(opts.socket_dir);
+    let argv = build_argv(link, decloak.url(), opts, &socket)?;
+
+    // Null stdio or mpv fights the TUI for the terminal it inherited.
+    let mut child = Command::new(opts.mpv_path)
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| PlayError::Spawn {
+            mpv: opts.mpv_path.to_string(),
+            source,
+        })?;
+
+    let observed = Mutex::new(Observed::default());
+    let gone = AtomicBool::new(false);
+    let exit = thread::scope(|s| {
+        s.spawn(|| {
+            if let Some(stream) = connect_ipc(&socket, &gone) {
+                watch_ipc(stream, &observed, on_event);
+            }
+        });
+        let exit = child.wait();
+        gone.store(true, Ordering::Relaxed);
+        exit
+    });
+    let _ = std::fs::remove_file(&socket);
+    let exit = exit.map_err(PlayError::Wait)?;
+    let observed = observed.into_inner().unwrap();
+    Ok(AttemptResult {
+        position: observed.final_position(),
+        exit,
+    })
+    // decloak drops here: proxy lifetime == mpv lifetime (ROD-445 seam).
+}
+
+// ── argv (03 §6.3.1, the table is law) ──────────────────────────────────────
+
+fn build_argv(
+    link: &StreamLink,
+    play_url: &str,
+    opts: &PlayOpts,
+    socket: &Path,
+) -> Result<Vec<String>, PlayError> {
+    // Positional: any leading '-' reads as a flag (stricter than the spike's
+    // '--' check; a real http(s) url never starts with one).
+    if !arg_clean(play_url) || play_url.starts_with('-') {
+        return Err(PlayError::UnsafeArg("url"));
+    }
+    let mut argv = Vec::new();
+    if let Some(referer) = &link.referer {
+        if !arg_clean(referer) {
+            return Err(PlayError::UnsafeArg("referer"));
+        }
+        argv.push(format!("--http-header-fields-append=Referer: {referer}"));
+    }
+    if let Some(ua) = &link.user_agent {
+        // Dedicated flag, never header-append: two UAs = Cloudflare 403.
+        if !ua_clean(ua) {
+            return Err(PlayError::UnsafeArg("user_agent"));
+        }
+        argv.push(format!("--user-agent={ua}"));
+    }
+    if play_url.starts_with("http://") || play_url.starts_with("https://") {
+        argv.push("--stream-lavf-o=multiple_requests=1,icy=0".into());
+    }
+    if let Some(sub) = &link.sub_url {
+        if !arg_clean(sub) {
+            return Err(PlayError::UnsafeArg("sub_url"));
+        }
+        argv.push(format!("--sub-file={sub}"));
+        argv.push("--sub-pos=92".into());
+        argv.push("--sub-bold=yes".into());
+    }
+    if link.cloaked_segments {
+        argv.push("--demuxer-lavf-o=allowed_extensions=ALL".into());
+    }
+    let title: String = opts.title.chars().filter(|c| !c.is_control()).collect();
+    if !title.is_empty() {
+        argv.push(format!("--force-media-title={title}"));
+        // ${media-title} expands mpv-side; the raw title never re-parses.
+        argv.push("--title=sabigoku - ${media-title}".into());
+    }
+    argv.push(format!("--input-ipc-server={}", socket.display()));
+    if opts.start_secs.is_finite() && opts.start_secs > 0.0 {
+        argv.push(format!("--start={}", opts.start_secs));
+    }
+    argv.push(play_url.to_string());
+    Ok(argv)
+}
+
+/// Provider bytes an argv element may carry: printable ASCII, no space. Catches
+/// CR/LF (header injection, ROD-92) and >= 0x80 in one range check.
+fn arg_clean(s: &str) -> bool {
+    s.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// UAs are the one field with legitimate spaces.
+fn ua_clean(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+fn socket_path(dir: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let uid = unsafe { libc::getuid() };
+    let pid = std::process::id();
+    dir.join(format!("sabigoku-mpv-{uid}-{pid}-{counter}.sock"))
+}
+
+// ── IPC (push-based, 03 §6.3.1) ─────────────────────────────────────────────
+
+#[derive(Default)]
+struct Observed {
+    /// Last meaningful time-pos; the whole recordPlay gate hangs off this.
+    meaningful_secs: Option<f64>,
+    duration: Option<f64>,
+}
+
+impl Observed {
+    fn final_position(&self) -> Option<Position> {
+        self.meaningful_secs.map(|secs| Position {
+            secs,
+            duration: self.duration,
+        })
+    }
+}
+
+fn meaningful(secs: f64) -> bool {
+    secs.is_finite() && secs > 0.0
+}
+
+fn connect_ipc(path: &Path, gone: &AtomicBool) -> Option<UnixStream> {
+    for _ in 0..IPC_CONNECT_TRIES {
+        if let Ok(stream) = UnixStream::connect(path) {
+            return Some(stream);
+        }
+        // A fast exit-2 mpv never creates the socket; stop burning the budget.
+        if gone.load(Ordering::Relaxed) {
+            return None;
+        }
+        thread::sleep(IPC_CONNECT_STEP);
+    }
+    None
+}
+
+/// Subscribe then blocking-read property-change events until EOF (mpv exit
+/// closes the socket; no read timeout on purpose, a paused player is silent
+/// for minutes). Malformed lines are skipped, never fatal.
+fn watch_ipc(stream: UnixStream, observed: &Mutex<Observed>, on_event: impl Fn(PlayerEvent)) {
+    let mut writer = &stream;
+    for (id, prop) in [(1, "time-pos"), (2, "duration")] {
+        let cmd = serde_json::json!({ "command": ["observe_property", id, prop] });
+        if writeln!(writer, "{cmd}").is_err() {
+            return;
+        }
+    }
+    for line in BufReader::new(&stream).lines() {
+        let Ok(line) = line else { return };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if msg.get("event").and_then(|e| e.as_str()) != Some("property-change") {
+            continue;
+        }
+        let data = msg.get("data").and_then(|d| d.as_f64());
+        match msg.get("id").and_then(|i| i.as_u64()) {
+            Some(1) => {
+                let Some(secs) = data else { continue };
+                let duration = {
+                    let mut observed = observed.lock().unwrap();
+                    if meaningful(secs) {
+                        observed.meaningful_secs = Some(secs);
+                    }
+                    observed.duration
+                };
+                on_event(PlayerEvent::Position(Position { secs, duration }));
+            }
+            Some(2) => {
+                if let Some(duration) = data {
+                    observed.lock().unwrap().duration = Some(duration);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Shutdown;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn exit(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code << 8)
+    }
+
+    fn full_link() -> StreamLink {
+        StreamLink {
+            url: "https://cdn.example/x.m3u8".into(),
+            resolution: Some(1080),
+            referer: Some("https://ref.example/".into()),
+            user_agent: Some("Mozilla/5.0 (X11; Linux) Gecko".into()),
+            cloaked_segments: true,
+            decloak_segments: false,
+            sub_url: Some("https://sub.example/s.vtt".into()),
+        }
+    }
+
+    fn opts<'a>(title: &'a str, start: f64) -> PlayOpts<'a> {
+        PlayOpts {
+            mpv_path: "mpv",
+            socket_dir: Path::new("/run/user/1000/sabigoku"),
+            title,
+            start_secs: start,
+        }
+    }
+
+    // ── argv ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn argv_full_house_matches_the_table() {
+        let link = full_link();
+        let socket = Path::new("/run/user/1000/sabigoku/s.sock");
+        let argv = build_argv(&link, &link.url, &opts("Frieren 冒険", 42.5), socket).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "--http-header-fields-append=Referer: https://ref.example/",
+                "--user-agent=Mozilla/5.0 (X11; Linux) Gecko",
+                "--stream-lavf-o=multiple_requests=1,icy=0",
+                "--sub-file=https://sub.example/s.vtt",
+                "--sub-pos=92",
+                "--sub-bold=yes",
+                "--demuxer-lavf-o=allowed_extensions=ALL",
+                "--force-media-title=Frieren 冒険",
+                "--title=sabigoku - ${media-title}",
+                "--input-ipc-server=/run/user/1000/sabigoku/s.sock",
+                "--start=42.5",
+                "https://cdn.example/x.m3u8",
+            ]
+        );
+    }
+
+    #[test]
+    fn argv_minimal_link_skips_every_optional_flag() {
+        let link = StreamLink {
+            url: "https://cdn.example/plain.mp4".into(),
+            resolution: None,
+            referer: None,
+            user_agent: None,
+            cloaked_segments: false,
+            decloak_segments: false,
+            sub_url: None,
+        };
+        let socket = Path::new("/tmp/s.sock");
+        let argv = build_argv(&link, &link.url, &opts("", 0.0), socket).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "--stream-lavf-o=multiple_requests=1,icy=0",
+                "--input-ipc-server=/tmp/s.sock",
+                "https://cdn.example/plain.mp4",
+            ]
+        );
+        assert!(!argv.iter().any(|a| a.contains("user-agent")));
+    }
+
+    #[test]
+    fn argv_rejects_injection_in_provider_fields() {
+        let socket = Path::new("/tmp/s.sock");
+        let mut link = full_link();
+        link.referer = Some("https://e/\r\nX-Evil: 1".into());
+        assert!(matches!(
+            build_argv(&link, &link.url.clone(), &opts("t", 0.0), socket),
+            Err(PlayError::UnsafeArg("referer"))
+        ));
+
+        let mut link = full_link();
+        link.user_agent = Some("UA\nUA".into());
+        assert!(matches!(
+            build_argv(&link, &link.url.clone(), &opts("t", 0.0), socket),
+            Err(PlayError::UnsafeArg("user_agent"))
+        ));
+
+        let mut link = full_link();
+        link.sub_url = Some("https://e/s.vtt\u{80}".into());
+        assert!(matches!(
+            build_argv(&link, &link.url.clone(), &opts("t", 0.0), socket),
+            Err(PlayError::UnsafeArg("sub_url"))
+        ));
+
+        let link = full_link();
+        assert!(matches!(
+            build_argv(&link, "--script=/tmp/evil.lua", &opts("t", 0.0), socket),
+            Err(PlayError::UnsafeArg("url"))
+        ));
+    }
+
+    #[test]
+    fn argv_title_strips_control_chars_and_empty_title_skips_flags() {
+        let link = full_link();
+        let socket = Path::new("/tmp/s.sock");
+        let argv = build_argv(&link, &link.url, &opts("A\x1b[31mB\r\n", 0.0), socket).unwrap();
+        assert!(argv.contains(&"--force-media-title=A[31mB".to_string()));
+
+        let argv = build_argv(&link, &link.url, &opts("\r\n", 0.0), socket).unwrap();
+        assert!(!argv.iter().any(|a| a.contains("title")));
+    }
+
+    #[test]
+    fn argv_start_only_when_positive_and_finite() {
+        let link = full_link();
+        let socket = Path::new("/tmp/s.sock");
+        for start in [0.0, -3.0, f64::NAN] {
+            let argv = build_argv(&link, &link.url, &opts("t", start), socket).unwrap();
+            assert!(!argv.iter().any(|a| a.starts_with("--start=")));
+        }
+    }
+
+    #[test]
+    fn socket_paths_are_unique_per_launch() {
+        let dir = Path::new("/tmp");
+        let a = socket_path(dir);
+        let b = socket_path(dir);
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("sabigoku-mpv-") && name.ends_with(".sock"));
+    }
+
+    // ── retry policy ────────────────────────────────────────────────────
+
+    fn scripted(
+        results: Vec<Result<AttemptResult, PlayError>>,
+    ) -> impl FnMut(u32) -> Result<AttemptResult, PlayError> {
+        let mut iter = results.into_iter();
+        move |_| iter.next().expect("more attempts than scripted")
+    }
+
+    fn open_failed() -> Result<AttemptResult, PlayError> {
+        Ok(AttemptResult {
+            position: None,
+            exit: exit(2),
+        })
+    }
+
+    #[test]
+    fn open_failed_retries_with_backoff_then_succeeds() {
+        let mut sleeps = Vec::new();
+        let mut retries = Vec::new();
+        let out = run_attempts(
+            scripted(vec![
+                open_failed(),
+                open_failed(),
+                Ok(AttemptResult {
+                    position: Some(Position {
+                        secs: 3.0,
+                        duration: Some(24.0),
+                    }),
+                    exit: exit(0),
+                }),
+            ]),
+            |n| retries.push(n),
+            |d| sleeps.push(d),
+        )
+        .unwrap();
+        assert_eq!(out.attempts, 3);
+        assert_eq!(out.position.unwrap().secs, 3.0);
+        assert_eq!(sleeps, [Duration::from_secs(2), Duration::from_secs(4)]);
+        assert_eq!(retries, [2, 3]);
+    }
+
+    #[test]
+    fn exit_two_with_meaningful_play_never_retries() {
+        let out = run_attempts(
+            scripted(vec![Ok(AttemptResult {
+                position: Some(Position {
+                    secs: 300.0,
+                    duration: None,
+                }),
+                exit: exit(2),
+            })]),
+            |_| panic!("no retry"),
+            |_| panic!("no backoff"),
+        )
+        .unwrap();
+        assert_eq!(out.attempts, 1);
+        assert_eq!(out.position.unwrap().secs, 300.0);
+    }
+
+    #[test]
+    fn exhausted_budget_is_open_failed() {
+        let mut sleeps = Vec::new();
+        let err = run_attempts(
+            scripted(vec![open_failed(), open_failed(), open_failed()]),
+            |_| {},
+            |d| sleeps.push(d),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlayError::OpenFailed { attempts: 3 }));
+        assert_eq!(sleeps, [Duration::from_secs(2), Duration::from_secs(4)]);
+    }
+
+    #[test]
+    fn other_exit_codes_fail_without_retry() {
+        let err = run_attempts(
+            scripted(vec![Ok(AttemptResult {
+                position: None,
+                exit: exit(1),
+            })]),
+            |_| panic!("no retry"),
+            |_| panic!("no backoff"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlayError::Exit { .. }));
+    }
+
+    #[test]
+    fn clean_exit_without_playback_is_ok_with_gate_shut() {
+        let out = run_attempts(
+            scripted(vec![Ok(AttemptResult {
+                position: None,
+                exit: exit(0),
+            })]),
+            |_| {},
+            |_| panic!("no backoff"),
+        )
+        .unwrap();
+        assert!(out.position.is_none());
+    }
+
+    #[test]
+    fn hard_attempt_error_aborts_immediately() {
+        let err = run_attempts(
+            scripted(vec![Err(PlayError::UnsafeArg("url"))]),
+            |_| panic!("no retry"),
+            |_| panic!("no backoff"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlayError::UnsafeArg("url")));
+    }
+
+    // ── IPC watcher ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ipc_handshake_events_and_final_position() {
+        let (client, server) = UnixStream::pair().unwrap();
+        {
+            let mut srv = &server;
+            for line in [
+                r#"{"event":"property-change","id":1,"name":"time-pos","data":5.5}"#,
+                r#"{"event":"property-change","id":2,"name":"duration","data":24.0}"#,
+                r#"{"event":"property-change","id":1,"name":"time-pos","data":6.5}"#,
+                r#"{"event":"property-change","id":1,"name":"time-pos","data":null}"#,
+                "not json at all",
+                r#"{"request_id":0,"error":"success"}"#,
+                r#"{"event":"property-change","id":1,"name":"time-pos","data":0.0}"#,
+            ] {
+                writeln!(srv, "{line}").unwrap();
+            }
+        }
+        server.shutdown(Shutdown::Write).unwrap();
+
+        let observed = Mutex::new(Observed::default());
+        let events = Mutex::new(Vec::new());
+        watch_ipc(client, &observed, |e| events.lock().unwrap().push(e));
+
+        let mut handshake = String::new();
+        let mut reader = BufReader::new(&server);
+        for expected in [
+            serde_json::json!({ "command": ["observe_property", 1, "time-pos"] }),
+            serde_json::json!({ "command": ["observe_property", 2, "duration"] }),
+        ] {
+            handshake.clear();
+            reader.read_line(&mut handshake).unwrap();
+            let sent: serde_json::Value = serde_json::from_str(&handshake).unwrap();
+            assert_eq!(sent, expected);
+        }
+
+        let events = events.into_inner().unwrap();
+        assert_eq!(
+            events,
+            [
+                PlayerEvent::Position(Position {
+                    secs: 5.5,
+                    duration: None
+                }),
+                PlayerEvent::Position(Position {
+                    secs: 6.5,
+                    duration: Some(24.0)
+                }),
+                PlayerEvent::Position(Position {
+                    secs: 0.0,
+                    duration: Some(24.0)
+                }),
+            ]
+        );
+        assert_eq!(
+            observed.into_inner().unwrap().final_position(),
+            Some(Position {
+                secs: 6.5,
+                duration: Some(24.0)
+            })
+        );
+    }
+
+    #[test]
+    fn ipc_without_meaningful_position_keeps_the_gate_shut() {
+        let (client, server) = UnixStream::pair().unwrap();
+        {
+            let mut srv = &server;
+            writeln!(
+                srv,
+                r#"{{"event":"property-change","id":1,"name":"time-pos","data":0.0}}"#
+            )
+            .unwrap();
+        }
+        server.shutdown(Shutdown::Write).unwrap();
+        let observed = Mutex::new(Observed::default());
+        watch_ipc(client, &observed, |_| {});
+        assert_eq!(observed.into_inner().unwrap().final_position(), None);
+    }
+
+    #[test]
+    fn meaningful_is_finite_and_positive() {
+        for bad in [0.0, -3.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!meaningful(bad));
+        }
+        assert!(meaningful(0.001));
+    }
+
+    // ── play() edges ────────────────────────────────────────────────────
+
+    #[test]
+    fn private_stream_url_is_blocked_before_spawn() {
+        let mut link = full_link();
+        link.url = "http://192.168.1.10/x.m3u8".into();
+        let opts = PlayOpts {
+            mpv_path: "/definitely/not/mpv",
+            socket_dir: Path::new("/tmp"),
+            title: "t",
+            start_secs: 0.0,
+        };
+        let err = play(&opts, || Ok(link.clone()), |_| {}).unwrap_err();
+        assert!(matches!(err, PlayError::UnsafeUrl(GuardError::BlockedHost)));
+    }
+
+    #[test]
+    fn decloak_link_engages_and_reaches_spawn_unguarded_loopback() {
+        let mut link = full_link();
+        link.decloak_segments = true;
+        let opts = PlayOpts {
+            mpv_path: "/definitely/not/mpv",
+            socket_dir: Path::new("/tmp"),
+            title: "t",
+            start_secs: 0.0,
+        };
+        // Spawn (not UnsafeUrl) proves the guard ran on the upstream url and
+        // the engaged loopback url was handed to mpv untouched.
+        let err = play(&opts, || Ok(link.clone()), |_| {}).unwrap_err();
+        assert!(matches!(err, PlayError::Spawn { .. }));
+    }
+
+    #[test]
+    fn resolve_failure_propagates_without_attempting() {
+        let opts = PlayOpts {
+            mpv_path: "/definitely/not/mpv",
+            socket_dir: Path::new("/tmp"),
+            title: "t",
+            start_secs: 0.0,
+        };
+        let err = play(&opts, || Err("hash rotated".into()), |_| {}).unwrap_err();
+        assert!(matches!(err, PlayError::Resolve(_)));
+    }
+}

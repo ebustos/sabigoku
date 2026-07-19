@@ -2644,6 +2644,7 @@ dependencies = [
  "aes-gcm",
  "base64",
  "image",
+ "libc",
  "ratatui",
  "ratatui-image",
  "reqwest",

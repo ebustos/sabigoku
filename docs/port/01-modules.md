@@ -75,7 +75,7 @@ this table is law:
 | `source` | domain |
 | `providers/*` | source (+ own http/hls helpers); **never** tui/store |
 | `store` | domain, paths **only** (no source, no providers) |
-| `player` | domain, paths **only** (StreamLink in, mpv out; glued in tui/workers) |
+| `player` | domain, fetchguard, proxy (spawn-edge guard + engage seam, 08 §10; StreamLink in, mpv out; glued in tui/workers) |
 | `resolver` | domain, **anilist** (reuses its pure scorers; see §5) |
 | `anilist` | domain, source, util |
 | `auth` | paths |
