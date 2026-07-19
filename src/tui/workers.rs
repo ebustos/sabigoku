@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::domain::Translation;
 use crate::error::Error;
 use crate::player::Position;
+use crate::providers::{CatalogProvider, DiscoverAxis};
 use crate::store::Store;
 use crate::tui::covers::{self, CoverCaches};
 use crate::tui::event::{Event, EventTx};
@@ -81,6 +82,33 @@ pub fn spawn_discover_cover_fetch(
         let event = match covers::load_cover_pixels(None, &url, &caches, &covers_dir) {
             Ok(img) => Event::DiscoverCoverDone { url, img },
             Err(_) => Event::DiscoverCoverError { url },
+        };
+        tx.post(event);
+    })
+}
+
+/// One discover feed page (04 §7.5): single-flight per axis, slot-filed by
+/// (axis, page) on arrival, so no generation token is needed.
+#[must_use]
+pub fn spawn_discover_feed(
+    drain: &Drain,
+    tx: EventTx,
+    catalog: Arc<dyn CatalogProvider>,
+    axis: DiscoverAxis,
+    page: u32,
+) -> bool {
+    drain.spawn("discover-feed", move || {
+        let event = match catalog.discover(axis, page) {
+            Ok(result) => Event::DiscoverFeed {
+                axis,
+                page,
+                entries: result.entries,
+                has_next: result.has_next,
+            },
+            Err(cause) => Event::DiscoverFeedError {
+                axis,
+                cause: cause.to_string(),
+            },
         };
         tx.post(event);
     })

@@ -52,3 +52,13 @@ pub enum InputMode {
     Search,
     Command,
 }
+
+/// Ambient render inputs every view draw shares: the resolved title
+/// preference (DESIGN 8.2), the current cour (badges, chips), and the frame
+/// instant (spinner phase, slow escalation).
+#[derive(Debug, Clone, Copy)]
+pub struct ViewEnv {
+    pub pref: crate::domain::TitleLanguage,
+    pub cour: crate::domain::Cour,
+    pub now: std::time::Instant,
+}

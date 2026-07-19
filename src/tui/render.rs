@@ -9,6 +9,8 @@ use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::domain::{Cour, Season};
+
 use super::theme::Palette;
 
 /// Braille spinner frames, ~100ms per frame (DESIGN 4.8).
@@ -16,6 +18,47 @@ pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", 
 
 pub fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
+}
+
+/// DESIGN 2.3 season glyphs.
+pub fn season_kanji(season: Season) -> &'static str {
+    match season {
+        Season::Winter => "冬",
+        Season::Spring => "春",
+        Season::Summer => "夏",
+        Season::Fall => "秋",
+    }
+}
+
+/// `冬 2026`-style chip for the ambient cour fallback (DESIGN 3.4).
+pub fn cour_chip(cour: Cour) -> String {
+    format!("{} {}", season_kanji(cour.season), cour.year)
+}
+
+/// Chip for a show/card's own season; absent unless both parts are known
+/// (DESIGN 3.4: never an empty chip).
+pub fn season_chip(season: Option<Season>, year: Option<u32>) -> Option<String> {
+    Some(format!("{} {}", season_kanji(season?), year?))
+}
+
+/// Compact list/card score badge (DESIGN 2.2): `[97]` / `[--]`.
+pub fn score_badge(score: Option<u32>) -> String {
+    match score {
+        Some(s) => format!("[{s}]"),
+        None => "[--]".to_string(),
+    }
+}
+
+/// DESIGN 2.2 tier colours. `cap_hot` is the card rule (DESIGN 3.8): the 91+
+/// tier steps down to fg so `TOP` keeps the one magenta pointer.
+pub fn score_style(palette: &Palette, score: Option<u32>, cap_hot: bool) -> Style {
+    match score {
+        Some(s) if s >= 91 && !cap_hot => Style::new().fg(palette.hot).add_modifier(Modifier::BOLD),
+        Some(s) if s >= 91 => Style::new().fg(palette.fg).add_modifier(Modifier::BOLD),
+        Some(s) if s >= 76 => Style::new().fg(palette.fg),
+        Some(s) if s >= 51 => Style::new().fg(palette.fg2),
+        _ => Style::new().fg(palette.fg3),
+    }
 }
 
 /// Truncate to `max_cols` display columns on a grapheme boundary with a

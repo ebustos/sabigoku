@@ -8,6 +8,9 @@ use std::time::Duration;
 use image::DynamicImage;
 use ratatui::crossterm::event::{self as ct, KeyEvent};
 
+use crate::domain::Enrichment;
+use crate::providers::DiscoverAxis;
+
 use super::workers::{CancelFlag, Drain};
 
 /// No `Eq`: cover events carry pixel payloads (`DynamicImage` is `PartialEq`
@@ -43,6 +46,18 @@ pub enum Event {
     /// the pool's own channel (ratatui-image types are not comparable, so
     /// they stay out of this enum); tick applies it on the UI thread.
     CoverEncodeReady,
+    /// One feed page (04 §4.2). Files into the axis slot; an out-of-order
+    /// page is discarded by the slot logic, never by a generation token.
+    DiscoverFeed {
+        axis: DiscoverAxis,
+        page: u32,
+        entries: Vec<Enrichment>,
+        has_next: bool,
+    },
+    DiscoverFeedError {
+        axis: DiscoverAxis,
+        cause: String,
+    },
 }
 
 pub type EventRx = mpsc::Receiver<Event>;

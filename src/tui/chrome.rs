@@ -362,60 +362,24 @@ pub fn draw_bottom_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, bar
     }
 }
 
-/// AniList cour for a UTC unix timestamp: 冬 Dec–Feb with December rolled into
-/// next year's winter, 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov (DESIGN 3.4). UTC is
-/// a deliberate simplification: the chip is ambient context and a cour
-/// boundary is off by hours at worst.
-pub fn current_cour(unix_secs: i64) -> String {
-    let (year, month) = civil_year_month(unix_secs.div_euclid(86_400));
-    let (kanji, year) = match month {
-        12 => ("冬", year + 1),
-        1 | 2 => ("冬", year),
-        3..=5 => ("春", year),
-        6..=8 => ("夏", year),
-        _ => ("秋", year),
-    };
-    format!("{kanji} {year}")
-}
-
-/// Days-since-epoch to civil (year, month), Gregorian.
-fn civil_year_month(days: i64) -> (i64, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::render::cour_chip;
+    use crate::domain::current_cour;
 
-    /// 2026-07-19 is 夏 2026 (this file's own authoring date).
+    /// The chip end to end: `domain::current_cour` owns the civil math and the
+    /// December roll; this pins the kanji formatting over its boundaries.
     #[test]
-    fn cour_boundaries_match_anilist_seasons() {
-        // Epoch day helpers: known timestamps at UTC noon.
+    fn cour_chip_matches_anilist_seasons() {
         let cases = [
             (1_768_824_000, "冬 2026"), // 2026-01-19
             (1_774_008_000, "春 2026"), // 2026-03-20
             (1_784_887_200, "夏 2026"), // 2026-07-24
             (1_792_305_600, "秋 2026"), // 2026-10-18
             (1_797_403_600, "冬 2027"), // 2026-12-16 rolls forward
-            (1_800_016_400, "冬 2027"), // 2027-01-15
         ];
         for (secs, want) in cases {
-            assert_eq!(current_cour(secs), want, "at {secs}");
+            assert_eq!(cour_chip(current_cour(secs)), want, "at {secs}");
         }
-    }
-
-    #[test]
-    fn civil_math_handles_pre_epoch() {
-        // 1969-12-31 is day -1.
-        assert_eq!(civil_year_month(-1), (1969, 12));
-        assert_eq!(civil_year_month(0), (1970, 1));
     }
 }

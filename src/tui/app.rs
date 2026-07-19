@@ -21,6 +21,9 @@ use ratatui::widgets::Block;
 use ratatui_image::picker::Picker;
 
 use crate::config::Config;
+use crate::domain::{self, TitleLanguage};
+use crate::providers::{CatalogProvider, DiscoverAxis};
+use crate::store::Store;
 
 use super::chrome::{self, BottomBar, HelpLine, Tab, TopBar};
 use super::covers::CoverCaches;
@@ -35,7 +38,7 @@ use super::view::detail::{self, DetailState};
 use super::view::discover::{self, DiscoverState};
 use super::view::history::{self, HistoryState};
 use super::view::settings::{self, SettingsState};
-use super::view::{InputMode, Origin, Pane, View};
+use super::view::{InputMode, Origin, Pane, View, ViewEnv};
 use super::workers::Drain;
 
 /// Unknown-command bottom-bar flash (DESIGN 3.5).
@@ -56,23 +59,28 @@ pub struct App {
     config: Config,
     browse: BrowseState,
     history: HistoryState,
-    discover: DiscoverState,
+    pub(super) discover: DiscoverState,
     settings: SettingsState,
     detail: DetailState,
-    // Read again when the cover fetch paths rewire (chunks 2-3).
-    #[allow(dead_code)]
+    store: Store,
+    catalog: Arc<dyn CatalogProvider>,
     caches: Arc<CoverCaches>,
-    #[allow(dead_code)]
     covers_dir: PathBuf,
     pub(super) pool: ProtocolPool,
     pub(super) cover_drain: Drain,
-    pub(super) discover_cover_drain: Drain,
     pub(super) encode_drain: Drain,
 }
 
 impl App {
     /// State only; workers start in `run` (bootstrap order is its job).
-    pub fn new(config: &Config, covers_dir: PathBuf, picker: Picker, tx: &EventTx) -> App {
+    pub fn new(
+        config: &Config,
+        store: Store,
+        catalog: Arc<dyn CatalogProvider>,
+        covers_dir: PathBuf,
+        picker: Picker,
+        tx: &EventTx,
+    ) -> App {
         let encode_drain = Drain::default();
         let pool = ProtocolPool::new(picker, tx.clone(), &encode_drain);
         App {
@@ -93,29 +101,38 @@ impl App {
             discover: DiscoverState::default(),
             settings: SettingsState::default(),
             detail: DetailState::default(),
+            store,
+            catalog,
             caches: Arc::new(CoverCaches::new()),
             covers_dir,
             pool,
             cover_drain: Drain::default(),
-            discover_cover_drain: Drain::default(),
             encode_drain,
         }
     }
 
     /// Mutates; draw is pure (04 §1). Dispatch only.
-    pub(super) fn tick(&mut self, event: Event, now: Instant, _tx: &EventTx) {
+    pub(super) fn tick(&mut self, event: Event, now: Instant, tx: &EventTx) {
         match event {
             Event::Key(key) => self.on_key(key, now),
             Event::Resize(w, h) => self.on_resize(w, h),
             Event::FocusGained | Event::FocusLost => {}
             // No keys can ever arrive again; quit clean instead of zombieing.
             Event::InputClosed => self.quit = true,
-            Event::Tick => self.on_tick(now),
-            // Cover results rewire into DetailState/DiscoverState in
-            // chunks 2-3; nothing spawns these workers yet.
+            Event::Tick => self.on_tick(now, tx),
+            // Detail cover results rewire into DetailState in chunk 3;
+            // nothing spawns that worker yet.
             Event::CoverDone { .. } | Event::CoverError { .. } => {}
-            Event::DiscoverCoverDone { .. } | Event::DiscoverCoverError { .. } => {}
+            Event::DiscoverCoverDone { url, img } => self.on_discover_cover_done(&url, img),
+            Event::DiscoverCoverError { url } => self.on_discover_cover_error(&url, now),
             Event::CoverEncodeReady => self.on_encode_ready(),
+            Event::DiscoverFeed {
+                axis,
+                page,
+                entries,
+                has_next,
+            } => self.on_discover_feed(axis, page, entries, has_next),
+            Event::DiscoverFeedError { axis, cause } => self.on_discover_feed_error(axis, cause),
         }
     }
 
@@ -133,14 +150,14 @@ impl App {
             return;
         }
         match self.mode {
-            InputMode::Normal => self.on_normal_key(key),
+            InputMode::Normal => self.on_normal_key(key, now),
             InputMode::Search => self.on_search_key(key),
             InputMode::Command => self.on_command_key(key, now),
         }
         self.dirty = true;
     }
 
-    fn on_normal_key(&mut self, key: KeyEvent) {
+    fn on_normal_key(&mut self, key: KeyEvent, now: Instant) {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('B') => self.switch_view(View::Browse),
@@ -154,6 +171,9 @@ impl App {
             KeyCode::Enter => self.on_enter(),
             KeyCode::Char('h') => self.on_h(),
             KeyCode::Char('l') => self.on_l(),
+            KeyCode::Char('j') => self.on_j(),
+            KeyCode::Char('k') => self.on_k(),
+            KeyCode::Char('P') => self.on_plan(now),
             KeyCode::Char(']') => self.on_axis_cycle(1),
             KeyCode::Char('[') => self.on_axis_cycle(-1),
             KeyCode::Char(c @ '1'..='4') => self.on_axis_select(c),
@@ -240,17 +260,36 @@ impl App {
         match self.view {
             View::Browse | View::History if self.pane == Pane::Detail => self.pane = Pane::List,
             View::Detail => self.demote(),
+            View::Discover => self.nav_discover(-1, 0),
             _ => {}
         }
     }
 
     fn on_l(&mut self) {
-        if matches!(self.view, View::Browse | View::History)
-            && self.pane == Pane::List
-            && self.two_pane()
-        {
-            self.pane = Pane::Detail;
+        match self.view {
+            View::Browse | View::History if self.pane == Pane::List && self.two_pane() => {
+                self.pane = Pane::Detail
+            }
+            View::Discover => self.nav_discover(1, 0),
+            _ => {}
         }
+    }
+
+    fn on_j(&mut self) {
+        if self.view == View::Discover {
+            self.nav_discover(0, 1);
+        }
+    }
+
+    fn on_k(&mut self) {
+        if self.view == View::Discover {
+            self.nav_discover(0, -1);
+        }
+    }
+
+    fn nav_discover(&mut self, dx: i64, dy: i64) {
+        let geo = self.discover_geo();
+        self.discover.nav(dx, dy, &geo);
     }
 
     fn on_axis_cycle(&mut self, delta: i64) {
@@ -262,6 +301,24 @@ impl App {
     fn on_axis_select(&mut self, c: char) {
         if self.view == View::Discover {
             self.discover.select_axis((c as u8 - b'1') as usize);
+        }
+    }
+
+    /// `P` "plan it" (DESIGN 6.1): Discover saves the selected card to the
+    /// watchlist; the show row's default list status is planning. Browse's
+    /// variant joins in chunk 3, History's transition in chunk 5.
+    fn on_plan(&mut self, now: Instant) {
+        if self.view != View::Discover {
+            return;
+        }
+        let Some(entry) = self.discover.selected_entry() else {
+            return;
+        };
+        match self.store.add_to_library(entry, unix_now()) {
+            Ok(()) => self.toasts.push(Kind::Success, "added to watchlist", now),
+            Err(_) => self
+                .toasts
+                .push(Kind::Error, "couldn't add to watchlist", now),
         }
     }
 
@@ -378,12 +435,69 @@ impl App {
         self.dirty = true;
     }
 
-    /// ~100ms cadence (04 §8): toast TTL and the command flash ride it.
-    fn on_tick(&mut self, now: Instant) {
+    /// ~100ms cadence (04 §8): toast TTL, the command flash, and the Discover
+    /// feed + cover pump ride it.
+    fn on_tick(&mut self, now: Instant, tx: &EventTx) {
         self.toasts.tick(now);
         if self.command_flash.is_some_and(|until| now >= until) {
             self.command_flash = None;
         }
+        if self.view == View::Discover {
+            self.tick_discover(now, tx);
+        }
+        self.dirty = true;
+    }
+
+    /// Feed decision + cover pump for the active axis. The cap is a live
+    /// config read each pump, the ROD-240 freeze law (the ROD-438 startup
+    /// snapshot compromise is retired).
+    fn tick_discover(&mut self, now: Instant, tx: &EventTx) {
+        let geo = self.discover_geo();
+        if let Some(page) = self.discover.wanted_fetch(&geo) {
+            self.discover.fire_fetch(page, now, tx, &self.catalog);
+        }
+        if self.config.cover_art {
+            let cap = self.config.effective_cover_concurrency() as usize;
+            self.discover.pump(
+                now,
+                cap,
+                &mut self.pool,
+                tx,
+                &self.caches,
+                &self.covers_dir,
+                &geo,
+            );
+        }
+    }
+
+    fn discover_geo(&self) -> discover::GridGeo {
+        discover::grid_geo(self.term.0, self.term.1.saturating_sub(3), self.pool.cell())
+    }
+
+    fn on_discover_feed(
+        &mut self,
+        axis: DiscoverAxis,
+        page: u32,
+        entries: Vec<domain::Enrichment>,
+        has_next: bool,
+    ) {
+        self.discover
+            .on_feed(axis, page, entries, has_next, &self.store, unix_now());
+        self.dirty = true;
+    }
+
+    fn on_discover_feed_error(&mut self, axis: DiscoverAxis, cause: String) {
+        self.discover.on_feed_error(axis, cause);
+        self.dirty = true;
+    }
+
+    fn on_discover_cover_done(&mut self, url: &str, img: image::DynamicImage) {
+        self.discover.on_cover_done(url, img, &mut self.pool);
+        self.dirty = true;
+    }
+
+    fn on_discover_cover_error(&mut self, url: &str, now: Instant) {
+        self.discover.on_cover_error(url, now);
         self.dirty = true;
     }
 
@@ -418,11 +532,27 @@ impl App {
             View::Browse => browse::draw(frame, rows.content, self.palette, &self.browse),
             View::History => history::draw(frame, rows.content, self.palette, &self.history),
             View::Detail => detail::draw(frame, rows.content, self.palette, &self.detail),
-            View::Discover => discover::draw(frame, rows.content, self.palette, &self.discover),
+            View::Discover => self.draw_discover(frame, rows.content, now),
             View::Settings => settings::draw(frame, rows.content, self.palette, &self.settings),
         }
         chrome::draw_bottom_bar(frame, rows.bottom, self.palette, &self.bottom_bar(now));
         self.toasts.draw(frame, area, self.palette);
+    }
+
+    fn draw_discover(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
+        let env = ViewEnv {
+            pref: TitleLanguage::parse(&self.config.title_language),
+            cour: domain::current_cour(unix_now()),
+            now,
+        };
+        discover::draw(
+            frame,
+            area,
+            self.palette,
+            &self.discover,
+            &mut self.pool,
+            &env,
+        );
     }
 
     fn top_bar(&self) -> TopBar {
@@ -439,11 +569,17 @@ impl App {
                 Origin::Discover => Tab::Discover,
             },
         };
-        // Browse/History fall back to the current cour; Detail and Discover
-        // track their show/card only (none selected yet, chunks 2-3);
+        // Browse/History fall back to the current cour; Discover tracks the
+        // selected card with no fallback; Detail tracks its show (chunk 3);
         // Settings shows no chip (DESIGN 3.4, 7.3).
         let season_chip = match self.view {
-            View::Browse | View::History => Some(chrome::current_cour(unix_now())),
+            View::Browse | View::History => {
+                Some(render::cour_chip(domain::current_cour(unix_now())))
+            }
+            View::Discover => self
+                .discover
+                .selected_entry()
+                .and_then(|e| render::season_chip(e.season, e.year)),
             _ => None,
         };
         let dot_lit = match self.view {
@@ -531,17 +667,90 @@ mod tests {
         key(KeyCode::Char(c))
     }
 
-    fn harness(name: &str) -> (App, EventTx, Instant) {
+    use crate::domain::Enrichment;
+    use crate::providers::{CatalogError, CatalogPage};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// Scripted catalog: each `discover` call pops the next page; an empty
+    /// script answers Network so nothing ever leaves the process.
+    struct StubCatalog(Mutex<VecDeque<Result<CatalogPage, CatalogError>>>);
+
+    impl StubCatalog {
+        fn scripted(pages: Vec<Result<CatalogPage, CatalogError>>) -> Arc<dyn CatalogProvider> {
+            Arc::new(StubCatalog(Mutex::new(pages.into())))
+        }
+
+        fn inert() -> Arc<dyn CatalogProvider> {
+            Self::scripted(Vec::new())
+        }
+    }
+
+    impl CatalogProvider for StubCatalog {
+        fn search(&self, _q: &str, _p: u32) -> Result<CatalogPage, CatalogError> {
+            Err(CatalogError::Network)
+        }
+        fn discover(&self, _a: DiscoverAxis, _p: u32) -> Result<CatalogPage, CatalogError> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(CatalogError::Network))
+        }
+        fn enrich(&self, _id: i64) -> Result<Option<Enrichment>, CatalogError> {
+            Ok(None)
+        }
+    }
+
+    fn feed_entry(id: i64) -> Enrichment {
+        Enrichment {
+            anilist_id: id,
+            title_romaji: format!("Show {id}"),
+            ..Enrichment::default()
+        }
+    }
+
+    fn one_page(n: i64) -> Result<CatalogPage, CatalogError> {
+        Ok(CatalogPage {
+            entries: (1..=n).map(feed_entry).collect(),
+            has_next: false,
+        })
+    }
+
+    fn harness_with(
+        name: &str,
+        catalog: Arc<dyn CatalogProvider>,
+    ) -> (App, EventTx, super::super::event::EventRx, Instant) {
         let covers_dir = std::env::temp_dir().join("sabigoku-app-tests").join(name);
-        let (tx, _rx) = super::super::event::channel();
-        let app = App::new(&Config::default(), covers_dir, Picker::halfblocks(), &tx);
-        (app, tx, Instant::now())
+        let (tx, rx) = super::super::event::channel();
+        let app = App::new(
+            &Config::default(),
+            Store::open_memory().unwrap(),
+            catalog,
+            covers_dir,
+            Picker::halfblocks(),
+            &tx,
+        );
+        (app, tx, rx, Instant::now())
+    }
+
+    fn harness(name: &str) -> (App, EventTx, Instant) {
+        let (app, tx, _rx, now) = harness_with(name, StubCatalog::inert());
+        (app, tx, now)
     }
 
     fn sized(name: &str, w: u16, h: u16) -> (App, EventTx, Instant) {
         let (mut app, tx, now) = harness(name);
         app.tick(Event::Resize(w, h), now, &tx);
         (app, tx, now)
+    }
+
+    /// Settle the feed worker, then apply everything it posted.
+    fn settle_feed(app: &mut App, tx: &EventTx, rx: &super::super::event::EventRx, now: Instant) {
+        assert!(app.discover.drain(Duration::from_secs(5)));
+        while let Ok(ev) = rx.try_recv() {
+            app.tick(ev, now, tx);
+        }
     }
 
     fn press(app: &mut App, tx: &EventTx, now: Instant, events: &[Event]) {
@@ -809,15 +1018,92 @@ mod tests {
         let (mut app, tx, now) = sized("axis", 100, 30);
         app.tick(ch('D'), now, &tx);
         app.tick(ch(']'), now, &tx);
-        assert_eq!(app.discover.axis, 1);
+        assert_eq!(app.discover.axis(), DiscoverAxis::Popular);
         press(&mut app, &tx, now, &[ch('['), ch('[')]);
-        assert_eq!(app.discover.axis, 3, "cycle wraps");
+        assert_eq!(app.discover.axis(), DiscoverAxis::ThisSeason, "cycle wraps");
         app.tick(ch('2'), now, &tx);
-        assert_eq!(app.discover.axis, 1);
+        assert_eq!(app.discover.axis(), DiscoverAxis::Popular);
         // Axis keys are Discover-only.
         app.tick(ch('B'), now, &tx);
         app.tick(ch(']'), now, &tx);
-        assert_eq!(app.discover.axis, 1);
+        assert_eq!(app.discover.axis(), DiscoverAxis::Popular);
+    }
+
+    #[test]
+    fn entering_discover_fetches_and_lands_the_feed() {
+        let (mut app, tx, rx, now) =
+            harness_with("feed-e2e", StubCatalog::scripted(vec![one_page(3)]));
+        app.tick(Event::Resize(100, 30), now, &tx);
+        app.tick(ch('D'), now, &tx);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(app.discover.selected_entry().unwrap().anilist_id, 1);
+        // Applied rows upsert catalog_cache (04 §10).
+        assert!(app.store.get_catalog(1).unwrap().is_some());
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("Show 1"));
+        assert!(text.contains("all entries loaded"));
+    }
+
+    #[test]
+    fn discover_feed_error_renders_the_persistent_state() {
+        let (mut app, tx, rx, now) = harness_with(
+            "feed-error",
+            StubCatalog::scripted(vec![Err(CatalogError::Network)]),
+        );
+        app.tick(Event::Resize(100, 30), now, &tx);
+        app.tick(ch('D'), now, &tx);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("can't reach the feed"));
+        // A later tick must not auto-retry a failed axis (storm guard).
+        app.tick(Event::Tick, now, &tx);
+        assert!(app.discover.drain(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn discover_p_saves_the_selected_card_as_planning() {
+        let (mut app, tx, rx, now) =
+            harness_with("p-save", StubCatalog::scripted(vec![one_page(2)]));
+        app.tick(Event::Resize(100, 30), now, &tx);
+        app.tick(ch('D'), now, &tx);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        app.tick(ch('l'), now, &tx);
+        app.tick(ch('P'), now, &tx);
+        let show = app.store.get_show(2).unwrap().expect("saved to library");
+        assert_eq!(show.list_status, crate::domain::ListStatus::Planning);
+        assert!(show.library_added_at.is_some());
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("added to watchlist"));
+    }
+
+    #[test]
+    fn discover_chip_tracks_the_selected_card() {
+        use crate::domain::Season;
+        let page = Ok(CatalogPage {
+            entries: vec![
+                Enrichment {
+                    season: Some(Season::Fall),
+                    year: Some(2024),
+                    ..feed_entry(1)
+                },
+                feed_entry(2),
+            ],
+            has_next: false,
+        });
+        let (mut app, tx, rx, now) = harness_with("chip-card", StubCatalog::scripted(vec![page]));
+        app.tick(Event::Resize(100, 30), now, &tx);
+        app.tick(ch('D'), now, &tx);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("秋") && text.contains("2024"));
+        // Card 2 has no season data: the chip is absent, no cour fallback.
+        app.tick(ch('l'), now, &tx);
+        let text = rendered(&mut app, 100, 30);
+        assert!(!text.contains("2024"));
     }
 
     #[test]
@@ -944,7 +1230,7 @@ mod tests {
         let text = rendered(&mut app, 100, 30);
         // The kanji is double-width, so the buffer carries a filler cell
         // between it and the year; assert the parts, not the joined string.
-        let cour = chrome::current_cour(unix_now());
+        let cour = render::cour_chip(domain::current_cour(unix_now()));
         let (kanji, year) = cour.split_once(' ').unwrap();
         assert!(text.contains(kanji), "missing season kanji");
         assert!(text.contains(year), "missing season year");

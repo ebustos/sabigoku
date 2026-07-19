@@ -16,12 +16,16 @@ pub mod toast;
 pub mod view;
 pub mod workers;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui_image::picker::Picker;
 
+use crate::anilist::AniList;
 use crate::config::Config;
 use crate::paths::Paths;
+use crate::providers::CatalogProvider;
+use crate::store::Store;
 use app::App;
 use clock::TickClock;
 use event::Event;
@@ -34,11 +38,27 @@ const MAX_EVENTS_PER_PASS: usize = 256;
 /// Init, loop, clean-drain teardown (a ratified deviation from zigoku's
 /// `_exit(0)`; the bounded timeouts are what 04 §3/§11 demand of it).
 pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
+    // Bootstrap order per 01 §2: store and catalog client before the
+    // terminal, so a failure prints to a normal screen. Startup does no
+    // network work (04 §9.8); building the client is offline.
+    let store = Store::open(&paths.db_file()).map_err(std::io::Error::other)?;
+    let catalog: Arc<dyn CatalogProvider> =
+        Arc::new(AniList::new().map_err(std::io::Error::other)?);
     let mut terminal = ratatui::init();
     scope_panic_hook_to_main_thread();
+    // The protocol query can stall for seconds where the terminal answers
+    // late or not at all (tmux); paint a minimal DESIGN 5.6 startup frame
+    // first so the wait is never a black screen.
+    let _ = terminal.draw(|frame| draw_startup_frame(frame, config));
     // Protocol query must run after entering the alternate screen and BEFORE
     // the input thread exists: it reads stdio itself (04 §3 query leftovers).
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // `image_protocol = "halfblocks"` skips the query outright: no stall, and
+    // no late query responses for a keypress to corrupt (a key that lands
+    // mid-response is eaten by the escape parser; tmux exposes this).
+    let picker = match config.image_protocol.as_str() {
+        "halfblocks" => Picker::halfblocks(),
+        _ => Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
+    };
     // External kills route through the same clean-drain quit as `q`; the OS
     // default disposition would strand the terminal raw + alt-screen.
     let sig_quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -57,7 +77,7 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
         return Err(std::io::Error::other("could not spawn the input thread"));
     }
 
-    let mut app = App::new(config, paths.covers_dir(), picker, &tx);
+    let mut app = App::new(config, store, catalog, paths.covers_dir(), picker, &tx);
     if let Ok(size) = terminal.size() {
         app.tick(Event::Resize(size.width, size.height), Instant::now(), &tx);
     }
@@ -93,13 +113,34 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
     shutdown.cancel();
     input_drain.drain(Duration::from_millis(500));
     app.cover_drain.drain(Duration::from_secs(1));
-    app.discover_cover_drain.drain(Duration::from_secs(1));
+    app.discover.drain(Duration::from_secs(1));
     // The encode worker exits when the pool (inside App) drops its queue.
     let encode_drain = app.encode_drain.clone();
     drop(app);
     encode_drain.drain(Duration::from_secs(1));
     ratatui::restore();
     result
+}
+
+/// Minimal DESIGN 5.6 startup frame, painted before the protocol query so a
+/// slow-answering terminal never shows a black hole. The real views take over
+/// on the first loop draw.
+fn draw_startup_frame(frame: &mut ratatui::Frame<'_>, config: &Config) {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Block;
+    let palette = theme::by_name(&config.palette);
+    let area = frame.area();
+    frame.render_widget(Block::new().style(Style::new().bg(palette.bg)), area);
+    render::draw_centered(
+        frame,
+        area,
+        area.height / 2,
+        Line::from(Span::styled(
+            "SABIGOKU",
+            Style::new().fg(palette.fg).add_modifier(Modifier::BOLD),
+        )),
+    );
 }
 
 /// `ratatui::init` installs a process-global restore hook, so an uncaught
