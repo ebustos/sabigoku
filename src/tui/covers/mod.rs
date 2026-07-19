@@ -10,6 +10,7 @@ pub mod cache;
 pub mod detail;
 pub mod discover;
 pub mod disk;
+pub mod render;
 pub mod sizing;
 
 use std::io::{Cursor, Read};

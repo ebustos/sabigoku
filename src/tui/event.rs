@@ -5,11 +5,23 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use image::DynamicImage;
 use ratatui::crossterm::event::{self as ct, KeyEvent};
 
 use super::workers::{CancelFlag, Drain};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One demo grid card (ROD-438 shell); the real DiscoverState rows replace
+/// this in ROD-439.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DemoCard {
+    pub anilist_id: i64,
+    pub title: String,
+    pub cover_url: Option<String>,
+}
+
+/// No `Eq`: cover events carry pixel payloads (`DynamicImage` is `PartialEq`
+/// only).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Key(KeyEvent),
     Resize(u16, u16),
@@ -20,14 +32,32 @@ pub enum Event {
     /// The input thread died on a terminal error. Keys can never arrive again,
     /// so the app must not idle on as an unquittable zombie.
     InputClosed,
-    /// Shell demo worker (ROD-433): generation-tagged so the loop demonstrates
-    /// the 04 §6 stale drop. Dies when real subsystem events land (ROD-434+).
-    DemoProgress {
-        token: u64,
-        percent: u8,
+    /// Detail cover result (04 §4.4); keep-check by `for_id` in tick.
+    CoverDone {
+        for_id: i64,
+        img: DynamicImage,
     },
-    DemoDone {
-        token: u64,
+    CoverError {
+        for_id: i64,
+    },
+    /// Url-keyed, no window stale-drop (04 §4.4): the slot adopts by url.
+    DiscoverCoverDone {
+        url: String,
+        img: DynamicImage,
+    },
+    DiscoverCoverError {
+        url: String,
+    },
+    /// Wake: the encode worker finished a resize. The response itself rides
+    /// the pool's own channel (ratatui-image types are not comparable, so
+    /// they stay out of this enum); tick applies it on the UI thread.
+    CoverEncodeReady,
+    /// Demo feed for the ROD-438 shell grid; DiscoverFeed replaces it (439).
+    DemoFeedLoaded {
+        cards: Vec<DemoCard>,
+    },
+    DemoFeedFailed {
+        cause: String,
     },
 }
 
