@@ -615,7 +615,7 @@ fn draw_grid(
             if ix >= grid.len() {
                 break;
             }
-            let (text, style) = grid_cell(palette, &grid[ix], ix, session, aired, focused);
+            let (text, style) = grid_cell(palette, &grid[ix], ix, session, aired, focused, env);
             let x = area.x + c as u16 * CELL_W;
             let w = (area.x + area.width).saturating_sub(x).min(CELL_W);
             frame.render_widget(
@@ -626,9 +626,11 @@ fn draw_grid(
     }
 }
 
-/// One cell's text + style, by the DESIGN 4.6 precedence: resume > cursor >
-/// watched > unaired > unwatched. The launching state joins with play
-/// (chunk 6).
+/// One cell's text + style, by the DESIGN 4.6 precedence: launching >
+/// resume > cursor > watched > unaired > unwatched. The launching cell
+/// outranks everything: it sits at the user's attention locus and tracks the
+/// playing episode, not the cursor.
+#[allow(clippy::too_many_arguments)]
 fn grid_cell(
     palette: &Palette,
     label: &str,
@@ -636,7 +638,26 @@ fn grid_cell(
     session: &EpisodeSession,
     aired: Option<u32>,
     focused: bool,
+    env: &ViewEnv,
 ) -> (String, Style) {
+    let launching = env
+        .play
+        .filter(|g| session.is_for(g.anilist_id) && g.cell == ix);
+    if let Some(glance) = launching {
+        let color = if glance.started.is_slow(env.now) {
+            palette.hot
+        } else {
+            palette.focus
+        };
+        let spin = SPINNER[glance.started.frame(env.now, SPINNER.len())];
+        return (
+            format!("[{spin}]"),
+            Style::new()
+                .bg(palette.surface)
+                .fg(color)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
     let resume = session.resume_ix() == Some(ix);
     let style = if resume {
         Style::new()
@@ -679,8 +700,9 @@ fn cell_text(label: &str, resume: bool) -> String {
 }
 
 /// Cells past the aired count render in the airing register (DESIGN 4.6);
-/// None means everything listed is out.
-fn aired_count(entry: &Enrichment) -> Option<u32> {
+/// None means everything listed is out. Also clamps the play path's finale
+/// judgment in app.rs, so the two never disagree on what is playable.
+pub(crate) fn aired_count(entry: &Enrichment) -> Option<u32> {
     if !domain::is_still_airing(entry.status.as_deref()) {
         return None;
     }

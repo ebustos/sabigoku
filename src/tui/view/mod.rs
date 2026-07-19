@@ -64,4 +64,6 @@ pub struct ViewEnv {
     pub cour: crate::domain::Cour,
     pub unix_now: i64,
     pub now: std::time::Instant,
+    /// Some while a play is resolving/launching: the §4.6 launching cell.
+    pub play: Option<crate::tui::playback::PlayGlance>,
 }

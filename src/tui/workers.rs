@@ -3,20 +3,21 @@
 //! queue; drain only at teardown. Supersede is detach + stale-token drop,
 //! NEVER a join on the hot path.
 
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::domain::Translation;
+use crate::domain::{Quality, Translation};
 use crate::error::Error;
-use crate::player::Position;
+use crate::player::{self, PlayError, PlayOpts, PlayerEvent, Position};
 use crate::providers::{
-    CatalogProvider, DiscoverAxis, ProviderRegistry, SEARCH_PAGE_SIZE, SearchOptions,
+    CatalogProvider, DiscoverAxis, ProviderError, ProviderRegistry, SEARCH_PAGE_SIZE, SearchOptions,
 };
 use crate::store::Store;
 use crate::tui::covers::{self, CoverCaches};
-use crate::tui::event::{Event, EventTx, FetchClass};
+use crate::tui::event::{Event, EventTx, FetchClass, PlayFailure};
 
 /// The 02 §4b post-play gate, the one owner of the finish writes (01 §3 glue).
 /// No meaningful position, no writes of any kind; the player already collapsed
@@ -257,6 +258,144 @@ pub fn spawn_provider_search(
         };
         tx.post(event);
     })
+}
+
+/// One play, described as data: everything the worker needs without touching
+/// App state (the resolve runs per attempt inside `player::play`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaySpec {
+    pub anilist_id: i64,
+    pub provider: String,
+    pub provider_id: String,
+    pub episode_label: String,
+    pub translation: Translation,
+    pub title: String,
+    pub start_secs: f64,
+    pub mpv_path: String,
+    pub socket_dir: PathBuf,
+    pub token: u64,
+}
+
+/// Floor between position posts. mpv emits `time-pos` per frame; the UI only
+/// needs the launching-cell flip and the 30s checkpoint cadence, so the
+/// bridge throttles here rather than flooding the queue (ROD-437 note).
+const POSITION_POST_FLOOR: Duration = Duration::from_millis(500);
+
+/// The play worker (04 §7.8): resolve + mpv + IPC live inside `player::play`;
+/// this glue forwards its events with the session token and posts the one
+/// terminal outcome. The worker outlives supersede checks by design; the UI
+/// drops stale tokens in tick and never joins.
+#[must_use]
+pub fn spawn_play(
+    drain: &Drain,
+    tx: EventTx,
+    registry: Arc<ProviderRegistry>,
+    spec: PlaySpec,
+) -> bool {
+    drain.spawn("play", move || {
+        let PlaySpec {
+            anilist_id,
+            provider,
+            provider_id,
+            episode_label,
+            translation,
+            title,
+            start_secs,
+            mpv_path,
+            socket_dir,
+            token,
+        } = spec;
+        // A retired name can only arrive through a stale binding row.
+        let Some(p) = registry.by_name(&provider) else {
+            tx.post(Event::PlayFinished {
+                anilist_id,
+                position: None,
+                failure: Some(PlayFailure::Resolve(FetchClass::Data)),
+                token,
+            });
+            return;
+        };
+        let opts = PlayOpts {
+            mpv_path: &mpv_path,
+            socket_dir: &socket_dir,
+            title: &title,
+            start_secs,
+        };
+        let bridge = PositionBridge {
+            tx: tx.clone(),
+            anilist_id,
+            token,
+            last: Arc::new(Mutex::new(None)),
+        };
+        let result = player::play(
+            &opts,
+            || {
+                p.resolve(&provider_id, &episode_label, translation, Quality::Best)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            },
+            move |event| bridge.forward(event),
+        );
+        let (position, failure) = match result {
+            Ok(outcome) => (outcome.position, None),
+            Err(e) => (None, Some(play_failure(&e))),
+        };
+        tx.post(Event::PlayFinished {
+            anilist_id,
+            position,
+            failure,
+            token,
+        });
+    })
+}
+
+/// `PlayError` → the POD classes the toast matrix keys on (DESIGN 4.10).
+/// Guard/proxy/wait failures land in `Internal`: residual, `playback failed`.
+fn play_failure(e: &PlayError) -> PlayFailure {
+    match e {
+        PlayError::Resolve(cause) => cause
+            .downcast_ref::<ProviderError>()
+            .map_or(PlayFailure::Internal, |pe| PlayFailure::Resolve(pe.into())),
+        PlayError::Spawn { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+            PlayFailure::MpvNotFound
+        }
+        PlayError::OpenFailed { .. } => PlayFailure::OpenFailed,
+        PlayError::Exit { .. } => PlayFailure::MpvFailed,
+        _ => PlayFailure::Internal,
+    }
+}
+
+/// Clone-per-attempt event forwarder (player.rs takes `on_event` by value per
+/// attempt); the shared throttle clock keeps the floor across attempts.
+#[derive(Clone)]
+struct PositionBridge {
+    tx: EventTx,
+    anilist_id: i64,
+    token: u64,
+    last: Arc<Mutex<Option<Instant>>>,
+}
+
+impl PositionBridge {
+    fn forward(&self, event: PlayerEvent) {
+        match event {
+            PlayerEvent::Retry { attempt } => self.tx.post(Event::PlayRetry {
+                anilist_id: self.anilist_id,
+                attempt,
+                token: self.token,
+            }),
+            PlayerEvent::Position(position) => {
+                let mut last = self.last.lock().unwrap();
+                let now = Instant::now();
+                if last.is_none_or(|t| now.saturating_duration_since(t) >= POSITION_POST_FLOOR) {
+                    *last = Some(now);
+                    self.tx.post(Event::PlayPosition {
+                        anilist_id: self.anilist_id,
+                        position,
+                        token: self.token,
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Inflight accounting for one worker family (04 §5.1).
@@ -521,6 +660,126 @@ mod tests {
         let history = store.list_history().unwrap();
         assert_eq!(history[0].play_count, 1);
         assert_eq!(history[0].progress, 0, "no duration, no ratchet");
+    }
+
+    #[test]
+    fn play_failure_maps_every_error_shape() {
+        use std::os::unix::process::ExitStatusExt;
+        let resolve_err = |e: ProviderError| {
+            PlayError::Resolve(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        };
+        assert_eq!(
+            play_failure(&resolve_err(ProviderError::Forbidden { status: 403 })),
+            PlayFailure::Resolve(FetchClass::Blocked)
+        );
+        assert_eq!(
+            play_failure(&resolve_err(ProviderError::Network)),
+            PlayFailure::Resolve(FetchClass::Network)
+        );
+        // A non-provider resolve error is the residual bucket.
+        assert_eq!(
+            play_failure(&PlayError::Resolve("weird".into())),
+            PlayFailure::Internal
+        );
+        assert_eq!(
+            play_failure(&PlayError::Spawn {
+                mpv: "mpv".into(),
+                source: io::Error::from(io::ErrorKind::NotFound),
+            }),
+            PlayFailure::MpvNotFound
+        );
+        assert_eq!(
+            play_failure(&PlayError::Spawn {
+                mpv: "mpv".into(),
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            }),
+            PlayFailure::Internal
+        );
+        assert_eq!(
+            play_failure(&PlayError::OpenFailed { attempts: 3 }),
+            PlayFailure::OpenFailed
+        );
+        assert_eq!(
+            play_failure(&PlayError::Exit {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+            }),
+            PlayFailure::MpvFailed
+        );
+    }
+
+    #[test]
+    fn position_bridge_throttles_positions_but_never_retries() {
+        let (tx, rx) = event::channel();
+        let bridge = PositionBridge {
+            tx,
+            anilist_id: 7,
+            token: 3,
+            last: Arc::new(Mutex::new(None)),
+        };
+        let at = |secs: f64| {
+            PlayerEvent::Position(Position {
+                secs,
+                duration: None,
+            })
+        };
+        bridge.forward(at(1.0));
+        bridge.forward(at(1.1));
+        bridge.forward(PlayerEvent::Retry { attempt: 2 });
+        bridge.forward(at(1.2));
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events,
+            [
+                Event::PlayPosition {
+                    anilist_id: 7,
+                    position: Position {
+                        secs: 1.0,
+                        duration: None
+                    },
+                    token: 3,
+                },
+                Event::PlayRetry {
+                    anilist_id: 7,
+                    attempt: 2,
+                    token: 3,
+                },
+            ],
+            "the first position passes, the burst is folded, retry always posts"
+        );
+    }
+
+    #[test]
+    fn spawn_play_with_a_retired_name_posts_the_data_failure() {
+        let (tx, rx) = event::channel();
+        let drain = Drain::default();
+        let registry = crate::tui::episodes::teststub::inert_registry();
+        assert!(spawn_play(
+            &drain,
+            tx,
+            registry,
+            PlaySpec {
+                anilist_id: 7,
+                provider: "gone".into(),
+                provider_id: "x".into(),
+                episode_label: "1".into(),
+                translation: Translation::Sub,
+                title: "t".into(),
+                start_secs: 0.0,
+                mpv_path: "mpv".into(),
+                socket_dir: PathBuf::from("/tmp"),
+                token: 9,
+            },
+        ));
+        assert!(drain.drain(Duration::from_secs(5)));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Event::PlayFinished {
+                anilist_id: 7,
+                position: None,
+                failure: Some(PlayFailure::Resolve(FetchClass::Data)),
+                token: 9,
+            }
+        );
     }
 
     #[test]

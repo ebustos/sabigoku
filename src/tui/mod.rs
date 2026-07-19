@@ -11,6 +11,7 @@ pub mod covers;
 pub mod episodes;
 pub mod event;
 pub mod layout;
+pub mod playback;
 pub mod render;
 pub mod theme;
 pub mod toast;
@@ -88,15 +89,7 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
         return Err(std::io::Error::other("could not spawn the input thread"));
     }
 
-    let mut app = App::new(
-        config,
-        store,
-        catalog,
-        registry,
-        paths.covers_dir(),
-        picker,
-        &tx,
-    );
+    let mut app = App::new(config, store, catalog, registry, paths, picker, &tx);
     if let Ok(size) = terminal.size() {
         app.tick(Event::Resize(size.width, size.height), Instant::now(), &tx);
     }

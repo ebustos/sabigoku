@@ -661,6 +661,39 @@ impl EpisodeSession {
         self.advance_walk(true, deps)
     }
 
+    /// Post-play refresh (05 §11, DESIGN 4.6): a recorded finish re-derives
+    /// the watched high-water and resume point from the store. A completed
+    /// watch advances the cursor off the played cell, but only when it still
+    /// sits there; the grid stayed navigable during play and a moved cursor
+    /// holds. Cross-show playback never touches this session (the id gate).
+    pub fn on_play_recorded(
+        &mut self,
+        anilist_id: i64,
+        episode_ix: u32,
+        completed: bool,
+        deps: &EpisodeDeps,
+    ) {
+        if !self.is_for(anilist_id) || self.episodes.is_empty() {
+            return;
+        }
+        self.watched = deps
+            .store
+            .get_show(anilist_id)
+            .ok()
+            .flatten()
+            .map_or(self.watched, |s| s.progress);
+        self.resume_ix = deps
+            .store
+            .latest_resume(anilist_id, deps.translation)
+            .ok()
+            .flatten()
+            .and_then(|(label, _)| self.episodes.iter().position(|e| *e == label));
+        let played = episode_ix.saturating_sub(1) as usize;
+        if completed && self.cursor == played {
+            self.cursor = (played + 1).min(self.episodes.len() - 1);
+        }
+    }
+
     /// Whether the session's answer belongs to the shown entry; render gates
     /// on this so a stale grid can never draw under another show (ROD-329).
     pub fn is_for(&self, anilist_id: i64) -> bool {

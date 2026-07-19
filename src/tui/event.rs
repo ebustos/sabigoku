@@ -9,6 +9,7 @@ use image::DynamicImage;
 use ratatui::crossterm::event::{self as ct, KeyEvent};
 
 use crate::domain::Enrichment;
+use crate::player::Position;
 use crate::providers::{DiscoverAxis, ProviderError, SearchHit};
 
 use super::workers::{CancelFlag, Drain};
@@ -38,6 +39,18 @@ impl From<&ProviderError> for FetchClass {
             ProviderError::Unsupported => FetchClass::Unsupported,
         }
     }
+}
+
+/// Play failure classes as event payload (04 §4.5); copy mapping lives in
+/// `play_failure_copy` (app.rs, DESIGN 4.10). `Internal` is the residual
+/// non-HTTP, non-mpv bucket behind the `playback failed` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayFailure {
+    MpvNotFound,
+    MpvFailed,
+    OpenFailed,
+    Resolve(FetchClass),
+    Internal,
 }
 
 /// No `Eq`: cover events carry pixel payloads (`DynamicImage` is `PartialEq`
@@ -122,6 +135,27 @@ pub enum Event {
         anilist_id: i64,
         provider: String,
         class: FetchClass,
+        token: u64,
+    },
+    /// Observed playback position (04 §4.5), throttled at the worker bridge
+    /// so mpv's per-frame cadence never floods the queue.
+    PlayPosition {
+        anilist_id: i64,
+        position: Position,
+        token: u64,
+    },
+    /// A relaunch is scheduled (04 §7.8); fires before the backoff sleep.
+    PlayRetry {
+        anilist_id: i64,
+        attempt: u32,
+        token: u64,
+    },
+    /// Terminal play outcome. `position` from a run that played, `failure`
+    /// from one that aborted; player.rs guarantees they never co-occur.
+    PlayFinished {
+        anilist_id: i64,
+        position: Option<Position>,
+        failure: Option<PlayFailure>,
         token: u64,
     },
 }

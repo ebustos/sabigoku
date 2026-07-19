@@ -22,6 +22,8 @@ use ratatui_image::picker::Picker;
 
 use crate::config::Config;
 use crate::domain::{self, TitleLanguage, Translation};
+use crate::paths::Paths;
+use crate::player::{self, Position};
 use crate::providers::{CatalogProvider, DiscoverAxis, ProviderRegistry};
 use crate::store::Store;
 
@@ -29,8 +31,9 @@ use super::chrome::{self, BottomBar, HelpLine, Tab, TopBar};
 use super::covers::CoverCaches;
 use super::covers::render::ProtocolPool;
 use super::episodes::{EpisodeDeps, Feedback};
-use super::event::{Event, EventTx, FetchClass};
+use super::event::{Event, EventTx, FetchClass, PlayFailure};
 use super::layout;
+use super::playback::{PlayFeedback, PlayRequest, PlaybackDeps, PlaybackSession};
 use super::render;
 use super::theme::{self, Palette};
 use super::toast::{Kind, Toasts};
@@ -75,11 +78,15 @@ pub struct App {
     pub(super) discover: DiscoverState,
     settings: SettingsState,
     pub(super) detail: DetailState,
+    playback: PlaybackSession,
     store: Store,
     catalog: Arc<dyn CatalogProvider>,
     registry: Arc<ProviderRegistry>,
     caches: Arc<CoverCaches>,
     covers_dir: PathBuf,
+    /// mpv IPC socket dir (paths.runtime); held so play fires stay
+    /// path-agnostic of the Paths type.
+    socket_dir: PathBuf,
     pub(super) pool: ProtocolPool,
     pub(super) encode_drain: Drain,
 }
@@ -94,7 +101,7 @@ impl App {
         store: Store,
         catalog: Arc<dyn CatalogProvider>,
         registry: Arc<ProviderRegistry>,
-        covers_dir: PathBuf,
+        paths: &Paths,
         picker: Picker,
         tx: &EventTx,
     ) -> App {
@@ -122,11 +129,13 @@ impl App {
             discover: DiscoverState::default(),
             settings: SettingsState::default(),
             detail: DetailState::default(),
+            playback: PlaybackSession::default(),
             store,
             catalog,
             registry,
             caches: Arc::new(CoverCaches::new()),
-            covers_dir,
+            covers_dir: paths.covers_dir(),
+            socket_dir: paths.runtime.clone(),
             pool,
             encode_drain,
         };
@@ -172,6 +181,22 @@ impl App {
             | Event::EpisodesError { .. }
             | Event::ProviderSearchDone { .. }
             | Event::ProviderSearchError { .. }) => self.on_episode_event(e, now, tx),
+            Event::PlayPosition {
+                anilist_id,
+                position,
+                token,
+            } => self.on_play_position(anilist_id, position, token, now, tx),
+            Event::PlayRetry {
+                anilist_id,
+                attempt,
+                token,
+            } => self.on_play_retry(anilist_id, attempt, token, now),
+            Event::PlayFinished {
+                anilist_id,
+                position,
+                failure,
+                token,
+            } => self.on_play_finished(anilist_id, position, failure, token, now, tx),
         }
     }
 
@@ -315,11 +340,12 @@ impl App {
     }
 
     /// Enter drills toward wherever the grid is visible, then plays
-    /// (DESIGN 10, ROD-170/259). Play itself lands in chunk 6.
+    /// (DESIGN 10, ROD-170/259).
     fn on_enter(&mut self, now: Instant, tx: &EventTx) {
         match self.view {
             View::Discover => self.open_discover_detail(now, tx),
-            View::Browse | View::History if self.pane == Pane::Detail => {}
+            View::Browse | View::History if self.pane == Pane::Detail => self.on_play(now, tx),
+            View::Detail => self.on_play(now, tx),
             View::History if !self.two_pane() => self.open_history_zoom(now, tx),
             View::Browse if self.two_pane() => self.enter_browse_pane(now, tx),
             View::History if self.two_pane() => self.enter_history_pane(now, tx),
@@ -1064,6 +1090,174 @@ impl App {
             .unwrap_or_else(|| provider.to_string())
     }
 
+    /// Enter on a focused grid plays the cursor episode through the serving
+    /// binding (03 §6.3); inert without a landed grid. The double-play guard
+    /// lives in the session.
+    fn on_play(&mut self, now: Instant, tx: &EventTx) {
+        let Some(entry) = self.detail.shown() else {
+            return;
+        };
+        let aid = entry.anilist_id;
+        let session = &self.detail.episodes;
+        if !session.is_for(aid) || !session.has_grid() {
+            return;
+        }
+        let Some(serving) = session.serving() else {
+            return;
+        };
+        // The serving grid minted its binding before caching (ROD-327), so a
+        // miss here is a torn store; refuse rather than resolve blind.
+        let Some(provider_id) = self
+            .store
+            .bindings_for(aid)
+            .ok()
+            .and_then(|bs| bs.into_iter().find(|b| b.provider == serving))
+            .map(|b| b.provider_id)
+        else {
+            return;
+        };
+        let provider = serving.to_string();
+        let cursor = session.cursor();
+        let episode_label = session.grid()[cursor].clone();
+        let episode_ix = cursor as u32 + 1;
+        // Finale = last playable episode: the aired count clamps an airing
+        // show's grid so an unaired tail never blocks `all caught up`.
+        let playable = detail::aired_count(entry).map_or(session.grid().len() as u32, |a| {
+            a.min(session.grid().len() as u32)
+        });
+        let finale = playable > 0 && episode_ix >= playable;
+        let title = format!(
+            "{} · {episode_label}",
+            domain::preferred_title(
+                &entry.title_romaji,
+                entry.title_english.as_deref(),
+                entry.title_native.as_deref(),
+                TitleLanguage::parse(&self.config.title_language),
+            )
+        );
+        let fb = {
+            let deps = playback_deps(
+                &self.store,
+                &self.registry,
+                &self.config,
+                &self.socket_dir,
+                tx,
+                now,
+            );
+            self.playback.fire(
+                PlayRequest {
+                    anilist_id: aid,
+                    provider,
+                    provider_id,
+                    episode_label,
+                    episode_ix,
+                    finale,
+                    title,
+                },
+                &deps,
+            )
+        };
+        self.apply_play_feedback(fb, now);
+    }
+
+    fn on_play_position(
+        &mut self,
+        anilist_id: i64,
+        position: Position,
+        token: u64,
+        now: Instant,
+        tx: &EventTx,
+    ) {
+        let deps = playback_deps(
+            &self.store,
+            &self.registry,
+            &self.config,
+            &self.socket_dir,
+            tx,
+            now,
+        );
+        self.playback
+            .on_position(anilist_id, position, token, &deps);
+        self.dirty = true;
+    }
+
+    fn on_play_retry(&mut self, anilist_id: i64, attempt: u32, token: u64, now: Instant) {
+        let fb = self.playback.on_retry(anilist_id, attempt, token);
+        self.apply_play_feedback(fb, now);
+        self.dirty = true;
+    }
+
+    /// Terminal play outcome: session settles the writes, then a recorded
+    /// finish fans out (grid progress refresh, history reload) so every
+    /// surface agrees with the store.
+    fn on_play_finished(
+        &mut self,
+        anilist_id: i64,
+        position: Option<Position>,
+        failure: Option<PlayFailure>,
+        token: u64,
+        now: Instant,
+        tx: &EventTx,
+    ) {
+        let (fb, recorded) = {
+            let deps = playback_deps(
+                &self.store,
+                &self.registry,
+                &self.config,
+                &self.socket_dir,
+                tx,
+                now,
+            );
+            self.playback
+                .on_finished(anilist_id, position, failure, token, &deps)
+        };
+        self.apply_play_feedback(fb, now);
+        if let Some(rec) = recorded {
+            {
+                let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+                self.detail.episodes.on_play_recorded(
+                    rec.anilist_id,
+                    rec.episode_ix,
+                    rec.completed,
+                    &deps,
+                );
+            }
+            self.reload_history(now);
+        }
+        self.dirty = true;
+    }
+
+    /// Playback outcomes to the DESIGN 4.10 play rows.
+    fn apply_play_feedback(&mut self, feedback: Vec<PlayFeedback>, now: Instant) {
+        for f in feedback {
+            match f {
+                PlayFeedback::Retry { attempt } => {
+                    let copy = format!(
+                        "stream didn't open · retrying {attempt}/{}",
+                        player::MAX_PLAY_ATTEMPTS
+                    );
+                    self.toasts.push(Kind::Warn, &copy, now);
+                }
+                PlayFeedback::Done { episode_ix, finale } => {
+                    if finale {
+                        self.toasts.push(Kind::Success, "all caught up", now);
+                    } else {
+                        let copy = format!("episode {episode_ix} done");
+                        self.toasts.push(Kind::Success, &copy, now);
+                    }
+                }
+                PlayFeedback::Failed { provider, failure } => {
+                    if let Some(copy) = play_failure_copy(failure, &self.display_name(&provider)) {
+                        self.toasts.push(Kind::Error, &copy, now);
+                    }
+                }
+                PlayFeedback::SaveFailed => {
+                    self.toasts.push(Kind::Error, "couldn't save progress", now)
+                }
+            }
+        }
+    }
+
     /// Pure of app state and stores (04 §1); `&mut` is for the protocol
     /// pool's render-owned resize bookkeeping only.
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>, now: Instant) {
@@ -1102,6 +1296,7 @@ impl App {
             cour: domain::current_cour(unix_now()),
             unix_now: unix_now(),
             now,
+            play: self.playback.glance(),
         }
     }
 
@@ -1373,7 +1568,7 @@ fn episode_deps<'a>(
 }
 
 /// The one failure-class → copy mapping (DESIGN 4.10); `episodes_error` and
-/// the play path (chunk 6) share it. `Unsupported` is deliberately silent.
+/// the play resolve path share it. `Unsupported` is deliberately silent.
 fn failure_class_copy(class: FetchClass, provider: &str) -> Option<String> {
     match class {
         FetchClass::Network => Some("network unreachable".to_string()),
@@ -1382,6 +1577,45 @@ fn failure_class_copy(class: FetchClass, provider: &str) -> Option<String> {
         FetchClass::Http => Some(format!("{provider} returned an error")),
         FetchClass::Data => Some("couldn't load episodes".to_string()),
         FetchClass::Unsupported => None,
+    }
+}
+
+/// The play-side rows (DESIGN 4.10): the resolve HTTP classes share
+/// `failure_class_copy`; the player-spawn classes get their own copy; the
+/// residuals collapse into `playback failed`. Unlike the walk, a resolve
+/// `Unsupported` here is a real dead play, never silent.
+fn play_failure_copy(failure: PlayFailure, provider: &str) -> Option<String> {
+    match failure {
+        PlayFailure::MpvNotFound => Some("mpv not found · install mpv".to_string()),
+        PlayFailure::MpvFailed => Some("mpv exited with error".to_string()),
+        PlayFailure::OpenFailed => Some("stream didn't open · try again".to_string()),
+        PlayFailure::Resolve(class) => match class {
+            FetchClass::Data | FetchClass::Unsupported => Some("playback failed".to_string()),
+            _ => failure_class_copy(class, provider),
+        },
+        PlayFailure::Internal => Some("playback failed".to_string()),
+    }
+}
+
+/// Free function for the same disjoint-borrow reason as `episode_deps`.
+fn playback_deps<'a>(
+    store: &'a Store,
+    registry: &'a Arc<ProviderRegistry>,
+    config: &'a Config,
+    socket_dir: &'a std::path::Path,
+    tx: &'a EventTx,
+    now: Instant,
+) -> PlaybackDeps<'a> {
+    PlaybackDeps {
+        store,
+        registry,
+        tx,
+        mpv_path: &config.mpv_path,
+        socket_dir,
+        resume_offset_sec: config.resume_offset_sec,
+        translation: Translation::parse(&config.translation).unwrap_or(Translation::Sub),
+        unix_now: unix_now(),
+        now,
     }
 }
 
@@ -1472,19 +1706,28 @@ mod tests {
 
     use super::super::episodes::teststub;
 
+    fn test_paths(name: &str) -> Paths {
+        let dir = std::env::temp_dir().join("sabigoku-app-tests").join(name);
+        Paths {
+            config: dir.clone(),
+            data: dir.clone(),
+            cache: dir.clone(),
+            runtime: dir,
+        }
+    }
+
     fn harness_full(
         name: &str,
         catalog: Arc<dyn CatalogProvider>,
         registry: Arc<ProviderRegistry>,
     ) -> (App, EventTx, super::super::event::EventRx, Instant) {
-        let covers_dir = std::env::temp_dir().join("sabigoku-app-tests").join(name);
         let (tx, rx) = super::super::event::channel();
         let app = App::new(
             &Config::default(),
             Store::open_memory().unwrap(),
             catalog,
             registry,
-            covers_dir,
+            &test_paths(name),
             Picker::halfblocks(),
             &tx,
         );
@@ -2397,6 +2640,269 @@ mod tests {
         assert!(text.contains("couldn't reach senshi"), "{text}");
     }
 
+    // ── play (chunk 6) ──────────────────────────────────────────────────
+
+    use crate::player::Position as PlayPos;
+    use crate::tui::event::PlayFailure;
+
+    /// Grid of three landed off megaplay; the stub resolve answers
+    /// Unsupported, so a fired play settles fast and mpv never spawns.
+    fn play_harness(name: &str) -> (App, EventTx, super::super::event::EventRx, Instant) {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into(), "3".into()])),
+        ]);
+        harness_full(
+            name,
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        )
+    }
+
+    /// Settle the play worker WITHOUT applying its own finish event, so a
+    /// test can inject its outcome against the live token.
+    fn discard_worker_finish(app: &mut App, rx: &super::super::event::EventRx) {
+        assert!(app.playback.drain(Duration::from_secs(5)));
+        while rx.try_recv().is_ok() {}
+    }
+
+    fn completed_pos() -> Option<PlayPos> {
+        Some(PlayPos {
+            secs: 1200.0,
+            duration: Some(1400.0),
+        })
+    }
+
+    #[test]
+    fn enter_on_the_grid_fires_play_with_launching_cell_and_guard() {
+        let (mut app, tx, rx, now) = play_harness("play-fire");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        assert!(!app.playback.is_playing());
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        assert!(app.playback.is_playing());
+        let token = app.playback.active_token().unwrap();
+        // §4.6 launching cell: the played cell spins in place of its number.
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("[⠋]"), "{text}");
+        assert!(!text.contains("[1]"), "the spinner replaces the number");
+        // Double-play guard: a second Enter is a silent no-op.
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        assert_eq!(app.playback.active_token(), Some(token));
+        // First position ends the launch; the grid returns to normal cells.
+        app.tick(
+            Event::PlayPosition {
+                anilist_id: 1,
+                position: PlayPos {
+                    secs: 0.0,
+                    duration: None,
+                },
+                token,
+            },
+            t1,
+            &tx,
+        );
+        let text = rendered(&mut app, 100, 30);
+        assert!(!text.contains("[⠋]"), "{text}");
+        assert!(text.contains("[1]"), "{text}");
+    }
+
+    #[test]
+    fn zoom_enter_fires_play_too() {
+        let (mut app, tx, rx, now) = play_harness("play-zoom");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(ch(' '), t1, &tx);
+        assert_eq!(app.view, View::Detail);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        assert!(app.playback.is_playing());
+    }
+
+    #[test]
+    fn play_pipeline_end_to_end_toasts_the_residual_failure() {
+        // The stub resolve answers Unsupported: a dead play, never silent
+        // (unlike the walk's silent Unsupported).
+        let (mut app, tx, rx, now) = play_harness("play-resolve-fail");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        assert!(app.playback.drain(Duration::from_secs(5)));
+        while let Ok(ev) = rx.try_recv() {
+            app.tick(ev, t1, &tx);
+        }
+        assert!(!app.playback.is_playing(), "the failed play cleared");
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("playback failed"), "{text}");
+        assert!(app.store.list_history().unwrap().is_empty(), "no writes");
+    }
+
+    #[test]
+    fn completed_finish_records_advances_and_reloads_history() {
+        let (mut app, tx, rx, now) = play_harness("play-complete");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        let token = app.playback.active_token().unwrap();
+        discard_worker_finish(&mut app, &rx);
+        assert!(app.history.is_empty());
+        app.tick(
+            Event::PlayFinished {
+                anilist_id: 1,
+                position: completed_pos(),
+                failure: None,
+                token,
+            },
+            t1,
+            &tx,
+        );
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("episode 1 done"), "{text}");
+        assert_eq!(app.detail.episodes.watched(), 1, "high-water re-derived");
+        assert_eq!(app.detail.episodes.cursor(), 1, "cursor advanced");
+        assert!(!app.history.is_empty(), "history reloaded after the play");
+        assert_eq!(app.store.list_history().unwrap()[0].progress, 1);
+    }
+
+    #[test]
+    fn finale_finish_toasts_all_caught_up() {
+        let (mut app, tx, rx, now) = play_harness("play-finale");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(ch('G'), t1, &tx);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        let token = app.playback.active_token().unwrap();
+        discard_worker_finish(&mut app, &rx);
+        app.tick(
+            Event::PlayFinished {
+                anilist_id: 1,
+                position: completed_pos(),
+                failure: None,
+                token,
+            },
+            t1,
+            &tx,
+        );
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("all caught up"), "{text}");
+    }
+
+    #[test]
+    fn partial_finish_records_silently_and_marks_resume() {
+        let (mut app, tx, rx, now) = play_harness("play-partial");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        let token = app.playback.active_token().unwrap();
+        discard_worker_finish(&mut app, &rx);
+        app.tick(
+            Event::PlayFinished {
+                anilist_id: 1,
+                position: Some(PlayPos {
+                    secs: 300.0,
+                    duration: Some(1400.0),
+                }),
+                failure: None,
+                token,
+            },
+            t1,
+            &tx,
+        );
+        let text = rendered(&mut app, 100, 30);
+        assert!(!text.contains("done") && !text.contains("failed"), "{text}");
+        assert_eq!(app.detail.episodes.resume_ix(), Some(0), "resume marked");
+        assert_eq!(app.detail.episodes.cursor(), 0, "partial holds the cursor");
+        assert_eq!(app.store.list_history().unwrap()[0].play_count, 1);
+    }
+
+    #[test]
+    fn cross_show_finish_never_touches_the_new_detail() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into(), "3".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "play-cross",
+            StubCatalog::search_scripted(vec![one_page(2)]),
+            registry,
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        let token = app.playback.active_token().unwrap();
+        discard_worker_finish(&mut app, &rx);
+        // Navigate away: the next selection resets the session (ROD-329).
+        app.tick(key(KeyCode::Esc), t1, &tx);
+        app.tick(ch('j'), t1, &tx);
+        app.tick(
+            Event::PlayFinished {
+                anilist_id: 1,
+                position: completed_pos(),
+                failure: None,
+                token,
+            },
+            t1,
+            &tx,
+        );
+        assert!(
+            !app.detail.episodes.is_for(2) || !app.detail.episodes.has_grid(),
+            "show 2 never inherits show 1's play"
+        );
+        assert_eq!(
+            app.store.list_history().unwrap()[0].progress,
+            1,
+            "the record still lands for show 1"
+        );
+    }
+
+    #[test]
+    fn play_toast_copy_covers_the_matrix_rows() {
+        let (mut app, _tx, now) = harness("play-copy");
+        let cases: Vec<(PlayFeedback, &str)> = vec![
+            (
+                PlayFeedback::Retry { attempt: 2 },
+                "stream didn't open · retrying 2/3",
+            ),
+            (
+                PlayFeedback::Failed {
+                    provider: "megaplay".into(),
+                    failure: PlayFailure::MpvNotFound,
+                },
+                "mpv not found · install mpv",
+            ),
+            (
+                PlayFeedback::Failed {
+                    provider: "megaplay".into(),
+                    failure: PlayFailure::MpvFailed,
+                },
+                "mpv exited with error",
+            ),
+            (
+                PlayFeedback::Failed {
+                    provider: "megaplay".into(),
+                    failure: PlayFailure::OpenFailed,
+                },
+                "stream didn't open · try again",
+            ),
+            (
+                PlayFeedback::Failed {
+                    provider: "megaplay".into(),
+                    failure: PlayFailure::Resolve(FetchClass::Blocked),
+                },
+                "megaplay blocked us",
+            ),
+            (
+                PlayFeedback::Failed {
+                    provider: "megaplay".into(),
+                    failure: PlayFailure::Resolve(FetchClass::Data),
+                },
+                "playback failed",
+            ),
+            (PlayFeedback::SaveFailed, "couldn't save progress"),
+        ];
+        for (feedback, copy) in cases {
+            app.apply_play_feedback(vec![feedback], now);
+            let text = rendered(&mut app, 100, 30);
+            assert!(text.contains(copy), "expected {copy:?} in {text}");
+            // Fresh slate: the queue caps at 3 and evicts oldest-first.
+            app.toasts = Toasts::default();
+        }
+    }
+
     #[test]
     fn zoom_metadata_blooms_only_for_history_origin() {
         let page = Ok(CatalogPage {
@@ -2682,7 +3188,6 @@ mod tests {
         registry: Arc<ProviderRegistry>,
         seed: impl FnOnce(&Store),
     ) -> (App, EventTx, super::super::event::EventRx, Instant) {
-        let covers_dir = std::env::temp_dir().join("sabigoku-app-tests").join(name);
         let store = Store::open_memory().unwrap();
         seed(&store);
         let config = Config {
@@ -2695,7 +3200,7 @@ mod tests {
             store,
             StubCatalog::inert(),
             registry,
-            covers_dir,
+            &test_paths(name),
             Picker::halfblocks(),
             &tx,
         );
