@@ -94,20 +94,6 @@ fn genre_glyphs(genres: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
-/// AniList format to the card label (DESIGN 3.8); unmapped renders the whole
-/// field absent (the U+2014 placeholder), never a partial guess.
-fn format_label(kind: Option<&str>) -> Option<&'static str> {
-    Some(match kind? {
-        "TV" | "TV_SHORT" => "TV",
-        "MOVIE" => "Movie",
-        "OVA" => "OVA",
-        "ONA" => "ONA",
-        "SPECIAL" => "Spec",
-        "MUSIC" => "Music",
-        _ => return None,
-    })
-}
-
 /// Grid geometry shared by draw, nav, and pump so they can never disagree on
 /// what is visible (zigoku ROD-243 shape). `content_h` is the §3.2 content
 /// band; the axis bar and its spacer are subtracted here (DESIGN 3.8).
@@ -627,7 +613,7 @@ fn draw_card(
 
     // Format + episode count left, genre glyphs right (DESIGN 3.8).
     let format_row = rank_y + 2;
-    match format_label(entry.kind.as_deref()) {
+    match render::format_label(entry.kind.as_deref()) {
         Some(label) => {
             let text = match entry.total_episodes {
                 _ if label == "Movie" => label.to_string(),
@@ -972,10 +958,10 @@ mod tests {
 
     #[test]
     fn format_labels_map_and_reject_unknown() {
-        assert_eq!(format_label(Some("TV")), Some("TV"));
-        assert_eq!(format_label(Some("TV_SHORT")), Some("TV"));
-        assert_eq!(format_label(Some("SPECIAL")), Some("Spec"));
-        assert_eq!(format_label(Some("VHS")), None);
-        assert_eq!(format_label(None), None);
+        assert_eq!(render::format_label(Some("TV")), Some("TV"));
+        assert_eq!(render::format_label(Some("TV_SHORT")), Some("TV"));
+        assert_eq!(render::format_label(Some("SPECIAL")), Some("Spec"));
+        assert_eq!(render::format_label(Some("VHS")), None);
+        assert_eq!(render::format_label(None), None);
     }
 }

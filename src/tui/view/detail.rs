@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::domain::{self, Enrichment, Season, preferred_title};
+use crate::store::ProviderAvailability;
 use crate::tui::clock::Debounce;
 use crate::tui::covers::detail::{Action, CoverState};
 use crate::tui::covers::render::ProtocolPool;
@@ -36,10 +37,10 @@ use crate::tui::workers::{self, Drain};
 pub const COVER_SETTLE: Duration = Duration::from_millis(150);
 
 /// Rows reserved below the cover in the single-column layout: worst-case
-/// header, a 2-line synopsis, the grid's spacer, and 2 grid rows, so the
-/// episode grid always keeps >= 2 visible rows (DESIGN 3.3). The grid itself
-/// lands in chunk 4; the reserve holds its ground now so nothing reflows.
-const COVER_RESERVE: u16 = 12;
+/// header (now including the §5.3a meta line + Provider/Pinned row), a
+/// 2-line synopsis, the grid's spacer, and 2 grid rows, so the episode grid
+/// always keeps >= 2 visible rows (DESIGN 3.3).
+const COVER_RESERVE: u16 = 14;
 /// Below this a squashed poster is dropped outright, never a sliver.
 const MIN_COVER_ROWS: u16 = 6;
 /// Grid share of the synopsis budget: spacer + 2 rows.
@@ -71,6 +72,15 @@ fn cover_width(detail_w: u16) -> u16 {
 
 /// Episode grid cell width (DESIGN 4.6): `[NN] ` / `[NNN]`.
 const CELL_W: u16 = 5;
+
+/// Two-internal-column gate (DESIGN 3.2), keyed to the pane's OWN width. The
+/// split needs the surface to allow it (Browse's in-pane detail keeps the
+/// single stack at any width); the §5.3a rail additionally needs the
+/// surface's `two_col` flag, which only History-origin surfaces set.
+pub const DETAIL_TWO_COL_MIN: u16 = 100;
+
+/// Gap between the cover column and the content column in the split layout.
+const SPLIT_GAP: u16 = 4;
 
 #[derive(Default)]
 pub struct DetailState {
@@ -250,11 +260,16 @@ pub fn draw_pane(
         return;
     }
     frame.render_widget(Block::new().style(Style::new().bg(palette.surface)), area);
-    draw_content(frame, area, palette, state, env, pool, focused);
+    // Browse's in-pane detail keeps the single stack at any width (§5.3a);
+    // the History pane variant joins in chunk 5 with its own flags.
+    draw_content(
+        frame, area, palette, state, env, pool, focused, false, false,
+    );
 }
 
-/// The full-screen zoom: same single-column content on the whole canvas
-/// (DESIGN 5.3; the two-column split lands in chunk 4b).
+/// The full-screen zoom: the split layout at `DETAIL_TWO_COL_MIN`, single
+/// stack below (DESIGN 5.3). `bloom` is the surface `two_col` flag: only a
+/// History-origin zoom blooms the §5.3a rail; the layout split is width-only.
 pub fn draw_zoom(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -262,15 +277,17 @@ pub fn draw_zoom(
     state: &DetailState,
     env: &ViewEnv,
     pool: &mut ProtocolPool,
+    bloom: bool,
 ) {
     let body = Rect {
         x: area.x + 2,
         width: area.width.saturating_sub(3),
         ..area
     };
-    draw_content(frame, body, palette, state, env, pool, true);
+    draw_content(frame, body, palette, state, env, pool, true, true, bloom);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_content(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -279,10 +296,18 @@ fn draw_content(
     env: &ViewEnv,
     pool: &mut ProtocolPool,
     focused: bool,
+    split_ok: bool,
+    bloom: bool,
 ) {
     let Some(entry) = state.shown() else {
         return;
     };
+    if split_ok && area.width >= DETAIL_TWO_COL_MIN {
+        draw_split(
+            frame, area, palette, state, entry, env, pool, focused, bloom,
+        );
+        return;
+    }
     let width = area.width as usize;
     let mut y = 1u16;
 
@@ -306,14 +331,44 @@ fn draw_content(
         }
     }
 
-    // Header stack: title, alt rows, chips row, score line (DESIGN 4.4).
+    let mut lines = header_lines(entry, palette, env, width);
+    // Compact meta (§5.3a): the joined line plus the dedicated
+    // Provider/Pinned row; the rail never blooms in the single stack.
+    let fields = detail_meta_fields(entry, &state.episodes);
+    lines.push(meta_line(&fields, palette));
+    if let Some(line) = provider_line(&fields, palette) {
+        lines.push(line);
+    }
+
+    for line in &lines {
+        if y >= area.height {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(line.clone()),
+            Rect::new(area.x, area.y + y, area.width, 1),
+        );
+        y += 1;
+    }
+    y += 1;
+
+    draw_body(frame, area, palette, state, entry, env, y, focused);
+}
+
+/// Header stack: title, alt rows, chips row, score line (DESIGN 4.4).
+fn header_lines(
+    entry: &Enrichment,
+    palette: &Palette,
+    env: &ViewEnv,
+    width: usize,
+) -> Vec<Line<'static>> {
     let title = preferred_title(
         &entry.title_romaji,
         entry.title_english.as_deref(),
         entry.title_native.as_deref(),
         env.pref,
     );
-    let mut lines: Vec<Line<'_>> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
         render::truncate_to_width(title, width).into_owned(),
         Style::new().fg(palette.fg).add_modifier(Modifier::BOLD),
@@ -332,20 +387,114 @@ fn draw_content(
         lines.push(chips);
     }
     lines.push(score_line(entry, palette));
+    lines
+}
 
-    for line in &lines {
-        if y >= area.height {
-            break;
+/// The two-internal-column form (DESIGN 5.3): cover in the left column,
+/// header + meta + synopsis + grid in the right. The left column width feeds
+/// the §3.2 cover tier; the cover shares no column with the grid, so the
+/// single-column height cap does not apply here.
+#[allow(clippy::too_many_arguments)]
+fn draw_split(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    palette: &Palette,
+    state: &DetailState,
+    entry: &Enrichment,
+    env: &ViewEnv,
+    pool: &mut ProtocolPool,
+    focused: bool,
+    bloom: bool,
+) {
+    let left_w = (area.width * 38 / 100).max(20);
+    let cover_w = cover_width(left_w);
+    let mut content_x = area.x;
+    if cover_w > 0 {
+        let tier = sizing::Tier {
+            large: cover_w == 20,
+            cover_w,
+            slot_w: cover_w,
+        };
+        let cover_h = sizing::detail_cover_h(&tier, pool.cell()).min(area.height.saturating_sub(2));
+        if cover_h >= MIN_COVER_ROWS {
+            let cover = Rect::new(area.x, area.y + 1, cover_w, cover_h);
+            draw_cover_block(frame, cover, palette, state, entry, env.now, pool);
+        }
+        content_x = area.x + cover_w + SPLIT_GAP;
+    }
+    let content_w = (area.x + area.width).saturating_sub(content_x);
+    if content_w == 0 {
+        return;
+    }
+    let content = Rect::new(content_x, area.y, content_w, area.height);
+    let mut y = 1u16;
+    for line in header_lines(entry, palette, env, content_w as usize) {
+        if y >= content.height {
+            return;
         }
         frame.render_widget(
-            Paragraph::new(line.clone()),
-            Rect::new(area.x, area.y + y, area.width, 1),
+            Paragraph::new(line),
+            Rect::new(content.x, content.y + y, content.width, 1),
         );
         y += 1;
     }
-    y += 1;
 
-    draw_body(frame, area, palette, state, entry, env, y, focused);
+    let fields = detail_meta_fields(entry, &state.episodes);
+    y = draw_hairline(frame, content, palette, y);
+    if bloom {
+        // Rail rows walk the priority order top-down; a short pane sheds the
+        // lowest-priority rows first (§5.3a). The reserve keeps the closing
+        // hairline, a 2-row synopsis, and the grid's spacer + 2 rows.
+        let reserve = 1 + 2 + GRID_RESERVE;
+        let max_rows = content.height.saturating_sub(y + reserve) as usize;
+        for f in fields.iter().take(max_rows) {
+            let value_style = if f.dim {
+                Style::new().fg(palette.fg3)
+            } else {
+                Style::new().fg(palette.fg2)
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(format!("{:<10}", f.label), Style::new().fg(palette.fg3)),
+                    Span::styled(f.value.clone(), value_style),
+                ])),
+                Rect::new(content.x + 1, content.y + y, content.width - 1, 1),
+            );
+            y += 1;
+        }
+    } else {
+        let compact: Vec<Line<'static>> = std::iter::once(meta_line(&fields, palette))
+            .chain(provider_line(&fields, palette))
+            .collect();
+        for line in compact {
+            if y >= content.height {
+                return;
+            }
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect::new(content.x + 1, content.y + y, content.width - 1, 1),
+            );
+            y += 1;
+        }
+    }
+    y = draw_hairline(frame, content, palette, y);
+
+    draw_body(frame, content, palette, state, entry, env, y, focused);
+}
+
+/// `─` section rule (DESIGN 3.6), chrome tier.
+fn draw_hairline(frame: &mut Frame<'_>, area: Rect, palette: &Palette, y: u16) -> u16 {
+    if y >= area.height {
+        return y;
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::new().fg(palette.chrome),
+        )),
+        Rect::new(area.x, area.y + y, area.width, 1),
+    );
+    y + 1
 }
 
 /// Split the rows under the header between synopsis and grid. With no session
@@ -531,6 +680,187 @@ fn aired_count(entry: &Enrichment) -> Option<u32> {
         return None;
     }
     entry.next_airing_episode.map(|n| n.saturating_sub(1))
+}
+
+/// One §5.3a metadata field; both render densities consume the same list so
+/// the forms can never drift apart.
+struct MetaField {
+    label: &'static str,
+    value: String,
+    /// Rendered only by the compact line (`13 eps`), never the rail.
+    unit: Option<&'static str>,
+    dim: bool,
+    rail_only: bool,
+}
+
+/// The ordered eight-field list (§5.3a), highest priority first. Episodes is
+/// the floor and never omitted; every other field omits outright when its
+/// value is null. Provider and Pinned are session-derived (nav-state only)
+/// and gated on an engaged session.
+fn detail_meta_fields(entry: &Enrichment, session: &EpisodeSession) -> Vec<MetaField> {
+    let mut out = Vec::new();
+    let (value, dim) = match entry.total_episodes {
+        Some(n) => (n.to_string(), false),
+        None => ("?".to_string(), true),
+    };
+    out.push(MetaField {
+        label: "Episodes",
+        value,
+        unit: Some("eps"),
+        dim,
+        rail_only: false,
+    });
+    let plain = |label, value: String, rail_only| MetaField {
+        label,
+        value,
+        unit: None,
+        dim: false,
+        rail_only,
+    };
+    if let Some(label) = render::format_label(entry.kind.as_deref()) {
+        out.push(plain("Format", label.to_string(), false));
+    }
+    if let Some(src) = entry.source_material.as_deref() {
+        out.push(plain("Source", title_case(src), false));
+    }
+    // A 0-minute runtime is a missing value, not a fact (§5.3a).
+    if let Some(minutes) = entry.duration_minutes.filter(|m| *m > 0) {
+        out.push(plain("Duration", format!("{minutes} min"), false));
+    }
+    if let Some(studios) = studios_value(&entry.studios) {
+        out.push(plain("Studios", studios, false));
+    }
+    if let Some(rank) = rank_value(entry) {
+        out.push(plain("Rank", rank, true));
+    }
+    if session.engaged_for(entry.anilist_id) {
+        if let Some((value, dim)) = provider_value(session) {
+            out.push(MetaField {
+                label: "Provider",
+                value,
+                unit: None,
+                dim,
+                rail_only: true,
+            });
+        }
+        if let Some(pin) = session.pin() {
+            out.push(plain("Pinned", pin.to_string(), true));
+        }
+    }
+    out
+}
+
+/// `LIGHT_NOVEL` -> `Light novel` (§5.3a).
+fn title_case(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase().replace('_', " ");
+    let mut chars = lower.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => lower,
+    }
+}
+
+/// Collapse-format capped at 2 named studios (§5.3a): `A`, `A, B`, `A, B +N`.
+fn studios_value(studios: &[String]) -> Option<String> {
+    match studios {
+        [] => None,
+        [a] => Some(a.clone()),
+        [a, b] => Some(format!("{a}, {b}")),
+        [a, b, rest @ ..] => Some(format!("{a}, {b} +{}", rest.len())),
+    }
+}
+
+/// `#{rank} rated {year}` from the pre-selected scalar columns (§5.3a); the
+/// season name never renders, the header chip already carries it.
+fn rank_value(entry: &Enrichment) -> Option<String> {
+    let rank = entry.rank?;
+    let word = match entry.rank_type.as_deref()? {
+        "RATED" => "rated",
+        "POPULAR" => "popular",
+        _ => return None,
+    };
+    Some(match entry.rank_year {
+        Some(year) => format!("#{rank} {word} {year}"),
+        None => format!("#{rank} {word}"),
+    })
+}
+
+/// Provider tokens in fixed registry order (§5.3a): `▸` serving, `+` bound,
+/// `-` fresh negative, `?` unchecked; shape carries the state, not color.
+/// Dim only when nothing is known about any provider.
+fn provider_value(session: &EpisodeSession) -> Option<(String, bool)> {
+    let avail = session.avail();
+    if avail.is_empty() {
+        return None;
+    }
+    let serving = session.serving();
+    let mut informative = false;
+    let tokens: Vec<String> = avail
+        .iter()
+        .map(|(name, availability)| {
+            let marker = if serving == Some(name.as_str()) {
+                informative = true;
+                '▸'
+            } else {
+                match availability {
+                    ProviderAvailability::Bound => {
+                        informative = true;
+                        '+'
+                    }
+                    ProviderAvailability::Absent => {
+                        informative = true;
+                        '-'
+                    }
+                    ProviderAvailability::Unchecked => '?',
+                }
+            };
+            format!("{marker}{name}")
+        })
+        .collect();
+    Some((tokens.join(" "), !informative))
+}
+
+/// The compact `·`-joined form (§5.3a): non-rail fields only, unit suffixes,
+/// separators only between emitted fields (no orphan `·`).
+fn meta_line(fields: &[MetaField], palette: &Palette) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for f in fields.iter().filter(|f| !f.rail_only) {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::new().fg(palette.fg3)));
+        }
+        let style = if f.dim {
+            Style::new().fg(palette.fg3)
+        } else {
+            Style::new().fg(palette.fg2)
+        };
+        let text = match f.unit {
+            Some(unit) => format!("{} {unit}", f.value),
+            None => f.value.clone(),
+        };
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+/// The dedicated Provider/Pinned row under the compact line (§5.3a). The
+/// `pin ` prefix is required: a bare trailing name would read as an unmarked
+/// provider token.
+fn provider_line(fields: &[MetaField], palette: &Palette) -> Option<Line<'static>> {
+    let provider = fields.iter().find(|f| f.label == "Provider")?;
+    let style = if provider.dim {
+        Style::new().fg(palette.fg3)
+    } else {
+        Style::new().fg(palette.fg2)
+    };
+    let mut spans = vec![Span::styled(provider.value.clone(), style)];
+    if let Some(pin) = fields.iter().find(|f| f.label == "Pinned") {
+        spans.push(Span::styled(" · ", Style::new().fg(palette.fg3)));
+        spans.push(Span::styled(
+            format!("pin {}", pin.value),
+            Style::new().fg(palette.fg2),
+        ));
+    }
+    Some(Line::from(spans))
 }
 
 /// Cover cell states (DESIGN 8.1): image, fetch spinner, or the `no art yet`
@@ -819,11 +1149,11 @@ mod tests {
     /// grid keeps its 2 rows.
     #[test]
     fn cover_cap_protects_the_grid_at_the_worst_case() {
-        assert_eq!(cover_height_cap(32), 20);
-        // 32 - blank - 20 cover - blank = 10 rows: worst header (5 lines +
-        // blank) + synopsis 2 + grid spacer + 2 grid rows.
+        assert_eq!(cover_height_cap(32), 18);
+        // 32 - blank - 18 cover - blank = 12 rows: worst header (7 lines
+        // incl. meta + provider row) + synopsis 2 + grid spacer + 2 grid rows.
         assert!(cover_height_cap(32) <= 32 - COVER_RESERVE);
-        assert_eq!(cover_height_cap(17), 0, "below 6 rows the poster drops");
+        assert_eq!(cover_height_cap(19), 0, "below 6 rows the poster drops");
         assert_eq!(synopsis_cap(5), 2);
         assert_eq!(synopsis_cap(3), 0);
     }
@@ -861,6 +1191,160 @@ mod tests {
         assert_eq!(grid_cols(60), 12);
         assert_eq!(grid_cols(25), 5);
         assert_eq!(grid_cols(3), 1);
+    }
+
+    fn rich_entry() -> Enrichment {
+        Enrichment {
+            total_episodes: Some(28),
+            kind: Some("TV".into()),
+            source_material: Some("LIGHT_NOVEL".into()),
+            duration_minutes: Some(24),
+            studios: vec!["Madhouse".into()],
+            rank: Some(12),
+            rank_type: Some("RATED".into()),
+            rank_year: Some(2023),
+            ..entry(1)
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn meta_fields_walk_the_priority_order() {
+        use crate::store::ProviderAvailability::{Absent, Bound, Unchecked};
+        let session = EpisodeSession::seeded(
+            1,
+            Some("megaplay"),
+            Some("senshi"),
+            vec![
+                ("megaplay".into(), Bound),
+                ("senshi".into(), Absent),
+                ("allanime".into(), Unchecked),
+            ],
+            vec!["1".into()],
+        );
+        let fields = detail_meta_fields(&rich_entry(), &session);
+        let labels: Vec<&str> = fields.iter().map(|f| f.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Episodes", "Format", "Source", "Duration", "Studios", "Rank", "Provider", "Pinned"
+            ]
+        );
+        assert_eq!(fields[2].value, "Light novel");
+        assert_eq!(fields[3].value, "24 min");
+        assert_eq!(fields[5].value, "#12 rated 2023");
+        // Serving outranks bound; absence and unchecked keep their shapes.
+        assert_eq!(fields[6].value, "▸megaplay -senshi ?allanime");
+        assert!(!fields[6].dim);
+        assert_eq!(fields[7].value, "senshi");
+        assert!(fields.iter().skip(5).all(|f| f.rail_only));
+        assert!(fields.iter().take(5).all(|f| !f.rail_only));
+    }
+
+    #[test]
+    fn meta_fields_floor_and_session_gate() {
+        // Bare entry, unengaged session: only the dim Episodes floor.
+        let fields = detail_meta_fields(&entry(1), &EpisodeSession::default());
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, "?");
+        assert!(fields[0].dim);
+
+        // Engaged but nothing known anywhere: Provider still emits, dimmed.
+        use crate::store::ProviderAvailability::Unchecked;
+        let session = EpisodeSession::seeded(
+            1,
+            None,
+            None,
+            vec![("megaplay".into(), Unchecked)],
+            vec!["1".into()],
+        );
+        let fields = detail_meta_fields(&entry(1), &session);
+        let provider = fields.iter().find(|f| f.label == "Provider").unwrap();
+        assert_eq!(provider.value, "?megaplay");
+        assert!(provider.dim, "all-unchecked dims the line");
+        assert!(
+            !fields.iter().any(|f| f.label == "Pinned"),
+            "unpinned omits"
+        );
+    }
+
+    #[test]
+    fn meta_line_joins_without_orphan_separators() {
+        let palette = &crate::tui::theme::TERMINAL_GHOST;
+        let session = EpisodeSession::default();
+        let sparse = line_text(&meta_line(
+            &detail_meta_fields(&entry(1), &session),
+            palette,
+        ));
+        assert_eq!(sparse, "? eps", "single field carries no separator");
+        let full = line_text(&meta_line(
+            &detail_meta_fields(&rich_entry(), &session),
+            palette,
+        ));
+        assert_eq!(full, "28 eps · TV · Light novel · 24 min · Madhouse");
+        assert!(
+            !full.contains("rated"),
+            "rail-only fields stay off the line"
+        );
+    }
+
+    #[test]
+    fn provider_row_composes_with_and_without_pin() {
+        use crate::store::ProviderAvailability::Bound;
+        let palette = &crate::tui::theme::TERMINAL_GHOST;
+        let pinned = EpisodeSession::seeded(
+            1,
+            Some("megaplay"),
+            Some("senshi"),
+            vec![("megaplay".into(), Bound), ("senshi".into(), Bound)],
+            vec!["1".into()],
+        );
+        let fields = detail_meta_fields(&entry(1), &pinned);
+        assert_eq!(
+            line_text(&provider_line(&fields, palette).unwrap()),
+            "▸megaplay +senshi · pin senshi"
+        );
+        let unpinned = EpisodeSession::seeded(
+            1,
+            Some("megaplay"),
+            None,
+            vec![("megaplay".into(), Bound)],
+            vec!["1".into()],
+        );
+        let fields = detail_meta_fields(&entry(1), &unpinned);
+        assert_eq!(
+            line_text(&provider_line(&fields, palette).unwrap()),
+            "▸megaplay",
+            "no trailing separator when unpinned"
+        );
+        // No engaged session: the whole row is skipped.
+        let fields = detail_meta_fields(&entry(1), &EpisodeSession::default());
+        assert!(provider_line(&fields, palette).is_none());
+    }
+
+    #[test]
+    fn meta_value_formatters() {
+        assert_eq!(title_case("LIGHT_NOVEL"), "Light novel");
+        assert_eq!(title_case("ORIGINAL"), "Original");
+        assert_eq!(studios_value(&[]), None);
+        assert_eq!(studios_value(&["A".into()]).unwrap(), "A");
+        assert_eq!(studios_value(&["A".into(), "B".into()]).unwrap(), "A, B");
+        assert_eq!(
+            studios_value(&["A".into(), "B".into(), "C".into(), "D".into()]).unwrap(),
+            "A, B +2"
+        );
+        let mut e = rich_entry();
+        e.rank_year = None;
+        assert_eq!(rank_value(&e).unwrap(), "#12 rated");
+        e.rank_type = Some("POPULAR".into());
+        assert_eq!(rank_value(&e).unwrap(), "#12 popular");
+        e.rank_type = Some("WEIRD".into());
+        assert_eq!(rank_value(&e), None, "unknown ranking type omits");
+        e.rank_type = None;
+        assert_eq!(rank_value(&e), None);
     }
 
     #[test]

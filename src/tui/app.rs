@@ -189,6 +189,7 @@ impl App {
             KeyCode::Char('k') => self.on_k(now),
             KeyCode::Char('g') => self.on_jump(true, now),
             KeyCode::Char('G') => self.on_jump(false, now),
+            KeyCode::Char('v') => self.on_pin_cycle(now, tx),
             KeyCode::Char('P') => self.on_plan(now),
             KeyCode::Char(']') => self.on_axis_cycle(1),
             KeyCode::Char('[') => self.on_axis_cycle(-1),
@@ -672,6 +673,21 @@ impl App {
         }
     }
 
+    /// `v` cycles the open show's provider pin (DESIGN 6.1); detail surfaces
+    /// only, inert elsewhere.
+    fn on_pin_cycle(&mut self, now: Instant, tx: &EventTx) {
+        let on_detail_surface = self.view == View::Detail
+            || (matches!(self.view, View::Browse | View::History) && self.pane == Pane::Detail);
+        if !on_detail_surface || self.detail.shown().is_none() {
+            return;
+        }
+        let fb = {
+            let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+            self.detail.episodes.cycle_pin(&deps)
+        };
+        self.apply_episode_feedback(fb, now);
+    }
+
     /// Detail entry resolves episodes (03 §6.1); list scroll never does
     /// (05 §10.1).
     fn engage_detail(&mut self, now: Instant, tx: &EventTx) {
@@ -747,6 +763,27 @@ impl App {
                     self.toasts.push(Kind::Warn, &copy, now);
                 }
                 Feedback::DeadEnd => self.toasts.push(Kind::Error, "no source found", now),
+                Feedback::PinSet { provider } => {
+                    let copy = format!("pinned to {}", self.display_name(&provider));
+                    self.toasts.push(Kind::Success, &copy, now);
+                }
+                Feedback::PinCleared => self.toasts.push(Kind::Info, "provider pin cleared", now),
+                Feedback::PinPending => {
+                    self.toasts
+                        .push(Kind::Info, "still resolving, try again shortly", now)
+                }
+                Feedback::PinNothing => {
+                    self.toasts
+                        .push(Kind::Info, "no source: nothing to pin", now)
+                }
+                Feedback::PinSaveFailed { clearing } => {
+                    let copy = if clearing {
+                        "couldn't clear the provider pin"
+                    } else {
+                        "couldn't save the provider pin"
+                    };
+                    self.toasts.push(Kind::Error, copy, now);
+                }
             }
         }
     }
@@ -849,6 +886,8 @@ impl App {
 
     fn draw_zoom(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
         let env = self.view_env(now);
+        // Only a History-origin zoom sets the two_col flag that blooms the
+        // §5.3a rail; the layout split itself is width-keyed in the view.
         detail::draw_zoom(
             frame,
             area,
@@ -856,6 +895,7 @@ impl App {
             &self.detail,
             &env,
             &mut self.pool,
+            self.origin == Origin::History,
         );
     }
 
@@ -1913,6 +1953,103 @@ mod tests {
         let text = rendered(&mut app, 100, 30);
         assert!(text.contains("megaplay is down"), "{text}");
         assert!(text.contains("trying senshi…"), "{text}");
+    }
+
+    #[test]
+    fn v_cycles_the_pin_with_toasts_and_flip() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into()])),
+            teststub::StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "pin-e2e",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        assert_eq!(app.detail.episodes.serving(), Some("megaplay"));
+
+        app.tick(ch('v'), t1, &tx);
+        let text = rendered(&mut app, 110, 32);
+        assert!(text.contains("pinned to megaplay"), "{text}");
+        assert_eq!(
+            app.store.get_provider_pin(1).unwrap().as_deref(),
+            Some("megaplay")
+        );
+
+        app.tick(ch('v'), t1, &tx);
+        let text = rendered(&mut app, 110, 32);
+        assert!(text.contains("trying senshi…"), "{text}");
+        settle_feed(&mut app, &tx, &rx, t1);
+        assert_eq!(app.detail.episodes.serving(), Some("senshi"));
+
+        app.tick(ch('v'), t1, &tx);
+        let text = rendered(&mut app, 110, 32);
+        assert!(text.contains("provider pin cleared"), "{text}");
+        assert_eq!(app.store.get_provider_pin(1).unwrap(), None);
+
+        // v is a detail-surface key; on the list it must stay inert.
+        app.tick(key(KeyCode::Esc), t1, &tx);
+        let before = app.store.get_provider_pin(1).unwrap();
+        app.tick(ch('v'), t1, &tx);
+        assert_eq!(app.store.get_provider_pin(1).unwrap(), before);
+    }
+
+    #[test]
+    fn zoom_metadata_blooms_only_for_history_origin() {
+        let page = Ok(CatalogPage {
+            entries: vec![Enrichment {
+                kind: Some("TV".into()),
+                total_episodes: Some(12),
+                duration_minutes: Some(24),
+                studios: vec!["Madhouse".into()],
+                ..feed_entry(1)
+            }],
+            has_next: false,
+        });
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "rail-e2e",
+            StubCatalog::search_scripted(vec![page]),
+            registry,
+        );
+        app.tick(Event::Resize(110, 32), now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('/'), ch('a')]);
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        app.tick(ch(' '), t1, &tx);
+        assert_eq!(app.view, View::Detail);
+        assert_eq!(app.origin, Origin::Browse);
+
+        // Browse-origin zoom at 110: split layout, compact metadata.
+        let browse_zoom = rendered(&mut app, 110, 32);
+        assert!(browse_zoom.contains("12 eps"), "{browse_zoom}");
+        assert!(browse_zoom.contains("▸megaplay"), "provider row renders");
+        assert!(
+            !browse_zoom.contains("Duration"),
+            "no rail labels on a Browse-origin zoom"
+        );
+
+        // Same zoom, History origin: the rail blooms with labeled rows.
+        app.origin = Origin::History;
+        app.dirty = true;
+        let history_zoom = rendered(&mut app, 110, 32);
+        assert!(history_zoom.contains("Episodes"), "{history_zoom}");
+        assert!(history_zoom.contains("Duration"), "{history_zoom}");
+        assert!(history_zoom.contains("Madhouse"), "{history_zoom}");
+        assert!(history_zoom.contains("▸megaplay"), "{history_zoom}");
     }
 
     #[test]

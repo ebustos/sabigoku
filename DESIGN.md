@@ -912,6 +912,7 @@ resolves one of three non-cell states, which must read as distinct:
 |---|---|---|
 | Fetching | `⠋ loading episodes…` in `state.focus`, top of region | active, spinner |
 | Genuinely zero episodes (`episodes_done`, empty array) | `no episodes` in `text.dim` + italic, **centered** | deliberate absent state |
+| Resolve walk exhausted, nothing landed | `no source` in `text.dim` + italic, **centered** | terminal absence (the walk's failure classes already toasted; ROD-439) |
 | No fetch fired (no item selected) | nothing | blank by design |
 
 The zero-episode case is a real provider result, *not* a failure; a fetch error
@@ -1052,6 +1053,8 @@ state.now` escalation.
 | Provider pin: row not minted yet | `v` pressed before the serving provider's binding row is minted (only happens on `episodes_done`) | info | `still resolving, try again shortly` | no |
 | Provider pin: no canonical identity | `v` pressed on a show with no AniList identity (no `provider_pins` FK target) | info | `no canonical identity: can't pin a provider` | no |
 | Provider pin: store write failed | the pin write errors on set or clear | error | `couldn't save the provider pin` / `couldn't clear the provider pin` | no |
+| Resolve walk exhausted | every provider tried or skipped, no grid landed (§4.6 `no source` state) | error | `no source found` | no |
+| Forced-preferred miss | the §5.3 stale-stamp probe missed; the K-2 continuation walk begins | warn | `no match on {provider}` (distinct from the pin-kept copy by law) | no |
 
 Copy: single line, lowercase, no terminal punctuation; status, not prose, and
 within the §4.7 36-column copy budget (the box is 40 cols incl. the 4-col glyph

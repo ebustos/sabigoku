@@ -81,6 +81,20 @@ pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// AniList format labels (DESIGN 3.8, 5.3a): TV_SHORT folds into TV; an
+/// unknown enum value renders nothing rather than a guess.
+pub fn format_label(kind: Option<&str>) -> Option<&'static str> {
+    Some(match kind? {
+        "TV" | "TV_SHORT" => "TV",
+        "MOVIE" => "Movie",
+        "OVA" => "OVA",
+        "ONA" => "ONA",
+        "SPECIAL" => "Spec",
+        "MUSIC" => "Music",
+        _ => return None,
+    })
+}
+
 /// Compact list/card score badge (DESIGN 2.2): `[97]` / `[--]`.
 pub fn score_badge(score: Option<u32>) -> String {
     match score {

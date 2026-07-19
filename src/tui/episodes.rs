@@ -15,7 +15,7 @@ use crate::domain::{self, Enrichment, Translation};
 use crate::providers::ProviderRegistry;
 use crate::resolve::{self, Exhausted, Hop, ResolveTarget, ResolveWorld, RouteAction, Walk};
 use crate::resolver;
-use crate::store::Store;
+use crate::store::{ProviderAvailability, Store};
 use crate::tui::clock::AsyncStart;
 use crate::tui::event::{EventTx, FetchClass};
 use crate::tui::workers::{self, Drain, EpisodeFetch, Generation, ProviderSearch};
@@ -112,6 +112,16 @@ pub enum Feedback {
     PinKept { provider: String },
     /// Ordinary walk exhausted with nothing landed.
     DeadEnd,
+    /// `v` pinned the provider already serving the grid; no hop.
+    PinSet { provider: String },
+    /// `v` cycled past the last provider back to unpinned.
+    PinCleared,
+    /// `v` while the resolve is still in flight.
+    PinPending,
+    /// `v` with no episode source to pin against.
+    PinNothing,
+    /// The pin write itself failed.
+    PinSaveFailed { clearing: bool },
 }
 
 #[derive(Default)]
@@ -134,6 +144,13 @@ pub struct EpisodeSession {
     walk: Option<Walk>,
     /// Name behind a live single-provider walk, for the miss copy.
     walk_provider: Option<String>,
+    /// Pre-flip cursor identity `(raw label, 1-based ordinal)`: a flip
+    /// landing keeps the cursor on the in-progress episode (05 §10.5).
+    remap_from: Option<(String, u32)>,
+    /// Pin + per-provider availability, refreshed on engage and on every
+    /// bind/absence write (03 §6.1 step 2) so draw never reads the store.
+    pin: Option<String>,
+    avail: Vec<(String, ProviderAvailability)>,
     generation: Generation,
     drain: Drain,
 }
@@ -154,6 +171,9 @@ impl EpisodeSession {
         self.mint_pending = false;
         self.walk = None;
         self.walk_provider = None;
+        self.remap_from = None;
+        self.pin = None;
+        self.avail.clear();
     }
 
     /// Detail entry (03 §6.1): lazy, never fired by list scroll (05 §10.1).
@@ -169,6 +189,7 @@ impl EpisodeSession {
         self.for_id = Some(aid);
         self.canonical = Some(canonical.clone());
         self.track = Some(deps.translation);
+        self.refresh_meta(deps);
 
         // 03 §6.1 step 4: the preferred re-route runs before the classifier.
         let routed = resolve::route_preferred(&deps.world(), canonical);
@@ -313,7 +334,13 @@ impl EpisodeSession {
                         provider: provider.clone(),
                     });
                 }
-                self.fire_fetch(provider, id, bind.is_some(), deps);
+                // A bound hop paints from an unexpired cache like a bound
+                // open; only a fresh tier-A key must go to the network.
+                if bind.is_some() {
+                    self.fire_fetch(provider, id, true, deps);
+                } else {
+                    self.open_bound(provider, id, deps);
+                }
                 fb
             }
             Ok(Hop::Search { provider, .. }) => {
@@ -389,6 +416,7 @@ impl EpisodeSession {
                 .store
                 .mark_provider_absent(&canonical, provider, deps.unix_now);
             self.mint_pending = false;
+            self.refresh_meta(deps);
             return self.fail_over(provider, deps);
         }
         // ROD-327 FK order: identity + binding land before the episode cache
@@ -411,6 +439,7 @@ impl EpisodeSession {
         // Landed hop clears the walk (05 §10.3); no ping-pong of fresh walks.
         self.walk = None;
         self.walk_provider = None;
+        self.refresh_meta(deps);
         self.land(provider.to_string(), episodes, deps);
         Vec::new()
     }
@@ -513,7 +542,84 @@ impl EpisodeSession {
         if let Some(ix) = self.resume_ix {
             self.cursor = ix;
         }
+        // A flip/hop landing keeps the cursor on the in-progress episode
+        // (05 §10.5): exact raw label, else 1-based ordinal (03 §6.6).
+        if let Some((label, ordinal)) = self.remap_from.take()
+            && let Some(ix) = domain::map_episode_index(&episodes, &label, ordinal)
+        {
+            self.cursor = ix;
+        }
         self.episodes = episodes;
+    }
+
+    /// Pin + availability snapshot for the meta rail (03 §6.1 step 2). Read
+    /// failures degrade to unchecked; the rail dims, nothing wedges.
+    fn refresh_meta(&mut self, deps: &EpisodeDeps) {
+        let Some(aid) = self.for_id else { return };
+        self.pin = deps.store.get_provider_pin(aid).ok().flatten();
+        self.avail = deps
+            .registry
+            .iter()
+            .map(|p| {
+                let availability = deps
+                    .store
+                    .provider_availability(aid, p.name(), deps.unix_now)
+                    .unwrap_or(ProviderAvailability::Unchecked);
+                (p.name().to_string(), availability)
+            })
+            .collect();
+    }
+
+    /// `v` cycle (03 §5.1, DESIGN 6.1): unpinned, then each live registry
+    /// provider in construction order, then unpinned. Pinning a provider that
+    /// is not serving the grid re-routes through a Path 3 single-provider
+    /// walk; its miss keeps the pin.
+    pub fn cycle_pin(&mut self, deps: &EpisodeDeps) -> Vec<Feedback> {
+        let Some(aid) = self.for_id else {
+            return vec![Feedback::PinNothing];
+        };
+        if self.loading.is_some() {
+            return vec![Feedback::PinPending];
+        }
+        if self.serving.is_none() {
+            return vec![Feedback::PinNothing];
+        }
+        let order: Vec<String> = deps.registry.iter().map(|p| p.name().to_string()).collect();
+        let next = match self.pin.as_deref() {
+            None => order.first().cloned(),
+            Some(pin) => match order.iter().position(|n| n == pin) {
+                Some(i) => order.get(i + 1).cloned(),
+                // A retired pin name wraps straight to unpinned (05 §10.5).
+                None => None,
+            },
+        };
+        let Some(target) = next else {
+            if deps.store.set_provider_pin(aid, None).is_err() {
+                return vec![Feedback::PinSaveFailed { clearing: true }];
+            }
+            self.pin = None;
+            return vec![Feedback::PinCleared];
+        };
+        if deps.store.set_provider_pin(aid, Some(&target)).is_err() {
+            return vec![Feedback::PinSaveFailed { clearing: false }];
+        }
+        self.pin = Some(target.clone());
+        if self.serving.as_deref() == Some(target.as_str()) {
+            return vec![Feedback::PinSet { provider: target }];
+        }
+        let Some(canonical) = self.canonical.clone() else {
+            return vec![Feedback::PinSet { provider: target }];
+        };
+        // Path 3 (03 §4.1): single-provider walk on the target, probing
+        // through fresh absence. `target` comes from the live registry, which
+        // is the pin_flip precondition.
+        self.remap_from = self
+            .episodes
+            .get(self.cursor)
+            .map(|label| (label.clone(), self.cursor as u32 + 1));
+        self.walk_provider = Some(target.clone());
+        self.walk = Some(Walk::pin_flip(canonical, target));
+        self.advance_walk(true, deps)
     }
 
     /// Whether the session's answer belongs to the shown entry; render gates
@@ -552,6 +658,14 @@ impl EpisodeSession {
         self.serving.as_deref()
     }
 
+    pub fn pin(&self) -> Option<&str> {
+        self.pin.as_deref()
+    }
+
+    pub fn avail(&self) -> &[(String, ProviderAvailability)] {
+        &self.avail
+    }
+
     pub fn loading(&self) -> Option<AsyncStart> {
         self.loading
     }
@@ -578,6 +692,27 @@ impl EpisodeSession {
 
     pub fn drain(&self, timeout: Duration) -> bool {
         self.drain.drain(timeout)
+    }
+}
+
+#[cfg(test)]
+impl EpisodeSession {
+    /// Render-test seed: a landed session without transport.
+    pub(crate) fn seeded(
+        for_id: i64,
+        serving: Option<&str>,
+        pin: Option<&str>,
+        avail: Vec<(String, ProviderAvailability)>,
+        episodes: Vec<String>,
+    ) -> EpisodeSession {
+        EpisodeSession {
+            for_id: Some(for_id),
+            serving: serving.map(str::to_string),
+            pin: pin.map(str::to_string),
+            avail,
+            episodes,
+            ..EpisodeSession::default()
+        }
     }
 }
 
@@ -1195,6 +1330,169 @@ mod tests {
         };
         rig.session.engage(&c, &deps);
         assert!(rig.session.loading().is_some(), "dub flip re-resolves");
+    }
+
+    #[test]
+    fn pin_cycle_sets_flips_and_clears() {
+        let mut rig = Rig::new(vec![
+            StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(eps(&["1", "2", "3"])),
+            StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(eps(&["1", "2", "3"])),
+        ]);
+        let c = canonical(5);
+        rig.session.engage(&c, &rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
+        rig.session.cursor_by(1);
+
+        // v #1: pins the provider already serving; no hop.
+        let fb = rig.session.cycle_pin(&rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::PinSet {
+                provider: "megaplay".into()
+            }]
+        );
+        assert_eq!(
+            rig.world.store.get_provider_pin(5).unwrap().as_deref(),
+            Some("megaplay")
+        );
+        assert!(rig.session.loading().is_none(), "no re-route fired");
+
+        // v #2: pins senshi and re-routes through the one-provider flip;
+        // the landing keeps the cursor on the in-progress episode.
+        let fb = rig.session.cycle_pin(&rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::Hop {
+                provider: "senshi".into()
+            }]
+        );
+        let fb = rig.world.settle(&mut rig.session, "");
+        assert!(fb.is_empty());
+        assert_eq!(rig.session.serving(), Some("senshi"));
+        assert_eq!(rig.session.cursor(), 1, "flip landing keeps the cursor");
+        assert_eq!(rig.world.store.bindings_for(5).unwrap().len(), 2);
+
+        // v #3: past the last provider wraps to unpinned; never re-routes.
+        let fb = rig.session.cycle_pin(&rig.world.deps(""));
+        assert_eq!(fb, vec![Feedback::PinCleared]);
+        assert_eq!(rig.world.store.get_provider_pin(5).unwrap(), None);
+        assert_eq!(rig.session.serving(), Some("senshi"));
+    }
+
+    #[test]
+    fn pin_flip_miss_keeps_pin_and_grid() {
+        // Pre-pinned megaplay; the cycle moves to senshi, which has no key
+        // and a failing search. The miss keeps the senshi pin AND the
+        // megaplay grid.
+        let mut rig = Rig::new(vec![
+            StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+            StubProvider::new("senshi"),
+        ]);
+        let c = canonical(5);
+        rig.world.store.add_to_library(&c, 50).unwrap();
+        rig.world
+            .store
+            .set_provider_pin(5, Some("megaplay"))
+            .unwrap();
+        rig.session.engage(&c, &rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
+
+        let fb = rig.session.cycle_pin(&rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::Hop {
+                provider: "senshi".into()
+            }]
+        );
+        let fb = rig.world.settle(&mut rig.session, "");
+        assert!(
+            fb.contains(&Feedback::PinKept {
+                provider: "senshi".into()
+            }),
+            "{fb:?}"
+        );
+        assert_eq!(
+            rig.world.store.get_provider_pin(5).unwrap().as_deref(),
+            Some("senshi"),
+            "the miss keeps the pin (03 5.1)"
+        );
+        assert_eq!(rig.session.serving(), Some("megaplay"), "grid survives");
+        assert_eq!(rig.session.grid(), ["1"]);
+    }
+
+    #[test]
+    fn retired_pin_wraps_straight_to_unpinned() {
+        let mut rig = Rig::new(vec![
+            StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+        ]);
+        let c = canonical(5);
+        rig.world.store.add_to_library(&c, 50).unwrap();
+        rig.world.store.set_provider_pin(5, Some("gogo")).unwrap();
+        rig.session.engage(&c, &rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        let fb = rig.session.cycle_pin(&rig.world.deps(""));
+        assert_eq!(fb, vec![Feedback::PinCleared]);
+        assert_eq!(rig.world.store.get_provider_pin(5).unwrap(), None);
+        assert!(rig.session.loading().is_none(), "no re-route on a retire");
+    }
+
+    #[test]
+    fn pin_gates_on_source_and_inflight() {
+        // Nothing engaged: nothing to pin.
+        let mut rig = Rig::new(vec![StubProvider::new("megaplay")]);
+        let fb = rig.session.cycle_pin(&rig.world.deps(""));
+        assert_eq!(fb, vec![Feedback::PinNothing]);
+
+        // Fetch in flight: still resolving.
+        let mut busy = Rig::new(vec![StubProvider::new("megaplay").with_key("505")]);
+        busy.session.engage(&canonical(5), &busy.world.deps(""));
+        assert!(busy.session.loading().is_some());
+        let fb = busy.session.cycle_pin(&busy.world.deps(""));
+        assert_eq!(fb, vec![Feedback::PinPending]);
+        busy.world.settle(&mut busy.session, "");
+
+        // Exhausted no-source state: nothing to pin either.
+        assert!(busy.session.no_source());
+        let fb = busy.session.cycle_pin(&busy.world.deps(""));
+        assert_eq!(fb, vec![Feedback::PinNothing]);
+    }
+
+    #[test]
+    fn engage_refreshes_pin_and_availability_for_the_rail() {
+        let mut rig = Rig::new(vec![
+            StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+            StubProvider::new("senshi"),
+        ]);
+        let c = canonical(5);
+        rig.world.store.add_to_library(&c, 50).unwrap();
+        rig.world.store.set_provider_pin(5, Some("senshi")).unwrap();
+        rig.session.engage(&c, &rig.world.deps(""));
+        assert_eq!(rig.session.pin(), Some("senshi"));
+        assert_eq!(
+            rig.session.avail(),
+            [
+                ("megaplay".to_string(), ProviderAvailability::Unchecked),
+                ("senshi".to_string(), ProviderAvailability::Unchecked),
+            ]
+        );
+        rig.world.settle(&mut rig.session, "");
+        // The landing minted the megaplay binding; availability follows.
+        assert_eq!(
+            rig.session.avail()[0],
+            ("megaplay".to_string(), ProviderAvailability::Bound)
+        );
     }
 
     #[test]
