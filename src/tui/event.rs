@@ -58,6 +58,17 @@ pub enum Event {
         axis: DiscoverAxis,
         cause: String,
     },
+    /// Browse catalogue search page (04 §4.2). Stale if `query` no longer
+    /// matches the live buffer; the token is the query string itself.
+    SearchDone {
+        query: String,
+        page: u32,
+        results: Vec<Enrichment>,
+    },
+    SearchFailed {
+        query: String,
+        cause: String,
+    },
 }
 
 pub type EventRx = mpsc::Receiver<Event>;

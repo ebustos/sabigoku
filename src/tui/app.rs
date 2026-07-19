@@ -57,19 +57,21 @@ pub struct App {
     toasts: Toasts,
     palette: &'static Palette,
     config: Config,
-    browse: BrowseState,
+    pub(super) browse: BrowseState,
     history: HistoryState,
     pub(super) discover: DiscoverState,
     settings: SettingsState,
-    detail: DetailState,
+    pub(super) detail: DetailState,
     store: Store,
     catalog: Arc<dyn CatalogProvider>,
     caches: Arc<CoverCaches>,
     covers_dir: PathBuf,
     pub(super) pool: ProtocolPool,
-    pub(super) cover_drain: Drain,
     pub(super) encode_drain: Drain,
 }
+
+/// Persistent-toast topic for the catalog brain (DESIGN 8.5).
+const ANILIST_TOPIC: &str = "anilist";
 
 impl App {
     /// State only; workers start in `run` (bootstrap order is its job).
@@ -106,7 +108,6 @@ impl App {
             caches: Arc::new(CoverCaches::new()),
             covers_dir,
             pool,
-            cover_drain: Drain::default(),
             encode_drain,
         }
     }
@@ -120,9 +121,8 @@ impl App {
             // No keys can ever arrive again; quit clean instead of zombieing.
             Event::InputClosed => self.quit = true,
             Event::Tick => self.on_tick(now, tx),
-            // Detail cover results rewire into DetailState in chunk 3;
-            // nothing spawns that worker yet.
-            Event::CoverDone { .. } | Event::CoverError { .. } => {}
+            Event::CoverDone { for_id, img } => self.on_cover_done(for_id, img),
+            Event::CoverError { for_id } => self.on_cover_error(for_id, now),
             Event::DiscoverCoverDone { url, img } => self.on_discover_cover_done(&url, img),
             Event::DiscoverCoverError { url } => self.on_discover_cover_error(&url, now),
             Event::CoverEncodeReady => self.on_encode_ready(),
@@ -133,6 +133,12 @@ impl App {
                 has_next,
             } => self.on_discover_feed(axis, page, entries, has_next),
             Event::DiscoverFeedError { axis, cause } => self.on_discover_feed_error(axis, cause),
+            Event::SearchDone {
+                query,
+                page: _,
+                results,
+            } => self.on_search_done(&query, results, now),
+            Event::SearchFailed { query, cause: _ } => self.on_search_failed(&query, now),
         }
     }
 
@@ -146,12 +152,12 @@ impl App {
             return;
         }
         if let KeyCode::F(n @ 1..=4) = key.code {
-            self.on_fkey(n);
+            self.on_fkey(n, now);
             return;
         }
         match self.mode {
             InputMode::Normal => self.on_normal_key(key, now),
-            InputMode::Search => self.on_search_key(key),
+            InputMode::Search => self.on_search_key(key, now),
             InputMode::Command => self.on_command_key(key, now),
         }
         self.dirty = true;
@@ -160,19 +166,21 @@ impl App {
     fn on_normal_key(&mut self, key: KeyEvent, now: Instant) {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('B') => self.switch_view(View::Browse),
-            KeyCode::Char('H') => self.switch_view(View::History),
-            KeyCode::Char('D') => self.switch_view(View::Discover),
-            KeyCode::Char('S') => self.switch_view(View::Settings),
-            KeyCode::Char('/') => self.open_search(),
+            KeyCode::Char('B') => self.switch_view(View::Browse, now),
+            KeyCode::Char('H') => self.switch_view(View::History, now),
+            KeyCode::Char('D') => self.switch_view(View::Discover, now),
+            KeyCode::Char('S') => self.switch_view(View::Settings, now),
+            KeyCode::Char('/') => self.open_search(now),
             KeyCode::Char(':') => self.open_command(),
             KeyCode::Esc => self.on_escape(),
             KeyCode::Char(' ') => self.on_space(),
-            KeyCode::Enter => self.on_enter(),
+            KeyCode::Enter => self.on_enter(now),
             KeyCode::Char('h') => self.on_h(),
-            KeyCode::Char('l') => self.on_l(),
-            KeyCode::Char('j') => self.on_j(),
-            KeyCode::Char('k') => self.on_k(),
+            KeyCode::Char('l') => self.on_l(now),
+            KeyCode::Char('j') => self.on_j(now),
+            KeyCode::Char('k') => self.on_k(now),
+            KeyCode::Char('g') => self.on_jump(true, now),
+            KeyCode::Char('G') => self.on_jump(false, now),
             KeyCode::Char('P') => self.on_plan(now),
             KeyCode::Char(']') => self.on_axis_cycle(1),
             KeyCode::Char('[') => self.on_axis_cycle(-1),
@@ -183,7 +191,7 @@ impl App {
 
     /// F1-F4 close any prompt: they are navigation, and unlike the letters
     /// they cannot be typed into a search (DESIGN 7.2).
-    fn on_fkey(&mut self, n: u8) {
+    fn on_fkey(&mut self, n: u8, now: Instant) {
         self.mode = InputMode::Normal;
         let target = match n {
             1 => View::Browse,
@@ -191,30 +199,35 @@ impl App {
             3 => View::Discover,
             _ => View::Settings,
         };
-        self.switch_view(target);
+        self.switch_view(target, now);
         self.dirty = true;
     }
 
     /// Direct go-to, never a toggle; same-view is a no-op (DESIGN 7.2).
-    fn switch_view(&mut self, target: View) {
+    /// Entering Browse re-pushes its selection so the shared detail surface
+    /// never shows another view's show.
+    fn switch_view(&mut self, target: View, now: Instant) {
         if self.view == target {
             return;
         }
         self.view = target;
         self.pane = Pane::List;
+        if target == View::Browse {
+            self.push_browse_selection(true, now);
+        }
     }
 
-    fn open_search(&mut self) {
+    fn open_search(&mut self, now: Instant) {
         match self.view {
             View::Browse | View::History => self.mode = InputMode::Search,
             // `/` jumps to Browse; Discover has no in-view filter (DESIGN 7.5).
-            View::Discover => self.jump_to_browse_search(),
+            View::Discover => self.jump_to_browse_search(now),
             View::Detail | View::Settings => {}
         }
     }
 
-    fn jump_to_browse_search(&mut self) {
-        self.switch_view(View::Browse);
+    fn jump_to_browse_search(&mut self, now: Instant) {
+        self.switch_view(View::Browse, now);
         self.mode = InputMode::Search;
     }
 
@@ -246,14 +259,29 @@ impl App {
 
     /// Enter drills toward wherever the grid is visible, then plays
     /// (DESIGN 10, ROD-170/259). Play itself lands in chunk 6.
-    fn on_enter(&mut self) {
+    fn on_enter(&mut self, now: Instant) {
         match self.view {
-            View::Discover => self.promote(),
+            View::Discover => self.open_discover_detail(now),
             View::Browse | View::History if self.pane == Pane::Detail => {}
             View::History if !self.two_pane() => self.promote(),
-            View::Browse | View::History if self.two_pane() => self.pane = Pane::Detail,
+            View::Browse if self.two_pane() => self.enter_browse_pane(now),
+            View::History if self.two_pane() => self.pane = Pane::Detail,
             _ => {}
         }
+    }
+
+    /// Zoom from a Discover card: push the card snapshot, then promote.
+    fn open_discover_detail(&mut self, now: Instant) {
+        if let Some(entry) = self.discover.selected_entry() {
+            let entry = entry.clone();
+            self.detail.set_target(&entry, true, now);
+        }
+        self.promote();
+    }
+
+    fn enter_browse_pane(&mut self, now: Instant) {
+        self.pane = Pane::Detail;
+        self.push_browse_selection(true, now);
     }
 
     fn on_h(&mut self) {
@@ -265,25 +293,69 @@ impl App {
         }
     }
 
-    fn on_l(&mut self) {
+    fn on_l(&mut self, now: Instant) {
         match self.view {
-            View::Browse | View::History if self.pane == Pane::List && self.two_pane() => {
-                self.pane = Pane::Detail
+            View::Browse if self.pane == Pane::List && self.two_pane() => {
+                self.enter_browse_pane(now)
             }
+            View::History if self.pane == Pane::List && self.two_pane() => self.pane = Pane::Detail,
             View::Discover => self.nav_discover(1, 0),
             _ => {}
         }
     }
 
-    fn on_j(&mut self) {
-        if self.view == View::Discover {
-            self.nav_discover(0, 1);
+    fn on_j(&mut self, now: Instant) {
+        match self.view {
+            View::Discover => self.nav_discover(0, 1),
+            View::Browse if self.pane == Pane::List => self.on_browse_nav(1, now),
+            View::Browse | View::History if self.pane == Pane::Detail => self.detail.scroll_by(1),
+            View::Detail => self.detail.scroll_by(1),
+            _ => {}
         }
     }
 
-    fn on_k(&mut self) {
-        if self.view == View::Discover {
-            self.nav_discover(0, -1);
+    fn on_k(&mut self, now: Instant) {
+        match self.view {
+            View::Discover => self.nav_discover(0, -1),
+            View::Browse if self.pane == Pane::List => self.on_browse_nav(-1, now),
+            View::Browse | View::History if self.pane == Pane::Detail => self.detail.scroll_by(-1),
+            View::Detail => self.detail.scroll_by(-1),
+            _ => {}
+        }
+    }
+
+    /// g / G jump (DESIGN 6.1); list surfaces only.
+    fn on_jump(&mut self, top: bool, now: Instant) {
+        if self.view == View::Browse && self.pane == Pane::List {
+            self.browse.jump(top, self.list_visible());
+            self.push_browse_selection(false, now);
+        }
+    }
+
+    /// Cursor motion is continuous scroll: the metadata updates instantly,
+    /// the cover trails by the settle window (DESIGN 6.4).
+    fn on_browse_nav(&mut self, dy: i64, now: Instant) {
+        self.browse.nav(dy, self.list_visible());
+        self.push_browse_selection(false, now);
+    }
+
+    /// List rows are 1 cell tall; the visible band is the content height.
+    fn list_visible(&self) -> usize {
+        self.term.1.saturating_sub(3) as usize
+    }
+
+    /// The list-to-detail push contract: the shared surface receives a
+    /// snapshot, never a reference into the list's own state.
+    fn push_browse_selection(&mut self, discrete: bool, now: Instant) {
+        if !self.two_pane() && self.view != View::Detail {
+            return;
+        }
+        match self.browse.selected() {
+            Some(entry) => {
+                let entry = entry.clone();
+                self.detail.set_target(&entry, discrete, now);
+            }
+            None => self.detail.clear_target(&mut self.pool),
         }
     }
 
@@ -304,14 +376,16 @@ impl App {
         }
     }
 
-    /// `P` "plan it" (DESIGN 6.1): Discover saves the selected card to the
-    /// watchlist; the show row's default list status is planning. Browse's
-    /// variant joins in chunk 3, History's transition in chunk 5.
+    /// `P` "plan it" (DESIGN 6.1): saves the highlighted Discover card or
+    /// Browse result as planning (the show row's default list status);
+    /// History's fifth transition joins in chunk 5.
     fn on_plan(&mut self, now: Instant) {
-        if self.view != View::Discover {
-            return;
-        }
-        let Some(entry) = self.discover.selected_entry() else {
+        let entry = match self.view {
+            View::Discover => self.discover.selected_entry(),
+            View::Browse if self.pane == Pane::List => self.browse.selected(),
+            _ => None,
+        };
+        let Some(entry) = entry else {
             return;
         };
         match self.store.add_to_library(entry, unix_now()) {
@@ -347,12 +421,12 @@ impl App {
         self.term.0 >= layout::PANE_SPLIT_MIN
     }
 
-    fn on_search_key(&mut self, key: KeyEvent) {
+    fn on_search_key(&mut self, key: KeyEvent, now: Instant) {
         match key.code {
             KeyCode::Esc => self.close_search(),
             KeyCode::Enter => self.lock_search(),
-            KeyCode::Backspace => self.on_search_backspace(),
-            KeyCode::Char(c) => self.on_search_char(c),
+            KeyCode::Backspace => self.on_search_backspace(now),
+            KeyCode::Char(c) => self.on_search_char(c, now),
             _ => {}
         }
     }
@@ -370,12 +444,22 @@ impl App {
         self.pane = Pane::List;
     }
 
-    fn on_search_char(&mut self, c: char) {
+    fn on_search_char(&mut self, c: char, now: Instant) {
         self.search_buffer().push(c);
+        self.arm_search(now);
     }
 
-    fn on_search_backspace(&mut self) {
+    fn on_search_backspace(&mut self, now: Instant) {
         self.search_buffer().pop();
+        self.arm_search(now);
+    }
+
+    /// Browse's catalogue search debounces the network fetch (04 §8);
+    /// History's filter is local and needs none (chunk 5).
+    fn arm_search(&mut self, now: Instant) {
+        if self.view == View::Browse {
+            self.browse.on_query_edited(now);
+        }
     }
 
     /// Browse owns the catalogue query, History its local filter (DESIGN 8.4).
@@ -435,17 +519,38 @@ impl App {
         self.dirty = true;
     }
 
-    /// ~100ms cadence (04 §8): toast TTL, the command flash, and the Discover
-    /// feed + cover pump ride it.
+    /// ~100ms cadence (04 §8): toast TTL, the command flash, the search
+    /// debounce, the detail cover reconcile, and the Discover pump ride it.
     fn on_tick(&mut self, now: Instant, tx: &EventTx) {
         self.toasts.tick(now);
         if self.command_flash.is_some_and(|until| now >= until) {
             self.command_flash = None;
         }
+        self.browse.maybe_fire(now, tx, &self.catalog);
+        if self.detail_surface_visible() {
+            self.detail.maybe_sync(
+                now,
+                self.config.cover_art,
+                tx,
+                &self.caches,
+                &self.covers_dir,
+                &mut self.pool,
+            );
+        }
         if self.view == View::Discover {
             self.tick_discover(now, tx);
         }
         self.dirty = true;
+    }
+
+    /// Where the shared detail surface is actually on screen: the zoom, or a
+    /// two-pane view's right column.
+    fn detail_surface_visible(&self) -> bool {
+        match self.view {
+            View::Detail => true,
+            View::Browse | View::History => self.two_pane(),
+            _ => false,
+        }
     }
 
     /// Feed decision + cover pump for the active axis. The cap is a live
@@ -501,6 +606,34 @@ impl App {
         self.dirty = true;
     }
 
+    fn on_cover_done(&mut self, for_id: i64, img: image::DynamicImage) {
+        self.detail.on_cover_done(for_id, img, &mut self.pool);
+        self.dirty = true;
+    }
+
+    fn on_cover_error(&mut self, for_id: i64, now: Instant) {
+        self.detail.on_cover_error(for_id, now);
+        self.dirty = true;
+    }
+
+    /// Applied results are the AniList recovery signal: the persistent
+    /// unreachable toast clears on the first success (DESIGN 8.5).
+    fn on_search_done(&mut self, query: &str, results: Vec<domain::Enrichment>, now: Instant) {
+        if self.browse.on_done(query, results, &self.store, unix_now()) {
+            self.toasts.clear_topic(ANILIST_TOPIC);
+            self.push_browse_selection(true, now);
+        }
+        self.dirty = true;
+    }
+
+    fn on_search_failed(&mut self, query: &str, now: Instant) {
+        if self.browse.on_failed(query) {
+            self.toasts
+                .push_persistent(Kind::Error, "can't reach AniList", ANILIST_TOPIC, now);
+        }
+        self.dirty = true;
+    }
+
     /// Encode worker wake: apply routed responses on the UI thread.
     fn on_encode_ready(&mut self) {
         if self.pool.apply_responses() {
@@ -529,9 +662,9 @@ impl App {
         let rows = layout::frame_rows(area);
         chrome::draw_top_bar(frame, rows.top, self.palette, &self.top_bar());
         match self.view {
-            View::Browse => browse::draw(frame, rows.content, self.palette, &self.browse),
+            View::Browse => self.draw_browse(frame, rows.content, now),
             View::History => history::draw(frame, rows.content, self.palette, &self.history),
-            View::Detail => detail::draw(frame, rows.content, self.palette, &self.detail),
+            View::Detail => self.draw_zoom(frame, rows.content, now),
             View::Discover => self.draw_discover(frame, rows.content, now),
             View::Settings => settings::draw(frame, rows.content, self.palette, &self.settings),
         }
@@ -539,12 +672,77 @@ impl App {
         self.toasts.draw(frame, area, self.palette);
     }
 
-    fn draw_discover(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
-        let env = ViewEnv {
+    fn view_env(&self, now: Instant) -> ViewEnv {
+        ViewEnv {
             pref: TitleLanguage::parse(&self.config.title_language),
+            kanji: self.config.kanji_chips,
             cour: domain::current_cour(unix_now()),
+            unix_now: unix_now(),
             now,
-        };
+        }
+    }
+
+    /// Browse composition (DESIGN 3.2): list column + shared detail pane at
+    /// two-pane widths, list only below.
+    fn draw_browse(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
+        let env = self.view_env(now);
+        if self.two_pane() {
+            let split = layout::pane_split(area.width);
+            let list = ratatui::layout::Rect::new(
+                area.x + 2,
+                area.y,
+                split.list_w.min(area.width.saturating_sub(2)),
+                area.height,
+            );
+            browse::draw_list(
+                frame,
+                list,
+                self.palette,
+                &self.browse,
+                &env,
+                self.pane == Pane::List,
+            );
+            let pane = ratatui::layout::Rect::new(
+                area.x + split.detail_x,
+                area.y,
+                split
+                    .detail_w
+                    .min(area.width.saturating_sub(split.detail_x)),
+                area.height,
+            );
+            detail::draw_pane(
+                frame,
+                pane,
+                self.palette,
+                &self.detail,
+                &env,
+                &mut self.pool,
+            );
+        } else {
+            let list = ratatui::layout::Rect::new(
+                area.x + 2,
+                area.y,
+                area.width.saturating_sub(3),
+                area.height,
+            );
+            browse::draw_list(frame, list, self.palette, &self.browse, &env, true);
+        }
+    }
+
+    fn draw_zoom(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
+        let env = self.view_env(now);
+        detail::draw_zoom(
+            frame,
+            area,
+            self.palette,
+            &self.detail,
+            &env,
+            &mut self.pool,
+        );
+    }
+
+    fn draw_discover(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
+        let env = self.view_env(now);
         discover::draw(
             frame,
             area,
@@ -570,8 +768,8 @@ impl App {
             },
         };
         // Browse/History fall back to the current cour; Discover tracks the
-        // selected card with no fallback; Detail tracks its show (chunk 3);
-        // Settings shows no chip (DESIGN 3.4, 7.3).
+        // selected card and the zoom its committed show, both with no
+        // fallback; Settings shows no chip (DESIGN 3.4, 7.3).
         let season_chip = match self.view {
             View::Browse | View::History => {
                 Some(render::cour_chip(domain::current_cour(unix_now())))
@@ -580,7 +778,11 @@ impl App {
                 .discover
                 .selected_entry()
                 .and_then(|e| render::season_chip(e.season, e.year)),
-            _ => None,
+            View::Detail => self
+                .detail
+                .shown()
+                .and_then(|e| render::season_chip(e.season, e.year)),
+            View::Settings => None,
         };
         let dot_lit = match self.view {
             View::Browse | View::History => self.pane == Pane::Detail,
@@ -607,7 +809,7 @@ impl App {
                 _ => BottomBar::Search {
                     query: &self.browse.query,
                     scope: "catalogue",
-                    count: self.browse.result_count,
+                    count: self.browse.count(),
                 },
             },
             InputMode::Command => BottomBar::Command {
@@ -674,11 +876,27 @@ mod tests {
 
     /// Scripted catalog: each `discover` call pops the next page; an empty
     /// script answers Network so nothing ever leaves the process.
-    struct StubCatalog(Mutex<VecDeque<Result<CatalogPage, CatalogError>>>);
+    #[derive(Default)]
+    struct StubCatalog {
+        discover: Mutex<VecDeque<Result<CatalogPage, CatalogError>>>,
+        search: Mutex<VecDeque<Result<CatalogPage, CatalogError>>>,
+    }
 
     impl StubCatalog {
         fn scripted(pages: Vec<Result<CatalogPage, CatalogError>>) -> Arc<dyn CatalogProvider> {
-            Arc::new(StubCatalog(Mutex::new(pages.into())))
+            Arc::new(StubCatalog {
+                discover: Mutex::new(pages.into()),
+                ..Default::default()
+            })
+        }
+
+        fn search_scripted(
+            pages: Vec<Result<CatalogPage, CatalogError>>,
+        ) -> Arc<dyn CatalogProvider> {
+            Arc::new(StubCatalog {
+                search: Mutex::new(pages.into()),
+                ..Default::default()
+            })
         }
 
         fn inert() -> Arc<dyn CatalogProvider> {
@@ -688,10 +906,14 @@ mod tests {
 
     impl CatalogProvider for StubCatalog {
         fn search(&self, _q: &str, _p: u32) -> Result<CatalogPage, CatalogError> {
-            Err(CatalogError::Network)
+            self.search
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(CatalogError::Network))
         }
         fn discover(&self, _a: DiscoverAxis, _p: u32) -> Result<CatalogPage, CatalogError> {
-            self.0
+            self.discover
                 .lock()
                 .unwrap()
                 .pop_front()
@@ -745,9 +967,11 @@ mod tests {
         (app, tx, now)
     }
 
-    /// Settle the feed worker, then apply everything it posted.
+    /// Settle every worker family, then apply everything they posted.
     fn settle_feed(app: &mut App, tx: &EventTx, rx: &super::super::event::EventRx, now: Instant) {
         assert!(app.discover.drain(Duration::from_secs(5)));
+        assert!(app.browse.drain(Duration::from_secs(5)));
+        assert!(app.detail.drain(Duration::from_secs(5)));
         while let Ok(ev) = rx.try_recv() {
             app.tick(ev, now, tx);
         }
@@ -1104,6 +1328,166 @@ mod tests {
         app.tick(ch('l'), now, &tx);
         let text = rendered(&mut app, 100, 30);
         assert!(!text.contains("2024"));
+    }
+
+    #[test]
+    fn typed_search_debounces_fetches_and_renders() {
+        let (mut app, tx, rx, now) = harness_with(
+            "search-e2e",
+            StubCatalog::search_scripted(vec![one_page(3)]),
+        );
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('/'), ch('f'), ch('r')]);
+        app.tick(Event::Tick, now, &tx);
+        assert_eq!(app.browse.count(), 0, "inside the debounce window");
+        let later = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, later, &tx);
+        settle_feed(&mut app, &tx, &rx, later);
+        assert_eq!(app.browse.count(), 3);
+        assert!(
+            app.store.get_catalog(1).unwrap().is_some(),
+            "results cached"
+        );
+        assert_eq!(
+            app.detail.shown().map(|e| e.anilist_id),
+            Some(1),
+            "applied results push the selection into the shared detail"
+        );
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("Show 1"));
+        assert!(text.contains("[catalogue · 3]"));
+    }
+
+    #[test]
+    fn search_outage_toasts_persistently_and_recovers() {
+        let (mut app, tx, rx, now) = harness_with(
+            "search-outage",
+            StubCatalog::search_scripted(vec![Err(CatalogError::Network), one_page(1)]),
+        );
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('/'), ch('a')]);
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        assert_eq!(app.toasts.iter().count(), 1, "persistent unreachable toast");
+        // Toast outlives the transient TTL while the outage holds.
+        app.tick(Event::Tick, t1 + Duration::from_secs(10), &tx);
+        assert_eq!(app.toasts.iter().count(), 1);
+        // Next keystroke retries; success clears the toast (DESIGN 8.5).
+        app.tick(ch('b'), t1, &tx);
+        let t2 = t1 + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t2, &tx);
+        settle_feed(&mut app, &tx, &rx, t2);
+        assert!(app.toasts.is_empty(), "first success clears the topic");
+        assert_eq!(app.browse.count(), 1);
+    }
+
+    #[test]
+    fn browse_nav_pushes_the_shared_detail() {
+        let (mut app, tx, rx, now) = harness_with(
+            "browse-push",
+            StubCatalog::search_scripted(vec![one_page(4)]),
+        );
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('/'), ch('x')]);
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        press(&mut app, &tx, t1, &[ch('j'), ch('j')]);
+        assert_eq!(app.detail.shown().map(|e| e.anilist_id), Some(3));
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("Show 3"), "detail pane renders the selection");
+    }
+
+    #[test]
+    fn discover_enter_pushes_the_card_into_the_zoom() {
+        let (mut app, tx, rx, now) =
+            harness_with("zoom-push", StubCatalog::scripted(vec![one_page(2)]));
+        app.tick(Event::Resize(100, 30), now, &tx);
+        app.tick(ch('D'), now, &tx);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        press(&mut app, &tx, now, &[ch('l'), key(KeyCode::Enter)]);
+        assert_eq!(app.view, View::Detail);
+        assert_eq!(app.detail.shown().map(|e| e.anilist_id), Some(2));
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("Show 2"));
+    }
+
+    #[test]
+    fn empty_results_clear_the_detail_pane() {
+        let empty = Ok(CatalogPage {
+            entries: Vec::new(),
+            has_next: false,
+        });
+        let (mut app, tx, rx, now) = harness_with(
+            "empty-clears",
+            StubCatalog::search_scripted(vec![one_page(1), empty]),
+        );
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('/'), ch('a')]);
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        assert!(app.detail.shown().is_some());
+        app.tick(ch('b'), t1, &tx);
+        let t2 = t1 + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t2, &tx);
+        settle_feed(&mut app, &tx, &rx, t2);
+        assert!(app.detail.shown().is_none(), "no stale detail (DESIGN 8.4)");
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("no results for \"ab\""));
+        assert!(text.contains("try a different spelling"));
+    }
+
+    #[test]
+    fn browse_p_saves_the_highlighted_result() {
+        let (mut app, tx, rx, now) =
+            harness_with("browse-p", StubCatalog::search_scripted(vec![one_page(2)]));
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('/'), ch('a')]);
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        app.tick(ch('P'), t1, &tx);
+        let show = app.store.get_show(1).unwrap().expect("saved to library");
+        assert_eq!(show.list_status, crate::domain::ListStatus::Planning);
+    }
+
+    #[test]
+    fn view_switch_repushes_browse_selection_over_a_stale_card() {
+        let discover_page = Ok(CatalogPage {
+            entries: (100..=101).map(feed_entry).collect(),
+            has_next: false,
+        });
+        let (mut app, tx, rx, now) = harness_with(
+            "repush",
+            Arc::new(StubCatalog {
+                discover: Mutex::new(vec![discover_page].into()),
+                search: Mutex::new(vec![one_page(2)].into()),
+            }),
+        );
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('/'), ch('a')]);
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        app.tick(key(KeyCode::Esc), t1, &tx);
+        // Visit Discover, open a card in the zoom, come back to Browse.
+        app.tick(ch('D'), t1, &tx);
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        assert_eq!(app.detail.shown().map(|e| e.anilist_id), Some(100));
+        app.tick(key(KeyCode::Esc), t1, &tx);
+        app.tick(ch('B'), t1, &tx);
+        assert_eq!(
+            app.detail.shown().map(|e| e.anilist_id),
+            Some(1),
+            "the shared surface shows Browse's own selection again"
+        );
     }
 
     #[test]

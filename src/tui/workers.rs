@@ -114,6 +114,32 @@ pub fn spawn_discover_feed(
     })
 }
 
+/// One Browse catalogue-search page (04 §4.2): stale results are dropped in
+/// tick by comparing `query` against the live buffer, never by generation.
+#[must_use]
+pub fn spawn_search(
+    drain: &Drain,
+    tx: EventTx,
+    catalog: Arc<dyn CatalogProvider>,
+    query: String,
+    page: u32,
+) -> bool {
+    drain.spawn("search", move || {
+        let event = match catalog.search(&query, page) {
+            Ok(result) => Event::SearchDone {
+                query,
+                page,
+                results: result.entries,
+            },
+            Err(cause) => Event::SearchFailed {
+                query,
+                cause: cause.to_string(),
+            },
+        };
+        tx.post(event);
+    })
+}
+
 /// Inflight accounting for one worker family (04 §5.1).
 #[derive(Debug, Clone, Default)]
 pub struct Drain {

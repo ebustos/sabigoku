@@ -54,11 +54,14 @@ pub enum InputMode {
 }
 
 /// Ambient render inputs every view draw shares: the resolved title
-/// preference (DESIGN 8.2), the current cour (badges, chips), and the frame
+/// preference (DESIGN 8.2), the kanji-chips toggle, the current cour
+/// (badges, chips), wall-clock seconds (airing countdown), and the frame
 /// instant (spinner phase, slow escalation).
 #[derive(Debug, Clone, Copy)]
 pub struct ViewEnv {
     pub pref: crate::domain::TitleLanguage,
+    pub kanji: bool,
     pub cour: crate::domain::Cour,
+    pub unix_now: i64,
     pub now: std::time::Instant,
 }

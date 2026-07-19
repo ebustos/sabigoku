@@ -41,6 +41,46 @@ pub fn season_chip(season: Option<Season>, year: Option<u32>) -> Option<String> 
     Some(format!("{} {}", season_kanji(season?), year?))
 }
 
+/// Greedy word wrap to `width` display columns. A single word wider than the
+/// line hard-breaks on grapheme boundaries so CJK prose still wraps.
+pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0usize;
+    for word in s.split_whitespace() {
+        let w = display_width(word);
+        if used > 0 && used + 1 + w > width {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        if w > width {
+            for g in word.graphemes(true) {
+                let gw = UnicodeWidthStr::width(g);
+                if used + gw > width {
+                    lines.push(std::mem::take(&mut line));
+                    used = 0;
+                }
+                line.push_str(g);
+                used += gw;
+            }
+            continue;
+        }
+        if used > 0 {
+            line.push(' ');
+            used += 1;
+        }
+        line.push_str(word);
+        used += w;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 /// Compact list/card score badge (DESIGN 2.2): `[97]` / `[--]`.
 pub fn score_badge(score: Option<u32>) -> String {
     match score {
@@ -134,6 +174,29 @@ pub fn draw_absent_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_breaks_on_words_and_respects_width() {
+        let lines = wrap_text("the quick brown fox jumps over the lazy dog", 10);
+        assert!(lines.iter().all(|l| display_width(l) <= 10));
+        assert_eq!(
+            lines.join(" "),
+            "the quick brown fox jumps over the lazy dog"
+        );
+    }
+
+    #[test]
+    fn wrap_hard_breaks_oversized_words() {
+        let lines = wrap_text(&"葬".repeat(12), 10);
+        assert!(lines.iter().all(|l| display_width(l) <= 10));
+        assert_eq!(lines.len(), 3, "24 columns of kanji over width 10");
+    }
+
+    #[test]
+    fn wrap_zero_width_is_empty() {
+        assert!(wrap_text("anything", 0).is_empty());
+        assert!(wrap_text("", 10).is_empty());
+    }
 
     #[test]
     fn truncate_passes_short_strings_through() {

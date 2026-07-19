@@ -112,7 +112,8 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
 
     shutdown.cancel();
     input_drain.drain(Duration::from_millis(500));
-    app.cover_drain.drain(Duration::from_secs(1));
+    app.browse.drain(Duration::from_secs(1));
+    app.detail.drain(Duration::from_secs(1));
     app.discover.drain(Duration::from_secs(1));
     // The encode worker exits when the pool (inside App) drops its queue.
     let encode_drain = app.encode_drain.clone();
