@@ -29,7 +29,7 @@ fn main() {
         return;
     }
 
-    if let Err(e) = sabigoku::tui::run() {
+    if let Err(e) = sabigoku::tui::run(&paths, &config) {
         eprintln!("sabigoku: {e}");
         std::process::exit(1);
     }
