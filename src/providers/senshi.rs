@@ -416,12 +416,18 @@ impl Senshi {
                 break;
             }
         }
-        let src = pick_sub_track(&tracks?)?;
-        // The picked src goes to mpv --sub-file, bypassing the proxy that guards
-        // the stream: SSRF-guard it, argv-vet alone is host-blind. Follow-up fix
-        // to merged ROD-441, ratified ROD-445 (backport owed, both providers).
-        (is_absolute_url(&src) && clean_arg(&src) && guard_fetch_url(&src).is_ok()).then_some(src)
+        guarded_sub_track(&tracks?)
     }
+}
+
+/// Pick the sub src and accept it only if absolute, argv-clean, AND past the
+/// SSRF guard: it goes to mpv --sub-file, bypassing the proxy that guards the
+/// stream, so argv-vet alone (host-blind) is not enough. Pure, so the guard is
+/// unit-testable. Follow-up fix to merged ROD-441, ratified ROD-445 (backport
+/// owed, both providers).
+fn guarded_sub_track(tracks: &[SubTrack]) -> Option<String> {
+    let src = pick_sub_track(tracks)?;
+    (is_absolute_url(&src) && clean_arg(&src) && guard_fetch_url(&src).is_ok()).then_some(src)
 }
 
 impl StreamProvider for Senshi {
@@ -776,6 +782,42 @@ mod tests {
         }];
         assert_eq!(pick_sub_track(&no_english).as_deref(), Some("jp"));
         assert_eq!(pick_sub_track(&[]), None);
+    }
+
+    #[test]
+    fn guarded_sub_track_drops_a_private_or_unsafe_src() {
+        // A public track survives the guard.
+        let ok = [SubTrack {
+            src: Some("https://cdn.example/eng.vtt".into()),
+            label: Some("English".into()),
+            default: true,
+        }];
+        assert_eq!(
+            guarded_sub_track(&ok).as_deref(),
+            Some("https://cdn.example/eng.vtt")
+        );
+        // The picked src reaches mpv --sub-file, bypassing the stream proxy: a
+        // host `default` track aimed at loopback / cloud metadata must be dropped,
+        // not handed to the player.
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:9/pwn.vtt",
+        ] {
+            let t = [SubTrack {
+                src: Some(bad.into()),
+                label: Some("English".into()),
+                default: true,
+            }];
+            assert_eq!(guarded_sub_track(&t), None, "{bad} must be guarded out");
+        }
+        // Scheme-less src still rejected (argv-vet), so the guard is not the only
+        // gate a fetch relies on.
+        let rel = [SubTrack {
+            src: Some("//cdn.example/x.vtt".into()),
+            label: None,
+            default: true,
+        }];
+        assert_eq!(guarded_sub_track(&rel), None);
     }
 
     #[test]

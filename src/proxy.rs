@@ -907,15 +907,17 @@ mod tests {
     }
 
     #[test]
-    fn read_request_target_bounds_an_oversized_head() {
-        // An unterminated header far past MAX_HEAD_BYTES must not grow memory or
-        // hang: the head is capped and the call returns the parsed request line.
-        let mut raw = Vec::from(*b"GET /r.ts?u=x HTTP/1.1\r\n");
-        raw.extend(std::iter::repeat_n(b'a', MAX_HEAD_BYTES as usize * 2));
-        let mut reader = BufReader::new(raw.as_slice());
+    fn read_request_target_cap_terminates_on_an_infinite_stream() {
+        // io::repeat never EOFs and sends no newline, so without the
+        // MAX_HEAD_BYTES Take cap read_line would grow its buffer without bound.
+        // The cap makes the read terminate. Remove the cap and this test hangs
+        // instead of passing: that hang IS the proof the bound does work (a
+        // finite in-memory reader can't demonstrate unboundedness).
+        let mut reader = BufReader::new(std::io::repeat(b'a'));
+        // Terminates and yields a (bounded, spaceless -> empty) target.
         assert_eq!(
             read_request_target(&mut reader).unwrap().as_deref(),
-            Some("/r.ts?u=x")
+            Some("")
         );
     }
 }
