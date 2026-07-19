@@ -7,6 +7,43 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::domain::Translation;
+use crate::error::Error;
+use crate::player::Position;
+use crate::store::Store;
+
+/// The 02 §4b post-play gate, the one owner of the finish writes (01 §3 glue).
+/// No meaningful position, no writes of any kind; the player already collapsed
+/// that judgment into `PlayOutcome::position`. The resume row and the
+/// engagement/ratchet land atomically inside `record_finish`. Returns whether
+/// the play was recorded.
+#[allow(clippy::too_many_arguments)]
+pub fn finish_playback(
+    store: &Store,
+    anilist_id: i64,
+    translation: Translation,
+    episode_label: &str,
+    episode_index: u32,
+    position: Option<Position>,
+    provider: Option<&str>,
+    now: i64,
+) -> Result<bool, Error> {
+    let Some(position) = position else {
+        return Ok(false);
+    };
+    store.record_finish(
+        anilist_id,
+        translation,
+        episode_label,
+        episode_index,
+        position.secs,
+        position.duration.unwrap_or(0.0),
+        provider,
+        now,
+    )?;
+    Ok(true)
+}
+
 /// Inflight accounting for one worker family (04 §5.1).
 #[derive(Debug, Clone, Default)]
 pub struct Drain {
@@ -138,8 +175,138 @@ impl CancelFlag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Enrichment;
     use crate::tui::event::{self, Event};
     use std::sync::mpsc;
+
+    /// Identity row via the binding mint (02 §3.7): present, bindable, and
+    /// carrying NO membership, so History appearance below is record_play's
+    /// own set-once stamp.
+    fn seed_bound_show(store: &Store, id: i64) {
+        let e = Enrichment {
+            anilist_id: id,
+            title_romaji: format!("Show {id}"),
+            ..Default::default()
+        };
+        store.bind_provider(&e, "senshi", "prov-1", 100).unwrap();
+        assert!(store.list_history().unwrap().is_empty());
+    }
+
+    fn pos(secs: f64, duration: Option<f64>) -> Option<Position> {
+        Some(Position { secs, duration })
+    }
+
+    #[test]
+    fn finish_without_position_writes_nothing() {
+        let store = Store::open_memory().unwrap();
+        seed_bound_show(&store, 7);
+        let recorded = finish_playback(
+            &store,
+            7,
+            Translation::Sub,
+            "1",
+            1,
+            None,
+            Some("senshi"),
+            200,
+        )
+        .unwrap();
+        assert!(!recorded);
+        assert!(store.list_history().unwrap().is_empty());
+        assert_eq!(store.get_resume(7, Translation::Sub, "1").unwrap(), None);
+    }
+
+    #[test]
+    fn partial_watch_lands_in_history_without_ratchet() {
+        let store = Store::open_memory().unwrap();
+        seed_bound_show(&store, 7);
+        let recorded = finish_playback(
+            &store,
+            7,
+            Translation::Sub,
+            "3",
+            3,
+            pos(300.0, Some(1420.0)),
+            Some("senshi"),
+            200,
+        )
+        .unwrap();
+        assert!(recorded);
+        let history = store.list_history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].play_count, 1);
+        assert_eq!(history[0].progress, 0, "0.21 ratio must not ratchet");
+        assert_eq!(history[0].last_watched_at, Some(200));
+        let resume = store.get_resume(7, Translation::Sub, "3").unwrap().unwrap();
+        assert_eq!(resume.position_secs, 300.0);
+        assert!(!resume.fully_watched);
+    }
+
+    #[test]
+    fn natural_end_ratchets_but_does_not_mark_watched() {
+        let store = Store::open_memory().unwrap();
+        seed_bound_show(&store, 7);
+        finish_playback(
+            &store,
+            7,
+            Translation::Sub,
+            "5",
+            5,
+            pos(1200.0, Some(1420.0)),
+            Some("senshi"),
+            200,
+        )
+        .unwrap();
+        let history = store.list_history().unwrap();
+        assert_eq!(history[0].progress, 5, "0.845 ratio ratchets");
+        let resume = store.get_resume(7, Translation::Sub, "5").unwrap().unwrap();
+        assert!(!resume.fully_watched, "0.845 is under WATCHED_RATIO");
+    }
+
+    #[test]
+    fn watched_tier_marks_fully_watched() {
+        let store = Store::open_memory().unwrap();
+        seed_bound_show(&store, 7);
+        finish_playback(
+            &store,
+            7,
+            Translation::Sub,
+            "5",
+            5,
+            pos(1400.0, Some(1420.0)),
+            Some("senshi"),
+            200,
+        )
+        .unwrap();
+        assert_eq!(store.list_history().unwrap()[0].progress, 5);
+        assert!(
+            store
+                .get_resume(7, Translation::Sub, "5")
+                .unwrap()
+                .unwrap()
+                .fully_watched
+        );
+    }
+
+    #[test]
+    fn unknown_duration_records_engagement_only() {
+        let store = Store::open_memory().unwrap();
+        seed_bound_show(&store, 7);
+        finish_playback(
+            &store,
+            7,
+            Translation::Sub,
+            "5",
+            5,
+            pos(900.0, None),
+            None,
+            200,
+        )
+        .unwrap();
+        let history = store.list_history().unwrap();
+        assert_eq!(history[0].play_count, 1);
+        assert_eq!(history[0].progress, 0, "no duration, no ratchet");
+    }
 
     #[test]
     fn begin_before_spawn_counts_immediately() {

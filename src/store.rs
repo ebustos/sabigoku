@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, named_
 
 use crate::domain::{
     Date, Enrichment, ListStatus, Season, Show, Translation, WATCHED_RATIO, episode_label_cmp,
-    is_still_airing,
+    is_still_airing, natural_end,
 };
 use crate::error::Error;
 
@@ -413,6 +413,88 @@ impl Store {
         Ok(())
     }
 
+    /// Atomic play-completion writer (02 §4b): the resume row and the
+    /// engagement/ratchet land under ONE BEGIN IMMEDIATE, so a mid-write
+    /// failure never leaves a saved resume point with the play uncounted.
+    /// This is what a finished play calls; the two primitives above stay for
+    /// standalone use (a 30s checkpoint is `save_progress` alone, no play bump).
+    /// Callers still gate on a meaningful position (finite > 0); the 0.80/0.95
+    /// thresholds are derived here from position/duration, the single authority.
+    /// Non-finite floats are rejected loud (SQLite turns NaN into NULL, +Inf
+    /// sails past the ratio). Unknown show or a zero index: no-op.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_finish(
+        &self,
+        anilist_id: i64,
+        translation: Translation,
+        episode: &str,
+        episode_index: u32,
+        position_secs: f64,
+        duration_secs: f64,
+        last_provider: Option<&str>,
+        now: i64,
+    ) -> Result<(), Error> {
+        if !position_secs.is_finite() || !duration_secs.is_finite() {
+            return Err(Error::NonFinitePosition {
+                position: position_secs,
+                duration: duration_secs,
+            });
+        }
+        if episode_index == 0 {
+            return Ok(());
+        }
+        let tx = immediate_tx(&self.conn)?;
+        let Some(cur) = status_row(&tx, anilist_id)? else {
+            return Ok(());
+        };
+        let watched = duration_secs > 0.0 && position_secs / duration_secs >= WATCHED_RATIO;
+        tx.execute(
+            "INSERT INTO episode_progress
+                (anilist_id, translation, episode, position_secs, duration_secs,
+                 fully_watched, updated_at, last_provider)
+             VALUES (:id, :tt, :episode, :pos, :dur, :watched, :now, :last_provider)
+             ON CONFLICT(anilist_id, translation, episode) DO UPDATE SET
+                position_secs = excluded.position_secs,
+                duration_secs = excluded.duration_secs,
+                fully_watched = excluded.fully_watched,
+                updated_at    = excluded.updated_at,
+                last_provider = excluded.last_provider",
+            named_params! {
+                ":id": anilist_id,
+                ":tt": translation.as_str(),
+                ":episode": episode,
+                ":pos": position_secs,
+                ":dur": duration_secs,
+                ":watched": watched,
+                ":now": now,
+                ":last_provider": last_provider,
+            },
+        )?;
+        let new_progress = if natural_end(position_secs, duration_secs) {
+            cur.progress.max(episode_index)
+        } else {
+            cur.progress
+        };
+        let new_status = cur.status.after_play(new_progress, cur.total, cur.airing);
+        tx.execute(
+            "UPDATE show SET
+                play_count = play_count + 1,
+                last_watched_at = :now,
+                progress = :progress,
+                list_status = :status,
+                library_added_at = COALESCE(library_added_at, :now)
+             WHERE anilist_id = :id",
+            named_params! {
+                ":now": now,
+                ":progress": new_progress,
+                ":status": new_status.as_str(),
+                ":id": anilist_id,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Manual status write (ROD-139): no play_count / last_watched_at.
     /// completed snaps progress to total only when total > 0 (total 0 must
     /// not zero progress). Stamps membership set-once. Unknown show: no-op.
@@ -757,6 +839,23 @@ pub struct Resume {
     pub position_secs: f64,
     pub duration_secs: f64,
     pub fully_watched: bool,
+}
+
+impl Resume {
+    /// The 03 §6.3.1 resume start rule: restart at 0 when fully watched, past
+    /// natural end, or the saved position is unusable; else back up by
+    /// `resume_offset_sec`, saturating at 0. zigoku parity: an unknown (0)
+    /// duration resumes, only a real ratio restarts.
+    pub fn start_secs(&self, resume_offset_sec: u32) -> f64 {
+        if self.fully_watched
+            || natural_end(self.position_secs, self.duration_secs)
+            || !self.position_secs.is_finite()
+            || self.position_secs <= 0.0
+        {
+            return 0.0;
+        }
+        (self.position_secs - f64::from(resume_offset_sec)).max(0.0)
+    }
 }
 
 /// One push-work row for AniList list sync (ROD-284 shape on the show PK).
@@ -1831,6 +1930,91 @@ mod tests {
     }
 
     #[test]
+    fn record_finish_writes_resume_and_engagement_atomically() {
+        let store = Store::open_memory().unwrap();
+        // Unknown show is a no-op on BOTH tables (no orphan progress row).
+        store
+            .record_finish(
+                9,
+                Translation::Sub,
+                "1",
+                1,
+                100.0,
+                1000.0,
+                Some("senshi"),
+                50,
+            )
+            .unwrap();
+        assert_eq!(store.get_show(9).unwrap(), None);
+        assert_eq!(store.get_resume(9, Translation::Sub, "1").unwrap(), None);
+
+        identity_row(&store, 9);
+        // Partial (0.10): engagement bumps, no ratchet, resume row present.
+        store
+            .record_finish(
+                9,
+                Translation::Sub,
+                "3",
+                3,
+                100.0,
+                1000.0,
+                Some("senshi"),
+                100,
+            )
+            .unwrap();
+        let show = store.get_show(9).unwrap().unwrap();
+        assert_eq!(show.play_count, 1);
+        assert_eq!(show.progress, 0);
+        assert_eq!(show.library_added_at, Some(100));
+        let resume = store.get_resume(9, Translation::Sub, "3").unwrap().unwrap();
+        assert_eq!(resume.position_secs, 100.0);
+        assert!(!resume.fully_watched);
+
+        // Natural end (0.85) ratchets progress; still not fully_watched.
+        store
+            .record_finish(9, Translation::Sub, "5", 5, 850.0, 1000.0, None, 200)
+            .unwrap();
+        assert_eq!(store.get_show(9).unwrap().unwrap().progress, 5);
+        assert!(
+            !store
+                .get_resume(9, Translation::Sub, "5")
+                .unwrap()
+                .unwrap()
+                .fully_watched
+        );
+
+        // Watched tier (0.96) marks fully_watched.
+        store
+            .record_finish(9, Translation::Sub, "6", 6, 960.0, 1000.0, None, 300)
+            .unwrap();
+        assert!(
+            store
+                .get_resume(9, Translation::Sub, "6")
+                .unwrap()
+                .unwrap()
+                .fully_watched
+        );
+
+        // A hostile +Inf position is rejected loud, and nothing is written.
+        let before = store.get_show(9).unwrap().unwrap().play_count;
+        let err = store
+            .record_finish(
+                9,
+                Translation::Sub,
+                "7",
+                7,
+                f64::INFINITY,
+                1000.0,
+                None,
+                400,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::NonFinitePosition { .. }));
+        assert_eq!(store.get_show(9).unwrap().unwrap().play_count, before);
+        assert_eq!(store.get_resume(9, Translation::Sub, "7").unwrap(), None);
+    }
+
+    #[test]
     fn record_play_status_transitions() {
         let store = Store::open_memory().unwrap();
         // Settled show at its finale: completes.
@@ -2190,6 +2374,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last.as_deref(), Some("senshi"));
+    }
+
+    #[test]
+    fn resume_start_rule() {
+        let resume = |position_secs, duration_secs, fully_watched| Resume {
+            position_secs,
+            duration_secs,
+            fully_watched,
+        };
+        assert_eq!(resume(100.0, 1000.0, true).start_secs(5), 0.0);
+        assert_eq!(resume(800.0, 1000.0, false).start_secs(5), 0.0);
+        assert_eq!(resume(-3.0, 1000.0, false).start_secs(5), 0.0);
+        assert_eq!(resume(0.0, 1000.0, false).start_secs(5), 0.0);
+        assert_eq!(resume(f64::NAN, 1000.0, false).start_secs(5), 0.0);
+        assert_eq!(resume(100.0, 1000.0, false).start_secs(5), 95.0);
+        assert_eq!(resume(3.0, 1000.0, false).start_secs(5), 0.0);
+        // Unknown duration resumes; only a real ratio restarts.
+        assert_eq!(resume(500.0, 0.0, false).start_secs(5), 495.0);
     }
 
     #[test]

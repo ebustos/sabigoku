@@ -70,6 +70,11 @@ impl Paths {
         for dir in [&self.config, &self.data, &self.cache, &self.runtime] {
             let _ = std::fs::create_dir_all(dir);
         }
+        // The mpv IPC socket lives under runtime; on the /tmp fallback (no
+        // XDG_RUNTIME_DIR) that dir is world-visible, so lock it to the owner
+        // rather than trust the ambient umask. Owner-created dirs only.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.runtime, std::fs::Permissions::from_mode(0o700));
     }
 }
 
