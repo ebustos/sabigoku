@@ -381,6 +381,7 @@ fn consider(url: &str, resolution: Option<u32>, referer: &str) -> Option<StreamL
         referer: Some(referer.to_string()),
         user_agent: None,
         cloaked_segments: false,
+        decloak_segments: false,
         sub_url: None,
     })
 }

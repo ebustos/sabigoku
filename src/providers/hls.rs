@@ -155,6 +155,7 @@ mod tests {
             referer: None,
             user_agent: None,
             cloaked_segments: false,
+            decloak_segments: false,
             sub_url: None,
         }
     }

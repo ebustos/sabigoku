@@ -386,6 +386,7 @@ impl Senshi {
                     referer: None,
                     user_agent: None,
                     cloaked_segments: false,
+                    decloak_segments: false,
                     sub_url: None,
                 });
             }
@@ -518,6 +519,7 @@ impl StreamProvider for Senshi {
             user_agent: Some(UA.to_string()),
             // ninstream serves .ts cloaked as .jpg; mpv must relax its demuxer.
             cloaked_segments: true,
+            decloak_segments: false,
             sub_url,
         })
     }
