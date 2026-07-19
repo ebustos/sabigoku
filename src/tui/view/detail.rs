@@ -1,13 +1,13 @@
 //! Detail: the shared show surface, in-pane and full-screen zoom (DESIGN 3.3,
-//! 4.4, 5.3). ROD-439 chunk 3 is the single-column form: header, chips,
-//! score, synopsis, cover. The episode grid, meta rail, and two-column split
-//! land in chunk 4.
+//! 4.4, 4.6, 5.3). The meta rail and two-column split land with ROD-439
+//! chunk 4b.
 //!
 //! Ownership contract: DetailState is the ONE owner of the shared detail
 //! surface. List views push a selection snapshot in; this module never reads
 //! Browse/History/Discover internals (the zigoku detail.zig coupling is the
 //! failure this rule exists to prevent). Cover transport (drain, settle
-//! debounce, single-flight) lives here, not on App.
+//! debounce, single-flight) lives here, and the episode session rides along
+//! as its own subsystem (`tui::episodes`); neither lives on App.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,11 +19,12 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::domain::{Enrichment, Season, preferred_title};
+use crate::domain::{self, Enrichment, Season, preferred_title};
 use crate::tui::clock::Debounce;
 use crate::tui::covers::detail::{Action, CoverState};
 use crate::tui::covers::render::ProtocolPool;
 use crate::tui::covers::{CoverCaches, DETAIL_KEY, sizing};
+use crate::tui::episodes::EpisodeSession;
 use crate::tui::event::EventTx;
 use crate::tui::render::{self, SPINNER};
 use crate::tui::theme::Palette;
@@ -68,6 +69,9 @@ fn cover_width(detail_w: u16) -> u16 {
     }
 }
 
+/// Episode grid cell width (DESIGN 4.6): `[NN] ` / `[NNN]`.
+const CELL_W: u16 = 5;
+
 #[derive(Default)]
 pub struct DetailState {
     shown: Option<Enrichment>,
@@ -77,6 +81,7 @@ pub struct DetailState {
     started: Option<crate::tui::clock::AsyncStart>,
     drain: Drain,
     settle: Debounce,
+    pub(crate) episodes: EpisodeSession,
 }
 
 impl DetailState {
@@ -90,6 +95,9 @@ impl DetailState {
     pub fn set_target(&mut self, entry: &Enrichment, discrete: bool, now: Instant) {
         if self.shown.as_ref().map(|e| e.anilist_id) != Some(entry.anilist_id) {
             self.scroll = 0;
+            // A new show voids the grid immediately (ROD-329: a stale grid
+            // must never let play launch the wrong show).
+            self.episodes.reset();
         }
         self.shown = Some(entry.clone());
         let window = if discrete {
@@ -105,11 +113,37 @@ impl DetailState {
         self.shown = None;
         self.scroll = 0;
         self.cover.clear();
+        self.episodes.reset();
         pool.remove(DETAIL_KEY);
     }
 
     pub fn scroll_by(&mut self, delta: i64) {
         self.scroll = (self.scroll as i64 + delta).max(0) as u16;
+    }
+
+    /// j/k on a detail surface: a landed grid owns the vertical axis (freeze
+    /// parity: the cursor steps episodes linearly), else the synopsis scrolls.
+    pub fn on_vertical(&mut self, delta: i64) {
+        if self.grid_active() {
+            self.episodes.cursor_by(delta);
+        } else {
+            self.scroll_by(delta);
+        }
+    }
+
+    /// g/G on a detail surface; true when the grid consumed the jump.
+    pub fn jump(&mut self, top: bool) -> bool {
+        if self.grid_active() {
+            self.episodes.cursor_end(top);
+            return true;
+        }
+        false
+    }
+
+    fn grid_active(&self) -> bool {
+        self.shown
+            .as_ref()
+            .is_some_and(|e| self.episodes.is_for(e.anilist_id) && self.episodes.has_grid())
     }
 
     /// Cover reconcile (05 §12), called each tick while a detail surface is
@@ -192,13 +226,17 @@ impl DetailState {
         self.cover.on_error(for_id, now);
     }
 
+    /// Drains both worker families; attempts the second even when the first
+    /// times out so teardown reclaims whatever it can.
     pub fn drain(&self, timeout: Duration) -> bool {
-        self.drain.drain(timeout)
+        let covers = self.drain.drain(timeout);
+        let episodes = self.episodes.drain(timeout);
+        covers && episodes
     }
 }
 
 /// The persistent right-hand pane: surface-tier background marks the pane
-/// boundary without a border (DESIGN 3.1).
+/// boundary without a border (DESIGN 3.1). `focused` lights the grid cursor.
 pub fn draw_pane(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -206,16 +244,17 @@ pub fn draw_pane(
     state: &DetailState,
     env: &ViewEnv,
     pool: &mut ProtocolPool,
+    focused: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     frame.render_widget(Block::new().style(Style::new().bg(palette.surface)), area);
-    draw_content(frame, area, palette, state, env, pool);
+    draw_content(frame, area, palette, state, env, pool, focused);
 }
 
 /// The full-screen zoom: same single-column content on the whole canvas
-/// (DESIGN 5.3; two-column split lands in chunk 4).
+/// (DESIGN 5.3; the two-column split lands in chunk 4b).
 pub fn draw_zoom(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -229,7 +268,7 @@ pub fn draw_zoom(
         width: area.width.saturating_sub(3),
         ..area
     };
-    draw_content(frame, body, palette, state, env, pool);
+    draw_content(frame, body, palette, state, env, pool, true);
 }
 
 fn draw_content(
@@ -239,6 +278,7 @@ fn draw_content(
     state: &DetailState,
     env: &ViewEnv,
     pool: &mut ProtocolPool,
+    focused: bool,
 ) {
     let Some(entry) = state.shown() else {
         return;
@@ -305,7 +345,192 @@ fn draw_content(
     }
     y += 1;
 
-    draw_synopsis(frame, area, palette, entry, state.scroll, y);
+    draw_body(frame, area, palette, state, entry, env, y, focused);
+}
+
+/// Split the rows under the header between synopsis and grid. With no session
+/// engaged the grid reserve still holds its ground so nothing reflows on
+/// landing (DESIGN 3.3). With one engaged: the synopsis keeps its natural
+/// height when everything fits, else it floors at 2 and yields; the grid
+/// scrolls past whatever it still cannot get.
+#[allow(clippy::too_many_arguments)]
+fn draw_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    palette: &Palette,
+    state: &DetailState,
+    entry: &Enrichment,
+    env: &ViewEnv,
+    y: u16,
+    focused: bool,
+) {
+    let remaining = area.height.saturating_sub(y);
+    let session = &state.episodes;
+    if !session.engaged_for(entry.anilist_id) {
+        let cap = synopsis_cap(remaining);
+        draw_synopsis(frame, area, palette, entry, state.scroll, y, cap);
+        return;
+    }
+    let indent_w = area.width.saturating_sub(2) as usize;
+    let syn_natural = entry
+        .description
+        .as_deref()
+        .map_or(1, |t| render::wrap_text(t, indent_w).len() as u16);
+    let cols = grid_cols(area.width);
+    let grid_need = (session.grid().len().div_ceil(cols).max(1)) as u16;
+    let budget = remaining.saturating_sub(1);
+    let syn_rows = syn_natural
+        .min(budget.saturating_sub(grid_need).max(2))
+        .min(budget.saturating_sub(2));
+    draw_synopsis(frame, area, palette, entry, state.scroll, y, syn_rows);
+    let grid_y = y + syn_rows + 1;
+    let grid_h = area.height.saturating_sub(grid_y);
+    if grid_h == 0 {
+        return;
+    }
+    let grid_area = Rect::new(area.x, area.y + grid_y, area.width, grid_h);
+    draw_grid(frame, grid_area, palette, session, entry, env, focused);
+}
+
+fn grid_cols(width: u16) -> usize {
+    (width / CELL_W).max(1) as usize
+}
+
+/// The episode grid region (DESIGN 4.6): spinner while fetching, `no source`
+/// when every road is exhausted, blank before any fetch, else the cell rows
+/// scrolled to keep the cursor visible.
+fn draw_grid(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    palette: &Palette,
+    session: &EpisodeSession,
+    entry: &Enrichment,
+    env: &ViewEnv,
+    focused: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if let Some(started) = session.loading() {
+        let spin = SPINNER[started.frame(env.now, SPINNER.len())];
+        let color = if started.is_slow(env.now) {
+            palette.hot
+        } else {
+            palette.focus
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("{spin} loading episodes…"),
+                Style::new().fg(color),
+            )),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        return;
+    }
+    let grid = session.grid();
+    if grid.is_empty() {
+        let label = if session.no_source() {
+            "no source"
+        } else {
+            // Engaged and genuinely answered zero; centered + dim like the
+            // other non-actionable absences (DESIGN 4.6).
+            "no episodes"
+        };
+        if session.no_source() || session.serving().is_some() {
+            render::draw_centered(
+                frame,
+                area,
+                area.height / 2,
+                Line::from(Span::styled(
+                    label,
+                    Style::new().fg(palette.fg3).add_modifier(Modifier::ITALIC),
+                )),
+            );
+        }
+        return;
+    }
+    let cols = grid_cols(area.width);
+    let total_rows = grid.len().div_ceil(cols);
+    let visible = area.height as usize;
+    let cursor_row = session.cursor() / cols;
+    let scroll = cursor_row.saturating_sub(visible.saturating_sub(1));
+    let aired = aired_count(entry);
+    for (r, row) in (scroll..total_rows).take(visible).enumerate() {
+        for c in 0..cols {
+            let ix = row * cols + c;
+            if ix >= grid.len() {
+                break;
+            }
+            let (text, style) = grid_cell(palette, &grid[ix], ix, session, aired, focused);
+            let x = area.x + c as u16 * CELL_W;
+            let w = (area.x + area.width).saturating_sub(x).min(CELL_W);
+            frame.render_widget(
+                Paragraph::new(Span::styled(text, style)),
+                Rect::new(x, area.y + r as u16, w, 1),
+            );
+        }
+    }
+}
+
+/// One cell's text + style, by the DESIGN 4.6 precedence: resume > cursor >
+/// watched > unaired > unwatched. The launching state joins with play
+/// (chunk 6).
+fn grid_cell(
+    palette: &Palette,
+    label: &str,
+    ix: usize,
+    session: &EpisodeSession,
+    aired: Option<u32>,
+    focused: bool,
+) -> (String, Style) {
+    let resume = session.resume_ix() == Some(ix);
+    let style = if resume {
+        Style::new()
+            .bg(palette.surface)
+            .fg(palette.hot)
+            .add_modifier(Modifier::BOLD)
+    } else if focused && session.cursor() == ix {
+        Style::new()
+            .bg(palette.surface)
+            .fg(palette.focus)
+            .add_modifier(Modifier::BOLD)
+    } else if (ix as u32) < session.watched() {
+        Style::new().fg(palette.fg3).add_modifier(Modifier::DIM)
+    } else if aired.is_some_and(|a| ix as u32 >= a) {
+        Style::new().fg(palette.fg3).add_modifier(Modifier::ITALIC)
+    } else {
+        Style::new().fg(palette.fg2)
+    };
+    (cell_text(label, resume), style)
+}
+
+/// `[NN]` in a 5-col slot; the resume arrow only fits labels up to 2 columns
+/// (DESIGN 5.3: on wider labels the colour carries resume alone). Labels are
+/// provider-controlled and this is the one edge where they meet the terminal:
+/// control bytes are stripped here so a hostile label cannot smuggle escape
+/// sequences into the buffer (ROD-441 review note).
+fn cell_text(label: &str, resume: bool) -> String {
+    let clean: String = label.chars().filter(|c| !c.is_control()).collect();
+    let width = render::display_width(&clean);
+    let core = if width > 3 {
+        render::truncate_to_width(&clean, 3)
+    } else {
+        std::borrow::Cow::Borrowed(clean.as_str())
+    };
+    if resume && width <= 2 {
+        format!("[▸{core}]")
+    } else {
+        format!("[{core}]")
+    }
+}
+
+/// Cells past the aired count render in the airing register (DESIGN 4.6);
+/// None means everything listed is out.
+fn aired_count(entry: &Enrichment) -> Option<u32> {
+    if !domain::is_still_airing(entry.status.as_deref()) {
+        return None;
+    }
+    entry.next_airing_episode.map(|n| n.saturating_sub(1))
 }
 
 /// Cover cell states (DESIGN 8.1): image, fetch spinner, or the `no art yet`
@@ -357,9 +582,8 @@ fn draw_synopsis(
     entry: &Enrichment,
     scroll: u16,
     y: u16,
+    cap: u16,
 ) {
-    let remaining = area.height.saturating_sub(y);
-    let cap = synopsis_cap(remaining);
     if cap == 0 {
         return;
     }
@@ -602,6 +826,41 @@ mod tests {
         assert_eq!(cover_height_cap(17), 0, "below 6 rows the poster drops");
         assert_eq!(synopsis_cap(5), 2);
         assert_eq!(synopsis_cap(3), 0);
+    }
+
+    #[test]
+    fn grid_cell_text_shapes_and_strips_control_bytes() {
+        assert_eq!(cell_text("7", false), "[7]");
+        assert_eq!(cell_text("24", false), "[24]");
+        assert_eq!(cell_text("128", false), "[128]");
+        assert_eq!(cell_text("7", true), "[▸7]");
+        assert_eq!(cell_text("24", true), "[▸24]");
+        assert_eq!(cell_text("128", true), "[128]", "3-wide drops the arrow");
+        assert_eq!(cell_text("13.5", false), "[13…]", "over-wide truncates");
+        // Provider-controlled label with an escape sequence: stripped at the
+        // render edge, never written into the buffer.
+        assert_eq!(cell_text("\x1b]0;x\x077", false), "[]0…]");
+        assert!(!cell_text("\x1b[31m1", false).contains('\x1b'));
+    }
+
+    #[test]
+    fn aired_count_only_marks_releasing_shows() {
+        let mut e = entry(1);
+        e.status = Some("RELEASING".into());
+        e.next_airing_episode = Some(15);
+        assert_eq!(aired_count(&e), Some(14));
+        e.status = Some("FINISHED".into());
+        assert_eq!(aired_count(&e), None);
+        e.status = Some("RELEASING".into());
+        e.next_airing_episode = None;
+        assert_eq!(aired_count(&e), None);
+    }
+
+    #[test]
+    fn grid_cols_floor_at_one() {
+        assert_eq!(grid_cols(60), 12);
+        assert_eq!(grid_cols(25), 5);
+        assert_eq!(grid_cols(3), 1);
     }
 
     #[test]

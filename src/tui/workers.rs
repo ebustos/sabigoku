@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 use crate::domain::Translation;
 use crate::error::Error;
 use crate::player::Position;
-use crate::providers::{CatalogProvider, DiscoverAxis};
+use crate::providers::{
+    CatalogProvider, DiscoverAxis, ProviderRegistry, SEARCH_PAGE_SIZE, SearchOptions,
+};
 use crate::store::Store;
 use crate::tui::covers::{self, CoverCaches};
-use crate::tui::event::{Event, EventTx};
+use crate::tui::event::{Event, EventTx, FetchClass};
 
 /// The 02 §4b post-play gate, the one owner of the finish writes (01 §3 glue).
 /// No meaningful position, no writes of any kind; the player already collapsed
@@ -134,6 +136,123 @@ pub fn spawn_search(
             Err(cause) => Event::SearchFailed {
                 query,
                 cause: cause.to_string(),
+            },
+        };
+        tx.post(event);
+    })
+}
+
+/// One episode listing fetch, described as data so the spawn stays under the
+/// argument lint and the session can log/replay the spec in tests.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EpisodeFetch {
+    pub anilist_id: i64,
+    pub provider: String,
+    pub provider_id: String,
+    pub translation: Translation,
+    /// Mints a 1..N grid on listing-less providers (03 §2).
+    pub count_hint: Option<u32>,
+    pub token: u64,
+}
+
+/// Provider episode listing (03 §6.1). Staleness is the session generation
+/// `token`; the UI never joins, it drops mismatches in tick.
+#[must_use]
+pub fn spawn_episodes(
+    drain: &Drain,
+    tx: EventTx,
+    registry: Arc<ProviderRegistry>,
+    fetch: EpisodeFetch,
+) -> bool {
+    drain.spawn("episodes", move || {
+        let EpisodeFetch {
+            anilist_id,
+            provider,
+            provider_id,
+            translation,
+            count_hint,
+            token,
+        } = fetch;
+        let event = match registry.by_name(&provider) {
+            Some(p) => match p.episodes(&provider_id, translation, count_hint) {
+                Ok(episodes) => Event::EpisodesDone {
+                    anilist_id,
+                    provider,
+                    provider_id,
+                    episodes,
+                    token,
+                },
+                Err(cause) => Event::EpisodesError {
+                    anilist_id,
+                    provider,
+                    class: (&cause).into(),
+                    token,
+                },
+            },
+            // A retired name can only reach here through a stale binding row;
+            // surface it as a data failure, never fetch on primary (03 §3.2).
+            None => Event::EpisodesError {
+                anilist_id,
+                provider,
+                class: FetchClass::Data,
+                token,
+            },
+        };
+        tx.post(event);
+    })
+}
+
+/// One tier-C binding search (03 §4.2, page 1 of `SEARCH_PAGE_SIZE`); the
+/// scorers run offline on the UI thread when the hits land.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderSearch {
+    pub anilist_id: i64,
+    pub provider: String,
+    pub query: String,
+    pub translation: Translation,
+    pub token: u64,
+}
+
+#[must_use]
+pub fn spawn_provider_search(
+    drain: &Drain,
+    tx: EventTx,
+    registry: Arc<ProviderRegistry>,
+    search: ProviderSearch,
+) -> bool {
+    drain.spawn("provider-search", move || {
+        let ProviderSearch {
+            anilist_id,
+            provider,
+            query,
+            translation,
+            token,
+        } = search;
+        let opts = SearchOptions {
+            translation,
+            limit: SEARCH_PAGE_SIZE,
+            page: 1,
+        };
+        let event = match registry.by_name(&provider) {
+            Some(p) => match p.search(&query, &opts) {
+                Ok(hits) => Event::ProviderSearchDone {
+                    anilist_id,
+                    provider,
+                    hits,
+                    token,
+                },
+                Err(cause) => Event::ProviderSearchError {
+                    anilist_id,
+                    provider,
+                    class: (&cause).into(),
+                    token,
+                },
+            },
+            None => Event::ProviderSearchError {
+                anilist_id,
+                provider,
+                class: FetchClass::Data,
+                token,
             },
         };
         tx.post(event);

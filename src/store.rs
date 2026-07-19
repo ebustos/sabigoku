@@ -1048,12 +1048,18 @@ impl Store {
             .map_err(Error::from)
     }
 
-    pub fn set_route_pref(&self, anilist_id: i64, pref: &str) -> Result<(), Error> {
-        self.conn.execute(
+    /// Mints the identity row when absent, like the absence mark: the stamp
+    /// is stamp-BEFORE-fetch (03 §5.3), so it must land for shows that have
+    /// never resolved. No membership (02 §3.7).
+    pub fn set_route_pref(&self, e: &Enrichment, pref: &str) -> Result<(), Error> {
+        let tx = immediate_tx(&self.conn)?;
+        ensure_show_row(&tx, e)?;
+        tx.execute(
             "INSERT INTO provider_route (anilist_id, resolved_pref) VALUES (?1, ?2)
              ON CONFLICT(anilist_id) DO UPDATE SET resolved_pref = excluded.resolved_pref",
-            (anilist_id, pref),
+            (e.anilist_id, pref),
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1124,6 +1130,37 @@ impl Store {
                         duration_secs: row.get(1)?,
                         fully_watched: row.get(2)?,
                     })
+                },
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
+    /// Freshest partial-watch row for the show + track: the DESIGN 4.6 resume
+    /// cell and its cursor override (05 §10.7). Fully-watched and unusable
+    /// positions never resume.
+    pub fn latest_resume(
+        &self,
+        anilist_id: i64,
+        translation: Translation,
+    ) -> Result<Option<(String, Resume)>, Error> {
+        self.conn
+            .query_row(
+                "SELECT episode, position_secs, duration_secs, fully_watched
+                 FROM episode_progress
+                 WHERE anilist_id = ?1 AND translation = ?2
+                   AND fully_watched = 0 AND position_secs > 0
+                 ORDER BY updated_at DESC LIMIT 1",
+                (anilist_id, translation.as_str()),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        Resume {
+                            position_secs: row.get(1)?,
+                            duration_secs: row.get(2)?,
+                            fully_watched: row.get(3)?,
+                        },
+                    ))
                 },
             )
             .optional()
@@ -2313,12 +2350,24 @@ mod tests {
         assert_eq!(store.get_provider_pin(54).unwrap(), None);
 
         assert_eq!(store.get_route_pref(54).unwrap(), None);
-        store.set_route_pref(54, "senshi").unwrap();
+        store.set_route_pref(&sample(54), "senshi").unwrap();
         assert_eq!(store.get_route_pref(54).unwrap().as_deref(), Some("senshi"));
-        store.set_route_pref(54, "megaplay").unwrap();
+        store.set_route_pref(&sample(54), "megaplay").unwrap();
         assert_eq!(
             store.get_route_pref(54).unwrap().as_deref(),
             Some("megaplay")
+        );
+
+        // The stamp mints the identity row for a never-resolved show
+        // (stamp-before-fetch must land, 03 §5.3); no membership.
+        store.set_route_pref(&sample(77), "senshi").unwrap();
+        assert_eq!(store.get_route_pref(77).unwrap().as_deref(), Some("senshi"));
+        assert!(
+            store
+                .list_history()
+                .unwrap()
+                .iter()
+                .all(|s| s.enrichment.anilist_id != 77)
         );
     }
 
@@ -2374,6 +2423,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last.as_deref(), Some("senshi"));
+    }
+
+    #[test]
+    fn latest_resume_picks_freshest_partial_watch() {
+        let store = Store::open_memory().unwrap();
+        identity_row(&store, 60);
+        assert_eq!(store.latest_resume(60, Translation::Sub).unwrap(), None);
+
+        // Fully watched rows and zero positions never resume.
+        store
+            .save_progress(60, Translation::Sub, "1", 95.0, 100.0, None, 500)
+            .unwrap();
+        store
+            .save_progress(60, Translation::Sub, "2", 0.0, 100.0, None, 600)
+            .unwrap();
+        assert_eq!(store.latest_resume(60, Translation::Sub).unwrap(), None);
+
+        store
+            .save_progress(60, Translation::Sub, "3", 40.0, 100.0, None, 700)
+            .unwrap();
+        store
+            .save_progress(60, Translation::Sub, "4", 20.0, 100.0, None, 800)
+            .unwrap();
+        let (label, resume) = store.latest_resume(60, Translation::Sub).unwrap().unwrap();
+        assert_eq!(label, "4", "freshest updated_at wins, not deepest position");
+        assert_eq!(resume.position_secs, 20.0);
+
+        // Tracks never mix.
+        assert_eq!(store.latest_resume(60, Translation::Dub).unwrap(), None);
     }
 
     #[test]

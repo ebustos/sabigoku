@@ -9,9 +9,36 @@ use image::DynamicImage;
 use ratatui::crossterm::event::{self as ct, KeyEvent};
 
 use crate::domain::Enrichment;
-use crate::providers::DiscoverAxis;
+use crate::providers::{DiscoverAxis, ProviderError, SearchHit};
 
 use super::workers::{CancelFlag, Drain};
+
+/// Provider failure classes as event payload; the toast copy mapping lives in
+/// `failure_class_copy` (app.rs, DESIGN 4.10). `Unsupported` earns no toast:
+/// a search-less provider inside a walk is routine, not a failure the user
+/// must see (03 §8.1: it must not poison absence either).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchClass {
+    Network,
+    Blocked,
+    Down,
+    Http,
+    Data,
+    Unsupported,
+}
+
+impl From<&ProviderError> for FetchClass {
+    fn from(e: &ProviderError) -> FetchClass {
+        match e {
+            ProviderError::Network => FetchClass::Network,
+            ProviderError::Forbidden { .. } => FetchClass::Blocked,
+            ProviderError::Server { .. } => FetchClass::Down,
+            ProviderError::Http { .. } => FetchClass::Http,
+            ProviderError::Decode(_) => FetchClass::Data,
+            ProviderError::Unsupported => FetchClass::Unsupported,
+        }
+    }
+}
 
 /// No `Eq`: cover events carry pixel payloads (`DynamicImage` is `PartialEq`
 /// only).
@@ -68,6 +95,34 @@ pub enum Event {
     SearchFailed {
         query: String,
         cause: String,
+    },
+    /// Provider episode listing (04 §4.2). `token` is the episode session's
+    /// generation: every fire supersedes, so only the latest token applies.
+    EpisodesDone {
+        anilist_id: i64,
+        provider: String,
+        provider_id: String,
+        episodes: Vec<String>,
+        token: u64,
+    },
+    EpisodesError {
+        anilist_id: i64,
+        provider: String,
+        class: FetchClass,
+        token: u64,
+    },
+    /// Tier-C candidates; scored offline on the UI thread (03 §4.2).
+    ProviderSearchDone {
+        anilist_id: i64,
+        provider: String,
+        hits: Vec<SearchHit>,
+        token: u64,
+    },
+    ProviderSearchError {
+        anilist_id: i64,
+        provider: String,
+        class: FetchClass,
+        token: u64,
     },
 }
 

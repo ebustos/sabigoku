@@ -8,6 +8,7 @@ pub mod app;
 pub mod chrome;
 pub mod clock;
 pub mod covers;
+pub mod episodes;
 pub mod event;
 pub mod layout;
 pub mod render;
@@ -24,7 +25,10 @@ use ratatui_image::picker::Picker;
 use crate::anilist::AniList;
 use crate::config::Config;
 use crate::paths::Paths;
-use crate::providers::CatalogProvider;
+use crate::providers::allanime::AllAnime;
+use crate::providers::megaplay::MegaPlay;
+use crate::providers::senshi::Senshi;
+use crate::providers::{CatalogProvider, ProviderRegistry, StreamProvider};
 use crate::store::Store;
 use app::App;
 use clock::TickClock;
@@ -44,6 +48,13 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
     let store = Store::open(&paths.db_file()).map_err(std::io::Error::other)?;
     let catalog: Arc<dyn CatalogProvider> =
         Arc::new(AniList::new().map_err(std::io::Error::other)?);
+    // Construction order IS the default fallback order (03 §3.1): megaplay,
+    // senshi, allanime. Building the clients is offline.
+    let registry = Arc::new(ProviderRegistry::new(vec![
+        Box::new(MegaPlay::new().map_err(std::io::Error::other)?) as Box<dyn StreamProvider>,
+        Box::new(Senshi::new().map_err(std::io::Error::other)?),
+        Box::new(AllAnime::new().map_err(std::io::Error::other)?),
+    ]));
     let mut terminal = ratatui::init();
     scope_panic_hook_to_main_thread();
     // The protocol query can stall for seconds where the terminal answers
@@ -77,7 +88,15 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
         return Err(std::io::Error::other("could not spawn the input thread"));
     }
 
-    let mut app = App::new(config, store, catalog, paths.covers_dir(), picker, &tx);
+    let mut app = App::new(
+        config,
+        store,
+        catalog,
+        registry,
+        paths.covers_dir(),
+        picker,
+        &tx,
+    );
     if let Ok(size) = terminal.size() {
         app.tick(Event::Resize(size.width, size.height), Instant::now(), &tx);
     }

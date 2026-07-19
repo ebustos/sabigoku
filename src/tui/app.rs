@@ -21,14 +21,15 @@ use ratatui::widgets::Block;
 use ratatui_image::picker::Picker;
 
 use crate::config::Config;
-use crate::domain::{self, TitleLanguage};
-use crate::providers::{CatalogProvider, DiscoverAxis};
+use crate::domain::{self, TitleLanguage, Translation};
+use crate::providers::{CatalogProvider, DiscoverAxis, ProviderRegistry};
 use crate::store::Store;
 
 use super::chrome::{self, BottomBar, HelpLine, Tab, TopBar};
 use super::covers::CoverCaches;
 use super::covers::render::ProtocolPool;
-use super::event::{Event, EventTx};
+use super::episodes::{EpisodeDeps, Feedback};
+use super::event::{Event, EventTx, FetchClass};
 use super::layout;
 use super::render;
 use super::theme::{self, Palette};
@@ -64,6 +65,7 @@ pub struct App {
     pub(super) detail: DetailState,
     store: Store,
     catalog: Arc<dyn CatalogProvider>,
+    registry: Arc<ProviderRegistry>,
     caches: Arc<CoverCaches>,
     covers_dir: PathBuf,
     pub(super) pool: ProtocolPool,
@@ -79,6 +81,7 @@ impl App {
         config: &Config,
         store: Store,
         catalog: Arc<dyn CatalogProvider>,
+        registry: Arc<ProviderRegistry>,
         covers_dir: PathBuf,
         picker: Picker,
         tx: &EventTx,
@@ -105,6 +108,7 @@ impl App {
             detail: DetailState::default(),
             store,
             catalog,
+            registry,
             caches: Arc::new(CoverCaches::new()),
             covers_dir,
             pool,
@@ -115,7 +119,7 @@ impl App {
     /// Mutates; draw is pure (04 §1). Dispatch only.
     pub(super) fn tick(&mut self, event: Event, now: Instant, tx: &EventTx) {
         match event {
-            Event::Key(key) => self.on_key(key, now),
+            Event::Key(key) => self.on_key(key, now, tx),
             Event::Resize(w, h) => self.on_resize(w, h),
             Event::FocusGained | Event::FocusLost => {}
             // No keys can ever arrive again; quit clean instead of zombieing.
@@ -139,12 +143,16 @@ impl App {
                 results,
             } => self.on_search_done(&query, results, now),
             Event::SearchFailed { query, cause: _ } => self.on_search_failed(&query, now),
+            e @ (Event::EpisodesDone { .. }
+            | Event::EpisodesError { .. }
+            | Event::ProviderSearchDone { .. }
+            | Event::ProviderSearchError { .. }) => self.on_episode_event(e, now, tx),
         }
     }
 
     /// Key dispatch. Ctrl-C hard-quits from every mode; F-keys are global
     /// aliases that fire in any mode (DESIGN 7.2).
-    fn on_key(&mut self, key: KeyEvent, now: Instant) {
+    fn on_key(&mut self, key: KeyEvent, now: Instant, tx: &EventTx) {
         let ctrl_c =
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl_c {
@@ -156,14 +164,14 @@ impl App {
             return;
         }
         match self.mode {
-            InputMode::Normal => self.on_normal_key(key, now),
+            InputMode::Normal => self.on_normal_key(key, now, tx),
             InputMode::Search => self.on_search_key(key, now),
-            InputMode::Command => self.on_command_key(key, now),
+            InputMode::Command => self.on_command_key(key, now, tx),
         }
         self.dirty = true;
     }
 
-    fn on_normal_key(&mut self, key: KeyEvent, now: Instant) {
+    fn on_normal_key(&mut self, key: KeyEvent, now: Instant, tx: &EventTx) {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('B') => self.switch_view(View::Browse, now),
@@ -174,9 +182,9 @@ impl App {
             KeyCode::Char(':') => self.open_command(),
             KeyCode::Esc => self.on_escape(),
             KeyCode::Char(' ') => self.on_space(),
-            KeyCode::Enter => self.on_enter(now),
+            KeyCode::Enter => self.on_enter(now, tx),
             KeyCode::Char('h') => self.on_h(),
-            KeyCode::Char('l') => self.on_l(now),
+            KeyCode::Char('l') => self.on_l(now, tx),
             KeyCode::Char('j') => self.on_j(now),
             KeyCode::Char('k') => self.on_k(now),
             KeyCode::Char('g') => self.on_jump(true, now),
@@ -259,29 +267,32 @@ impl App {
 
     /// Enter drills toward wherever the grid is visible, then plays
     /// (DESIGN 10, ROD-170/259). Play itself lands in chunk 6.
-    fn on_enter(&mut self, now: Instant) {
+    fn on_enter(&mut self, now: Instant, tx: &EventTx) {
         match self.view {
-            View::Discover => self.open_discover_detail(now),
+            View::Discover => self.open_discover_detail(now, tx),
             View::Browse | View::History if self.pane == Pane::Detail => {}
             View::History if !self.two_pane() => self.promote(),
-            View::Browse if self.two_pane() => self.enter_browse_pane(now),
+            View::Browse if self.two_pane() => self.enter_browse_pane(now, tx),
             View::History if self.two_pane() => self.pane = Pane::Detail,
             _ => {}
         }
     }
 
     /// Zoom from a Discover card: push the card snapshot, then promote.
-    fn open_discover_detail(&mut self, now: Instant) {
+    /// Detail entry is what resolves episodes, never card scroll (05 §10.1).
+    fn open_discover_detail(&mut self, now: Instant, tx: &EventTx) {
         if let Some(entry) = self.discover.selected_entry() {
             let entry = entry.clone();
             self.detail.set_target(&entry, true, now);
         }
         self.promote();
+        self.engage_detail(now, tx);
     }
 
-    fn enter_browse_pane(&mut self, now: Instant) {
+    fn enter_browse_pane(&mut self, now: Instant, tx: &EventTx) {
         self.pane = Pane::Detail;
         self.push_browse_selection(true, now);
+        self.engage_detail(now, tx);
     }
 
     fn on_h(&mut self) {
@@ -293,10 +304,10 @@ impl App {
         }
     }
 
-    fn on_l(&mut self, now: Instant) {
+    fn on_l(&mut self, now: Instant, tx: &EventTx) {
         match self.view {
             View::Browse if self.pane == Pane::List && self.two_pane() => {
-                self.enter_browse_pane(now)
+                self.enter_browse_pane(now, tx)
             }
             View::History if self.pane == Pane::List && self.two_pane() => self.pane = Pane::Detail,
             View::Discover => self.nav_discover(1, 0),
@@ -308,8 +319,8 @@ impl App {
         match self.view {
             View::Discover => self.nav_discover(0, 1),
             View::Browse if self.pane == Pane::List => self.on_browse_nav(1, now),
-            View::Browse | View::History if self.pane == Pane::Detail => self.detail.scroll_by(1),
-            View::Detail => self.detail.scroll_by(1),
+            View::Browse | View::History if self.pane == Pane::Detail => self.detail.on_vertical(1),
+            View::Detail => self.detail.on_vertical(1),
             _ => {}
         }
     }
@@ -318,14 +329,23 @@ impl App {
         match self.view {
             View::Discover => self.nav_discover(0, -1),
             View::Browse if self.pane == Pane::List => self.on_browse_nav(-1, now),
-            View::Browse | View::History if self.pane == Pane::Detail => self.detail.scroll_by(-1),
-            View::Detail => self.detail.scroll_by(-1),
+            View::Browse | View::History if self.pane == Pane::Detail => {
+                self.detail.on_vertical(-1)
+            }
+            View::Detail => self.detail.on_vertical(-1),
             _ => {}
         }
     }
 
-    /// g / G jump (DESIGN 6.1); list surfaces only.
+    /// g / G jump (DESIGN 6.1): a focused detail surface consumes it for the
+    /// grid (freeze parity, inert without one), else the Browse list jumps.
     fn on_jump(&mut self, top: bool, now: Instant) {
+        let on_detail_surface = self.view == View::Detail
+            || (matches!(self.view, View::Browse | View::History) && self.pane == Pane::Detail);
+        if on_detail_surface {
+            self.detail.jump(top);
+            return;
+        }
         if self.view == View::Browse && self.pane == Pane::List {
             self.browse.jump(top, self.list_visible());
             self.push_browse_selection(false, now);
@@ -470,10 +490,10 @@ impl App {
         }
     }
 
-    fn on_command_key(&mut self, key: KeyEvent, now: Instant) {
+    fn on_command_key(&mut self, key: KeyEvent, now: Instant, tx: &EventTx) {
         match key.code {
             KeyCode::Esc => self.mode = InputMode::Normal,
-            KeyCode::Enter => self.run_command(now),
+            KeyCode::Enter => self.run_command(now, tx),
             KeyCode::Backspace => {
                 self.command.pop();
             }
@@ -484,23 +504,34 @@ impl App {
 
     /// DESIGN 6.3. `sync` and `cache clear` are recognized but inert until
     /// their subsystems land (chunks 2-5); see the ROD-439 handoff notes.
-    fn run_command(&mut self, now: Instant) {
+    fn run_command(&mut self, now: Instant, tx: &EventTx) {
         let command = std::mem::take(&mut self.command);
         self.mode = InputMode::Normal;
         match command.trim() {
             "q" => self.quit = true,
-            "dub" => self.toggle_translation(),
+            "dub" => self.toggle_translation(now, tx),
             "sync" | "cache clear" => {}
             _ => self.on_unknown_command(now),
         }
     }
 
-    fn toggle_translation(&mut self) {
+    /// The track flip changes the episode-cache key, so a visible grid
+    /// re-resolves once; the reset supersedes any in-flight walk instead of
+    /// stacking a second one (config churn must not storm the walk).
+    fn toggle_translation(&mut self, now: Instant, tx: &EventTx) {
         self.config.translation = if self.config.translation == "dub" {
             "sub".to_string()
         } else {
             "dub".to_string()
         };
+        let engaged = self
+            .detail
+            .shown()
+            .is_some_and(|e| self.detail.episodes.engaged_for(e.anilist_id));
+        if engaged {
+            self.detail.episodes.reset();
+            self.engage_detail(now, tx);
+        }
     }
 
     /// Both feedback channels are specced: the 800ms bar flash (DESIGN 3.5)
@@ -641,6 +672,92 @@ impl App {
         }
     }
 
+    /// Detail entry resolves episodes (03 §6.1); list scroll never does
+    /// (05 §10.1).
+    fn engage_detail(&mut self, now: Instant, tx: &EventTx) {
+        let Some(entry) = self.detail.shown().cloned() else {
+            return;
+        };
+        let fb = {
+            let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+            self.detail.episodes.engage(&entry, &deps)
+        };
+        self.apply_episode_feedback(fb, now);
+    }
+
+    /// One handler for the four episode-session results: route into the
+    /// session, then toast whatever it reports.
+    fn on_episode_event(&mut self, event: Event, now: Instant, tx: &EventTx) {
+        let fb = {
+            let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+            let session = &mut self.detail.episodes;
+            match event {
+                Event::EpisodesDone {
+                    anilist_id,
+                    provider,
+                    provider_id,
+                    episodes,
+                    token,
+                } => session.on_done(anilist_id, &provider, &provider_id, episodes, token, &deps),
+                Event::EpisodesError {
+                    anilist_id,
+                    provider,
+                    class,
+                    token,
+                } => session.on_error(anilist_id, &provider, class, token, &deps),
+                Event::ProviderSearchDone {
+                    anilist_id,
+                    provider,
+                    hits,
+                    token,
+                } => session.on_search_done(anilist_id, &provider, &hits, token, &deps),
+                Event::ProviderSearchError {
+                    anilist_id,
+                    provider,
+                    class,
+                    token,
+                } => session.on_search_error(anilist_id, &provider, class, token, &deps),
+                _ => Vec::new(),
+            }
+        };
+        self.apply_episode_feedback(fb, now);
+        self.dirty = true;
+    }
+
+    /// Session outcomes to DESIGN 4.10 toast rows.
+    fn apply_episode_feedback(&mut self, feedback: Vec<Feedback>, now: Instant) {
+        for f in feedback {
+            match f {
+                Feedback::Fail { provider, class } => {
+                    if let Some(copy) = failure_class_copy(class, &self.display_name(&provider)) {
+                        self.toasts.push(Kind::Error, &copy, now);
+                    }
+                }
+                Feedback::Hop { provider } => {
+                    let copy = format!("trying {}…", self.display_name(&provider));
+                    self.toasts.push(Kind::Warn, &copy, now);
+                }
+                Feedback::NoMatch { provider } => {
+                    // K-2 step 5: distinct from the pin-kept copy.
+                    let copy = format!("no match on {}", self.display_name(&provider));
+                    self.toasts.push(Kind::Warn, &copy, now);
+                }
+                Feedback::PinKept { provider } => {
+                    let copy = format!("no match on {}, pin kept", self.display_name(&provider));
+                    self.toasts.push(Kind::Warn, &copy, now);
+                }
+                Feedback::DeadEnd => self.toasts.push(Kind::Error, "no source found", now),
+            }
+        }
+    }
+
+    fn display_name(&self, provider: &str) -> String {
+        self.registry
+            .by_name(provider)
+            .map(|p| p.display_name().to_string())
+            .unwrap_or_else(|| provider.to_string())
+    }
+
     /// Pure of app state and stores (04 §1); `&mut` is for the protocol
     /// pool's render-owned resize bookkeeping only.
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>, now: Instant) {
@@ -717,6 +834,7 @@ impl App {
                 &self.detail,
                 &env,
                 &mut self.pool,
+                self.pane == Pane::Detail,
             );
         } else {
             let list = ratatui::layout::Rect::new(
@@ -854,6 +972,39 @@ fn unix_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Free function so the deps borrow individual App fields and stay disjoint
+/// from `&mut self.detail`.
+fn episode_deps<'a>(
+    store: &'a Store,
+    registry: &'a Arc<ProviderRegistry>,
+    config: &'a Config,
+    tx: &'a EventTx,
+    now: Instant,
+) -> EpisodeDeps<'a> {
+    EpisodeDeps {
+        store,
+        registry,
+        tx,
+        global_pref: &config.preferred_provider,
+        translation: Translation::parse(&config.translation).unwrap_or(Translation::Sub),
+        unix_now: unix_now(),
+        now,
+    }
+}
+
+/// The one failure-class → copy mapping (DESIGN 4.10); `episodes_error` and
+/// the play path (chunk 6) share it. `Unsupported` is deliberately silent.
+fn failure_class_copy(class: FetchClass, provider: &str) -> Option<String> {
+    match class {
+        FetchClass::Network => Some("network unreachable".to_string()),
+        FetchClass::Blocked => Some(format!("{provider} blocked us")),
+        FetchClass::Down => Some(format!("{provider} is down")),
+        FetchClass::Http => Some(format!("{provider} returned an error")),
+        FetchClass::Data => Some("couldn't load episodes".to_string()),
+        FetchClass::Unsupported => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,9 +1090,12 @@ mod tests {
         })
     }
 
-    fn harness_with(
+    use super::super::episodes::teststub;
+
+    fn harness_full(
         name: &str,
         catalog: Arc<dyn CatalogProvider>,
+        registry: Arc<ProviderRegistry>,
     ) -> (App, EventTx, super::super::event::EventRx, Instant) {
         let covers_dir = std::env::temp_dir().join("sabigoku-app-tests").join(name);
         let (tx, rx) = super::super::event::channel();
@@ -949,11 +1103,19 @@ mod tests {
             &Config::default(),
             Store::open_memory().unwrap(),
             catalog,
+            registry,
             covers_dir,
             Picker::halfblocks(),
             &tx,
         );
         (app, tx, rx, Instant::now())
+    }
+
+    fn harness_with(
+        name: &str,
+        catalog: Arc<dyn CatalogProvider>,
+    ) -> (App, EventTx, super::super::event::EventRx, Instant) {
+        harness_full(name, catalog, teststub::inert_registry())
     }
 
     fn harness(name: &str) -> (App, EventTx, Instant) {
@@ -967,12 +1129,14 @@ mod tests {
         (app, tx, now)
     }
 
-    /// Settle every worker family, then apply everything they posted.
+    /// Settle every worker family, applying one event per drain pass so a
+    /// worker spawned WHILE applying (a walk hop) settles too.
     fn settle_feed(app: &mut App, tx: &EventTx, rx: &super::super::event::EventRx, now: Instant) {
-        assert!(app.discover.drain(Duration::from_secs(5)));
-        assert!(app.browse.drain(Duration::from_secs(5)));
-        assert!(app.detail.drain(Duration::from_secs(5)));
-        while let Ok(ev) = rx.try_recv() {
+        loop {
+            assert!(app.discover.drain(Duration::from_secs(5)));
+            assert!(app.browse.drain(Duration::from_secs(5)));
+            assert!(app.detail.drain(Duration::from_secs(5)));
+            let Ok(ev) = rx.try_recv() else { break };
             app.tick(ev, now, tx);
         }
     }
@@ -1670,5 +1834,104 @@ mod tests {
         let (mut app, _tx, _now) = sized("tiny", 15, 3);
         let text = rendered(&mut app, 20, 3);
         assert!(text.contains("terminal too small"));
+    }
+
+    /// Lands one Browse result set, locks the search, and steps into the pane
+    /// (the second Enter engages the episode session).
+    fn open_first_result(
+        app: &mut App,
+        tx: &EventTx,
+        rx: &super::super::event::EventRx,
+        now: Instant,
+    ) -> Instant {
+        app.tick(Event::Resize(100, 30), now, tx);
+        press(app, tx, now, &[ch('B'), ch('/'), ch('a')]);
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, tx);
+        settle_feed(app, tx, rx, t1);
+        assert!(
+            !app.detail.episodes.engaged_for(1),
+            "list scroll/selection never fetches episodes (05 §10.1)"
+        );
+        app.tick(key(KeyCode::Enter), t1, tx); // locks the search
+        app.tick(key(KeyCode::Enter), t1, tx); // enters the pane, engages
+        settle_feed(app, tx, rx, t1);
+        t1
+    }
+
+    #[test]
+    fn detail_entry_resolves_renders_and_navigates_the_grid() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into(), "3".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "grid-e2e",
+            StubCatalog::search_scripted(vec![one_page(2)]),
+            registry,
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        assert_eq!(app.detail.episodes.grid(), ["1", "2", "3"]);
+        assert_eq!(app.detail.episodes.serving(), Some("megaplay"));
+        assert_eq!(app.store.bindings_for(1).unwrap().len(), 1, "tier-A mint");
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("[1]") && text.contains("[3]"), "{text}");
+
+        // j/k step episodes linearly; g/G jump ends (freeze parity).
+        press(&mut app, &tx, t1, &[ch('j'), ch('j'), ch('j')]);
+        assert_eq!(app.detail.episodes.cursor(), 2, "clamped at the end");
+        app.tick(ch('g'), t1, &tx);
+        assert_eq!(app.detail.episodes.cursor(), 0);
+        app.tick(ch('G'), t1, &tx);
+        assert_eq!(app.detail.episodes.cursor(), 2);
+
+        // Back on the list, another selection: the stale grid never draws.
+        app.tick(key(KeyCode::Esc), t1, &tx);
+        app.tick(ch('j'), t1, &tx);
+        let text = rendered(&mut app, 100, 30);
+        assert!(!text.contains("[1]"), "another show must not show the grid");
+    }
+
+    #[test]
+    fn episode_failure_toasts_the_class_copy_and_hops() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Err(crate::providers::ProviderError::Server { status: 503 })),
+            teststub::StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "hop-e2e",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        open_first_result(&mut app, &tx, &rx, now);
+        assert_eq!(app.detail.episodes.serving(), Some("senshi"));
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("megaplay is down"), "{text}");
+        assert!(text.contains("trying senshi…"), "{text}");
+    }
+
+    #[test]
+    fn exhausted_resolve_renders_no_source() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Err(crate::providers::ProviderError::Network)),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "nosource-e2e",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        open_first_result(&mut app, &tx, &rx, now);
+        assert!(app.detail.episodes.no_source());
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("network unreachable"), "{text}");
+        assert!(text.contains("no source found"), "{text}");
+        assert!(text.contains("no source"), "{text}");
     }
 }

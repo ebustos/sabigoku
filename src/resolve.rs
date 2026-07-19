@@ -4,7 +4,7 @@
 //!
 //! Headless by design. Every decision is a pure function over a
 //! `ResolveWorld` (the store + registry reads it needs) returning an action;
-//! the TUI worker layer (ROD-437) performs the fetch/search/stamp the action
+//! the TUI worker layer (ROD-439) performs the fetch/search/stamp the action
 //! names. No threads, no network, no `Store` here, so the walk contracts are
 //! pinned by offline tests.
 //!
@@ -345,7 +345,7 @@ impl Walk {
     ///
     /// PRECONDITION: `target` must be a live registry name. Unlike
     /// `route_preferred`, this takes no world and cannot check `registered`, so
-    /// the caller (the `v`-flip UI, ROD-437) must only pass providers the
+    /// the caller (the `v`-flip UI, ROD-439) must only pass providers the
     /// registry offers, or `advance` will search a name the store cannot key.
     pub fn pin_flip(canonical: Enrichment, target: String) -> Walk {
         let anilist_id = canonical.anilist_id;
