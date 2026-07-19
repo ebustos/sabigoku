@@ -167,9 +167,9 @@ where
     let socket = socket_path(opts.socket_dir);
     let argv = build_argv(link, decloak.url(), opts, &socket)?;
 
-    // Clear a stale or pre-planted file so mpv binds its own socket; a same-uid
-    // squatter answering our watcher could otherwise forge positions. This
-    // shuts the pre-planted race; the same-instant one wants peer-cred (ROD-447).
+    // Clear a stale or pre-planted file so mpv binds its own socket rather than
+    // failing on an existing path. Squatter forgery is caught separately by the
+    // peer-cred check in connect_ipc, not by this unlink.
     let _ = std::fs::remove_file(&socket);
 
     // Null stdio or mpv fights the TUI for the terminal it inherited.
