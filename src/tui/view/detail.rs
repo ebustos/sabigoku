@@ -246,7 +246,10 @@ impl DetailState {
 }
 
 /// The persistent right-hand pane: surface-tier background marks the pane
-/// boundary without a border (DESIGN 3.1). `focused` lights the grid cursor.
+/// boundary without a border (DESIGN 3.1). `focused` lights the grid cursor;
+/// `split_ok`/`bloom` are the §5.3a surface flags: Browse keeps the single
+/// stack and never blooms, History splits and blooms past the width gate.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_pane(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -255,15 +258,15 @@ pub fn draw_pane(
     env: &ViewEnv,
     pool: &mut ProtocolPool,
     focused: bool,
+    split_ok: bool,
+    bloom: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     frame.render_widget(Block::new().style(Style::new().bg(palette.surface)), area);
-    // Browse's in-pane detail keeps the single stack at any width (§5.3a);
-    // the History pane variant joins in chunk 5 with its own flags.
     draw_content(
-        frame, area, palette, state, env, pool, focused, false, false,
+        frame, area, palette, state, env, pool, focused, split_ok, bloom,
     );
 }
 
@@ -515,7 +518,9 @@ fn draw_body(
 ) {
     let remaining = area.height.saturating_sub(y);
     let session = &state.episodes;
-    if !session.engaged_for(entry.anilist_id) {
+    // The grid region renders only while its surface has focus (DESIGN 5.4a,
+    // ROD-222): an unfocused pane is a synopsis preview, never a grid.
+    if !focused || !session.engaged_for(entry.anilist_id) {
         let cap = synopsis_cap(remaining);
         draw_synopsis(frame, area, palette, entry, state.scroll, y, cap);
         return;

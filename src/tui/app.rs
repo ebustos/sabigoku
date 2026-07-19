@@ -88,7 +88,7 @@ impl App {
     ) -> App {
         let encode_drain = Drain::default();
         let pool = ProtocolPool::new(picker, tx.clone(), &encode_drain);
-        App {
+        let mut app = App {
             quit: false,
             dirty: true,
             term: (0, 0),
@@ -113,7 +113,11 @@ impl App {
             covers_dir,
             pool,
             encode_drain,
-        }
+        };
+        // A synchronous local read, not a worker (a deliberate deviation from
+        // 04 §4.2's load events; recorded on the ticket).
+        app.history.load(&app.store);
+        app
     }
 
     /// Mutates; draw is pure (04 §1). Dispatch only.
@@ -181,7 +185,7 @@ impl App {
             KeyCode::Char('/') => self.open_search(now),
             KeyCode::Char(':') => self.open_command(),
             KeyCode::Esc => self.on_escape(),
-            KeyCode::Char(' ') => self.on_space(),
+            KeyCode::Char(' ') => self.on_space(now, tx),
             KeyCode::Enter => self.on_enter(now, tx),
             KeyCode::Char('h') => self.on_h(),
             KeyCode::Char('l') => self.on_l(now, tx),
@@ -221,8 +225,17 @@ impl App {
         }
         self.view = target;
         self.pane = Pane::List;
-        if target == View::Browse {
-            self.push_browse_selection(true, now);
+        // Entering a list view re-pushes ITS selection so the shared detail
+        // never shows another view's show. History also re-reads the store
+        // on entry: saves land from any view (P in Browse/Discover) and the
+        // in-memory list must not go stale against them.
+        match target {
+            View::Browse => self.push_browse_selection(true, now),
+            View::History => {
+                self.history.load(&self.store);
+                self.push_history_selection(true, now);
+            }
+            _ => {}
         }
     }
 
@@ -257,11 +270,11 @@ impl App {
 
     /// Space is the symmetric zoom toggle (DESIGN 7.2). At `w < 60` only the
     /// History list opens the zoom directly (DESIGN 7.1).
-    fn on_space(&mut self) {
+    fn on_space(&mut self, now: Instant, tx: &EventTx) {
         match self.view {
             View::Detail => self.demote(),
             View::Browse | View::History if self.pane == Pane::Detail => self.promote(),
-            View::History if !self.two_pane() => self.promote(),
+            View::History if !self.two_pane() => self.open_history_zoom(now, tx),
             _ => {}
         }
     }
@@ -272,9 +285,9 @@ impl App {
         match self.view {
             View::Discover => self.open_discover_detail(now, tx),
             View::Browse | View::History if self.pane == Pane::Detail => {}
-            View::History if !self.two_pane() => self.promote(),
+            View::History if !self.two_pane() => self.open_history_zoom(now, tx),
             View::Browse if self.two_pane() => self.enter_browse_pane(now, tx),
-            View::History if self.two_pane() => self.pane = Pane::Detail,
+            View::History if self.two_pane() => self.enter_history_pane(now, tx),
             _ => {}
         }
     }
@@ -310,7 +323,9 @@ impl App {
             View::Browse if self.pane == Pane::List && self.two_pane() => {
                 self.enter_browse_pane(now, tx)
             }
-            View::History if self.pane == Pane::List && self.two_pane() => self.pane = Pane::Detail,
+            View::History if self.pane == Pane::List && self.two_pane() => {
+                self.enter_history_pane(now, tx)
+            }
             View::Discover => self.nav_discover(1, 0),
             _ => {}
         }
@@ -320,6 +335,7 @@ impl App {
         match self.view {
             View::Discover => self.nav_discover(0, 1),
             View::Browse if self.pane == Pane::List => self.on_browse_nav(1, now),
+            View::History if self.pane == Pane::List => self.on_history_nav(1, now),
             View::Browse | View::History if self.pane == Pane::Detail => self.detail.on_vertical(1),
             View::Detail => self.detail.on_vertical(1),
             _ => {}
@@ -330,6 +346,7 @@ impl App {
         match self.view {
             View::Discover => self.nav_discover(0, -1),
             View::Browse if self.pane == Pane::List => self.on_browse_nav(-1, now),
+            View::History if self.pane == Pane::List => self.on_history_nav(-1, now),
             View::Browse | View::History if self.pane == Pane::Detail => {
                 self.detail.on_vertical(-1)
             }
@@ -339,7 +356,7 @@ impl App {
     }
 
     /// g / G jump (DESIGN 6.1): a focused detail surface consumes it for the
-    /// grid (freeze parity, inert without one), else the Browse list jumps.
+    /// grid (freeze parity, inert without one), else the focused list jumps.
     fn on_jump(&mut self, top: bool, now: Instant) {
         let on_detail_surface = self.view == View::Detail
             || (matches!(self.view, View::Browse | View::History) && self.pane == Pane::Detail);
@@ -347,10 +364,48 @@ impl App {
             self.detail.jump(top);
             return;
         }
-        if self.view == View::Browse && self.pane == Pane::List {
-            self.browse.jump(top, self.list_visible());
-            self.push_browse_selection(false, now);
+        match self.view {
+            View::Browse if self.pane == Pane::List => {
+                self.browse.jump(top, self.list_visible());
+                self.push_browse_selection(false, now);
+            }
+            View::History if self.pane == Pane::List => {
+                self.history.jump(top, self.list_visible());
+                self.push_history_selection(false, now);
+            }
+            _ => {}
         }
+    }
+
+    /// History cursor motion pushes the focused record into the shared detail
+    /// preview (DESIGN 5.4a: focus change = immediate update).
+    fn on_history_nav(&mut self, dy: i64, now: Instant) {
+        self.history.nav(dy, self.list_visible());
+        self.push_history_selection(false, now);
+    }
+
+    fn push_history_selection(&mut self, discrete: bool, now: Instant) {
+        if !self.two_pane() && self.view != View::Detail {
+            return;
+        }
+        match self.history.selected().map(|s| s.enrichment.clone()) {
+            Some(entry) => self.detail.set_target(&entry, discrete, now),
+            None => self.detail.clear_target(&mut self.pool),
+        }
+    }
+
+    fn enter_history_pane(&mut self, now: Instant, tx: &EventTx) {
+        self.pane = Pane::Detail;
+        self.push_history_selection(true, now);
+        self.engage_detail(now, tx);
+    }
+
+    /// Narrow History (DESIGN 5.4a): no pane exists, so Enter/Space drill
+    /// straight into the zoom; the fetch fires with the open.
+    fn open_history_zoom(&mut self, now: Instant, tx: &EventTx) {
+        self.promote();
+        self.push_history_selection(true, now);
+        self.engage_detail(now, tx);
     }
 
     /// Cursor motion is continuous scroll: the metadata updates instantly,
@@ -455,6 +510,9 @@ impl App {
     /// Esc clears the query and restores the full list (DESIGN 6.2).
     fn close_search(&mut self) {
         self.search_buffer().clear();
+        if self.view == View::History {
+            self.history.on_filter_cleared();
+        }
         self.mode = InputMode::Normal;
     }
 
@@ -478,8 +536,11 @@ impl App {
     /// Browse's catalogue search debounces the network fetch (04 §8);
     /// History's filter is local and needs none (chunk 5).
     fn arm_search(&mut self, now: Instant) {
-        if self.view == View::Browse {
-            self.browse.on_query_edited(now);
+        match self.view {
+            View::Browse => self.browse.on_query_edited(now),
+            // The filter is local: no debounce, immediate narrowing.
+            View::History => self.history.on_filter_edited(),
+            _ => {}
         }
     }
 
@@ -821,7 +882,7 @@ impl App {
         chrome::draw_top_bar(frame, rows.top, self.palette, &self.top_bar());
         match self.view {
             View::Browse => self.draw_browse(frame, rows.content, now),
-            View::History => history::draw(frame, rows.content, self.palette, &self.history),
+            View::History => self.draw_history(frame, rows.content, now),
             View::Detail => self.draw_zoom(frame, rows.content, now),
             View::Discover => self.draw_discover(frame, rows.content, now),
             View::Settings => settings::draw(frame, rows.content, self.palette, &self.settings),
@@ -876,6 +937,8 @@ impl App {
                 &env,
                 &mut self.pool,
                 self.pane == Pane::Detail,
+                false,
+                false,
             );
         } else {
             let list = ratatui::layout::Rect::new(
@@ -885,6 +948,58 @@ impl App {
                 area.height,
             );
             browse::draw_list(frame, list, self.palette, &self.browse, &env, true);
+        }
+    }
+
+    /// History composition (DESIGN 5.4a): the split engages only with a
+    /// focused record; empty/failed states keep the full-width column.
+    fn draw_history(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
+        let env = self.view_env(now);
+        if self.two_pane() && self.history.selected().is_some() {
+            let split = layout::pane_split(area.width);
+            let list = ratatui::layout::Rect::new(
+                area.x + 2,
+                area.y,
+                split.list_w.min(area.width.saturating_sub(2)),
+                area.height,
+            );
+            history::draw_list(
+                frame,
+                list,
+                self.palette,
+                &self.history,
+                &env,
+                self.pane == Pane::List,
+            );
+            let pane = ratatui::layout::Rect::new(
+                area.x + split.detail_x,
+                area.y,
+                split
+                    .detail_w
+                    .min(area.width.saturating_sub(split.detail_x)),
+                area.height,
+            );
+            detail::draw_pane(
+                frame,
+                pane,
+                self.palette,
+                &self.detail,
+                &env,
+                &mut self.pool,
+                self.pane == Pane::Detail,
+                // History's pane is the one in-pane surface that splits and
+                // blooms the rail past DETAIL_TWO_COL_MIN (DESIGN 5.3a).
+                true,
+                true,
+            );
+        } else {
+            let list = ratatui::layout::Rect::new(
+                area.x + 2,
+                area.y,
+                area.width.saturating_sub(3),
+                area.height,
+            );
+            history::draw_list(frame, list, self.palette, &self.history, &env, true);
         }
     }
 
@@ -929,13 +1044,17 @@ impl App {
                 Origin::Discover => Tab::Discover,
             },
         };
-        // Browse/History fall back to the current cour; Discover tracks the
+        // Browse falls back to the current cour; History mirrors the focused
+        // row with the cour fallback (DESIGN 8.3); Discover tracks the
         // selected card and the zoom its committed show, both with no
         // fallback; Settings shows no chip (DESIGN 3.4, 7.3).
         let season_chip = match self.view {
-            View::Browse | View::History => {
-                Some(render::cour_chip(domain::current_cour(unix_now())))
-            }
+            View::Browse => Some(render::cour_chip(domain::current_cour(unix_now()))),
+            View::History => self
+                .history
+                .selected()
+                .and_then(|s| render::season_chip(s.enrichment.season, s.enrichment.year))
+                .or_else(|| Some(render::cour_chip(domain::current_cour(unix_now())))),
             View::Discover => self
                 .discover
                 .selected_entry()
@@ -966,7 +1085,7 @@ impl App {
                 View::History => BottomBar::Search {
                     query: &self.history.filter,
                     scope: "history",
-                    count: self.history.row_count,
+                    count: self.history.count(),
                 },
                 _ => BottomBar::Search {
                     query: &self.browse.query,
@@ -1772,11 +1891,30 @@ mod tests {
         assert!(matches!(app.bottom_bar(later), BottomBar::Help(_)));
     }
 
+    /// Library rows seeded through the store, then reloaded the way the app
+    /// itself loads.
+    fn seed_history(app: &mut App, shows: &[(i64, &str, crate::domain::ListStatus)]) {
+        for (aid, title, status) in shows {
+            let e = Enrichment {
+                anilist_id: *aid,
+                title_romaji: title.to_string(),
+                total_episodes: Some(12),
+                ..Enrichment::default()
+            };
+            app.store.add_to_library(&e, 100).unwrap();
+            app.store.set_list_status(*aid, *status, 100).unwrap();
+        }
+        app.history.load(&app.store);
+    }
+
     #[test]
     fn help_line_tracks_view_pane_and_empty_history() {
         let (mut app, tx, now) = sized("help-line", 100, 30);
         assert_eq!(app.help_line(), HelpLine::HistoryEmpty);
-        app.history.row_count = 3;
+        seed_history(
+            &mut app,
+            &[(1, "Show 1", crate::domain::ListStatus::Watching)],
+        );
         assert_eq!(app.help_line(), HelpLine::HistoryList);
         app.tick(ch('l'), now, &tx);
         assert_eq!(app.help_line(), HelpLine::HistoryDetail);
@@ -2093,6 +2231,112 @@ mod tests {
         assert!(history_zoom.contains("Duration"), "{history_zoom}");
         assert!(history_zoom.contains("Madhouse"), "{history_zoom}");
         assert!(history_zoom.contains("▸megaplay"), "{history_zoom}");
+    }
+
+    #[test]
+    fn history_renders_groups_bars_and_detail_preview() {
+        use crate::domain::ListStatus;
+        let (mut app, tx, now) = sized("history-groups", 100, 30);
+        seed_history(
+            &mut app,
+            &[
+                (1, "Alpha", ListStatus::Watching),
+                (2, "Beta", ListStatus::Completed),
+                (3, "Gamma", ListStatus::Watching),
+            ],
+        );
+        app.tick(ch('H'), now, &tx);
+        app.tick(ch('B'), now, &tx);
+        app.tick(ch('H'), now, &tx);
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("watching (2)"), "{text}");
+        assert!(text.contains("complete (1)"), "{text}");
+        assert!(text.contains("eps"), "bars carry the fraction");
+        assert!(text.contains("█"), "completed rows fill the bar");
+        assert_eq!(
+            app.detail.shown().map(|e| e.anilist_id),
+            Some(1),
+            "entering History pushes the focused record into the preview"
+        );
+        // Cursor motion follows group order (watching first), pushing along.
+        app.tick(ch('j'), now, &tx);
+        assert_eq!(app.detail.shown().map(|e| e.anilist_id), Some(3));
+        app.tick(ch('j'), now, &tx);
+        assert_eq!(
+            app.detail.shown().map(|e| e.anilist_id),
+            Some(2),
+            "group order, not store order"
+        );
+    }
+
+    #[test]
+    fn history_pane_entry_engages_and_list_focus_hides_the_grid() {
+        use crate::domain::ListStatus;
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full("history-grid", StubCatalog::inert(), registry);
+        app.tick(Event::Resize(100, 30), now, &tx);
+        seed_history(&mut app, &[(7, "Alpha", ListStatus::Watching)]);
+        app.tick(ch('H'), now, &tx);
+        app.tick(ch('B'), now, &tx);
+        app.tick(ch('H'), now, &tx);
+        assert!(
+            !app.detail.episodes.engaged_for(7),
+            "list focus never fetches (05 §10.1)"
+        );
+        app.tick(key(KeyCode::Enter), now, &tx);
+        assert_eq!(app.pane, Pane::Detail);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(app.detail.episodes.grid(), ["1", "2"]);
+        let text = rendered(&mut app, 100, 30);
+        assert!(
+            text.contains("[1]"),
+            "focused pane renders the grid: {text}"
+        );
+        // Back on the list: the pane is a synopsis preview, never a grid
+        // (DESIGN 5.4a, ROD-222).
+        app.tick(key(KeyCode::Esc), now, &tx);
+        let text = rendered(&mut app, 100, 30);
+        assert!(!text.contains("[1]"), "unfocused pane hides the grid");
+    }
+
+    #[test]
+    fn history_filter_narrows_counts_and_esc_restores() {
+        use crate::domain::ListStatus;
+        let (mut app, tx, now) = sized("history-filter", 100, 30);
+        seed_history(
+            &mut app,
+            &[
+                (1, "Frieren", ListStatus::Watching),
+                (2, "Vinland", ListStatus::Watching),
+            ],
+        );
+        press(&mut app, &tx, now, &[ch('/'), ch('v'), ch('i'), ch('n')]);
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("[history · 1]"), "{text}");
+        assert!(text.contains("Vinland") && !text.contains("Frieren"));
+        app.tick(key(KeyCode::Esc), now, &tx);
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("Frieren"), "esc restores the full list");
+        assert!(app.history.filter.is_empty());
+    }
+
+    #[test]
+    fn narrow_history_enter_opens_the_zoom_with_the_selection() {
+        use crate::domain::ListStatus;
+        let (mut app, tx, now) = sized("history-narrow", 50, 30);
+        seed_history(&mut app, &[(9, "Alpha", ListStatus::Watching)]);
+        app.tick(key(KeyCode::Enter), now, &tx);
+        assert_eq!(app.view, View::Detail);
+        assert_eq!(app.origin, Origin::History);
+        assert_eq!(
+            app.detail.shown().map(|e| e.anilist_id),
+            Some(9),
+            "the zoom opens on the focused record"
+        );
     }
 
     #[test]

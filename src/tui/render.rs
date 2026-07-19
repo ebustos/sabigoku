@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::domain::{Cour, Season};
+use crate::domain::{Cour, ListStatus, Season};
 
 use super::theme::Palette;
 
@@ -113,6 +113,50 @@ pub fn score_style(palette: &Palette, score: Option<u32>, cap_hot: bool) -> Styl
         Some(s) if s >= 51 => Style::new().fg(palette.fg2),
         _ => Style::new().fg(palette.fg3),
     }
+}
+
+/// Progress-bar fill (DESIGN 4.5): selection-aware, so the cursor always
+/// owns the single brightest bar. Off-cursor bars drop to their status
+/// colour and can never impersonate the cursor.
+pub fn bar_fill_color(
+    palette: &Palette,
+    status: ListStatus,
+    selected: bool,
+    list_focused: bool,
+) -> Style {
+    let dim_if_paused = |style: Style| {
+        if status == ListStatus::Paused {
+            style.add_modifier(Modifier::DIM)
+        } else {
+            style
+        }
+    };
+    if selected && list_focused {
+        return dim_if_paused(Style::new().fg(palette.focus));
+    }
+    if selected {
+        return dim_if_paused(Style::new().fg(palette.fg2));
+    }
+    match status {
+        ListStatus::Watching => Style::new().fg(palette.fg2),
+        ListStatus::Paused => Style::new().fg(palette.fg2).add_modifier(Modifier::DIM),
+        ListStatus::Completed | ListStatus::Dropped => Style::new().fg(palette.fg3),
+        // An empty-reading bar: planning has nothing to brag about.
+        ListStatus::Planning => Style::new().fg(palette.chrome),
+    }
+}
+
+/// Fraction text beside the bar (DESIGN 4.5).
+pub fn bar_frac_color(
+    palette: &Palette,
+    status: ListStatus,
+    selected: bool,
+    list_focused: bool,
+) -> Style {
+    if selected && list_focused && matches!(status, ListStatus::Watching | ListStatus::Paused) {
+        return Style::new().fg(palette.fg2);
+    }
+    Style::new().fg(palette.fg3)
 }
 
 /// Truncate to `max_cols` display columns on a grapheme boundary with a
