@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use crate::domain::{self, Enrichment, Translation};
 use crate::providers::ProviderRegistry;
-use crate::resolve::{self, Exhausted, Hop, ResolveTarget, ResolveWorld, RouteAction, Walk};
+use crate::resolve::{
+    self, Exhausted, Hop, ResolveTarget, ResolveWorld, RouteAction, Walk, WalkOrigin,
+};
 use crate::resolver;
 use crate::store::{ProviderAvailability, Store};
 use crate::tui::clock::AsyncStart;
@@ -112,6 +114,9 @@ pub enum Feedback {
     PinKept { provider: String },
     /// Ordinary walk exhausted with nothing landed.
     DeadEnd,
+    /// The pin flip's walk could not even run (worker spawn failure); pin
+    /// kept, distinct from a walk that ran and missed (DESIGN 4.10).
+    PinUnreachable { provider: String },
     /// `v` pinned the provider already serving the grid; no hop.
     PinSet { provider: String },
     /// `v` cycled past the last provider back to unpinned.
@@ -240,16 +245,17 @@ impl EpisodeSession {
 
     /// Tier 0: an unexpired cached listing paints without a fetch (03 §6.1
     /// step 7); the DB cache is the one listing cache, no in-memory twin.
-    fn open_bound(&mut self, provider: String, id: String, deps: &EpisodeDeps) {
+    /// True when answered or a worker is in flight.
+    fn open_bound(&mut self, provider: String, id: String, deps: &EpisodeDeps) -> bool {
         let aid = self.for_id.unwrap_or_default();
         if let Ok(Some(cached)) =
             deps.store
                 .get_cached_episodes(aid, &provider, deps.translation, deps.unix_now)
         {
             self.land(provider, cached, deps);
-            return;
+            return true;
         }
-        self.fire_fetch(provider, id, false, deps);
+        self.fire_fetch(provider, id, false, deps)
     }
 
     fn fire_fetch(
@@ -258,9 +264,9 @@ impl EpisodeSession {
         provider_id: String,
         mint: bool,
         deps: &EpisodeDeps,
-    ) {
+    ) -> bool {
         let Some(canonical) = self.canonical.as_ref() else {
-            return;
+            return false;
         };
         let token = self.generation.bump();
         self.mint_pending = mint;
@@ -287,11 +293,12 @@ impl EpisodeSession {
             // No worker will ever answer; blank beats a stranded spinner.
             self.loading = None;
         }
+        spawned
     }
 
-    fn fire_search(&mut self, provider: String, deps: &EpisodeDeps) {
+    fn fire_search(&mut self, provider: String, deps: &EpisodeDeps) -> bool {
         let Some(canonical) = self.canonical.as_ref() else {
-            return;
+            return false;
         };
         let token = self.generation.bump();
         self.mint_pending = false;
@@ -311,6 +318,7 @@ impl EpisodeSession {
         if !spawned {
             self.loading = None;
         }
+        spawned
     }
 
     /// One hop per call (03 §6.4). `announce` gates the hop toast: the walk's
@@ -336,10 +344,13 @@ impl EpisodeSession {
                 }
                 // A bound hop paints from an unexpired cache like a bound
                 // open; only a fresh tier-A key must go to the network.
-                if bind.is_some() {
-                    self.fire_fetch(provider, id, true, deps);
+                let running = if bind.is_some() {
+                    self.fire_fetch(provider.clone(), id, true, deps)
                 } else {
-                    self.open_bound(provider, id, deps);
+                    self.open_bound(provider.clone(), id, deps)
+                };
+                if !running {
+                    fb.extend(self.hop_unreachable(provider));
                 }
                 fb
             }
@@ -350,7 +361,9 @@ impl EpisodeSession {
                         provider: provider.clone(),
                     });
                 }
-                self.fire_search(provider, deps);
+                if !self.fire_search(provider.clone(), deps) {
+                    fb.extend(self.hop_unreachable(provider));
+                }
                 fb
             }
             Err(Exhausted::Continue(cont)) => {
@@ -377,6 +390,25 @@ impl EpisodeSession {
                 }
                 vec![Feedback::DeadEnd]
             }
+        }
+    }
+
+    /// A hop whose worker never started: no event will ever advance the walk,
+    /// so clear it instead of leaving it dangling. A pin flip surfaces this
+    /// as its own DESIGN 4.10 row (`couldn't reach {provider}`, freeze
+    /// parity: the walk could not even run, distinct from ran-and-missed);
+    /// other origins stay silent, matching the fire_* spawn-fail policy.
+    fn hop_unreachable(&mut self, provider: String) -> Vec<Feedback> {
+        let origin = self.walk.as_ref().map(Walk::origin);
+        self.walk = None;
+        self.walk_provider = None;
+        if origin == Some(WalkOrigin::PinFlip) {
+            vec![Feedback::PinUnreachable { provider }]
+        } else {
+            if self.episodes.is_empty() {
+                self.no_source = true;
+            }
+            Vec::new()
         }
     }
 
@@ -456,10 +488,17 @@ impl EpisodeSession {
             return Vec::new();
         }
         self.loading = None;
-        let mut fb = vec![Feedback::Fail {
-            provider: provider.to_string(),
-            class,
-        }];
+        let mut fb = Vec::new();
+        // Unsupported is silent here for the same reason as in the search
+        // arm: a capability gap is routine, not a failure the user must see.
+        // Unreachable today (every provider implements episodes), kept
+        // symmetric so a future provider can't regress the copy.
+        if class != FetchClass::Unsupported {
+            fb.push(Feedback::Fail {
+                provider: provider.to_string(),
+                class,
+            });
+        }
         // Transient failure: no absence mark (03 §4.3), just the next hop.
         fb.extend(self.fail_over(provider, deps));
         fb

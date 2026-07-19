@@ -763,6 +763,10 @@ impl App {
                     self.toasts.push(Kind::Warn, &copy, now);
                 }
                 Feedback::DeadEnd => self.toasts.push(Kind::Error, "no source found", now),
+                Feedback::PinUnreachable { provider } => {
+                    let copy = format!("couldn't reach {}", self.display_name(&provider));
+                    self.toasts.push(Kind::Warn, &copy, now);
+                }
                 Feedback::PinSet { provider } => {
                     let copy = format!("pinned to {}", self.display_name(&provider));
                     self.toasts.push(Kind::Success, &copy, now);
@@ -1997,6 +2001,45 @@ mod tests {
         let before = app.store.get_provider_pin(1).unwrap();
         app.tick(ch('v'), t1, &tx);
         assert_eq!(app.store.get_provider_pin(1).unwrap(), before);
+    }
+
+    /// Pins the USER-VISIBLE copy for the two pin-walk failure rows, which
+    /// are distinct events (DESIGN 4.10): ran-and-missed vs could-not-run.
+    #[test]
+    fn pin_flip_miss_toasts_the_pin_kept_copy() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into()])),
+            teststub::StubProvider::new("senshi"),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "pinkept-e2e",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        // v pins serving megaplay; v again flips to senshi, whose search
+        // fails and misses.
+        press(&mut app, &tx, t1, &[ch('v'), ch('v')]);
+        settle_feed(&mut app, &tx, &rx, t1);
+        let text = rendered(&mut app, 110, 32);
+        assert!(text.contains("no match on senshi, pin kept"), "{text}");
+        assert_eq!(
+            app.store.get_provider_pin(1).unwrap().as_deref(),
+            Some("senshi"),
+            "the miss keeps the pin"
+        );
+
+        // The could-not-run sibling maps to its own distinct copy.
+        app.apply_episode_feedback(
+            vec![Feedback::PinUnreachable {
+                provider: "senshi".into(),
+            }],
+            t1,
+        );
+        let text = rendered(&mut app, 110, 32);
+        assert!(text.contains("couldn't reach senshi"), "{text}");
     }
 
     #[test]
