@@ -7,6 +7,7 @@
 //! body from ROD-439 without touching the loop.
 
 pub mod clock;
+pub mod covers;
 pub mod event;
 pub mod workers;
 

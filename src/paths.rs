@@ -9,6 +9,7 @@ pub const APP_SEGMENT: &str = "sabigoku";
 pub const DB_FILE: &str = "sabigoku.db";
 pub const CONFIG_FILE: &str = "config.toml";
 pub const AUTH_FILE: &str = "auth.toml";
+pub const COVERS_SEGMENT: &str = "covers";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -63,6 +64,10 @@ impl Paths {
 
     pub fn db_file(&self) -> PathBuf {
         self.data.join(DB_FILE)
+    }
+
+    pub fn covers_dir(&self) -> PathBuf {
+        self.cache.join(COVERS_SEGMENT)
     }
 
     /// Best-effort mkdir -p on all four dirs; real failure surfaces on open (06 §1).
@@ -171,6 +176,7 @@ mod tests {
             p.db_file(),
             PathBuf::from("/h/.local/share/sabigoku/sabigoku.db")
         );
+        assert_eq!(p.covers_dir(), PathBuf::from("/h/.cache/sabigoku/covers"));
     }
 
     #[test]
