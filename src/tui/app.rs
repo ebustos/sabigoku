@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Block;
 use ratatui_image::picker::Picker;
 
+use crate::aniskip::SkipMode;
 use crate::config::Config;
 use crate::domain::{self, TitleLanguage, Translation};
 use crate::paths::Paths;
@@ -33,7 +34,7 @@ use super::covers::render::ProtocolPool;
 use super::episodes::{EpisodeDeps, Feedback};
 use super::event::{Event, EventTx, FetchClass, PlayFailure};
 use super::layout;
-use super::playback::{PlayFeedback, PlayRequest, PlaybackDeps, PlaybackSession};
+use super::playback::{HopAsk, PlayFeedback, PlayRequest, PlaybackDeps, PlaybackSession};
 use super::render;
 use super::theme::{self, Palette};
 use super::toast::{Kind, Toasts};
@@ -84,9 +85,7 @@ pub struct App {
     registry: Arc<ProviderRegistry>,
     caches: Arc<CoverCaches>,
     covers_dir: PathBuf,
-    /// mpv IPC socket dir (paths.runtime); held so play fires stay
-    /// path-agnostic of the Paths type.
-    socket_dir: PathBuf,
+    play_dirs: PlayDirs,
     pub(super) pool: ProtocolPool,
     pub(super) encode_drain: Drain,
 }
@@ -135,7 +134,10 @@ impl App {
             registry,
             caches: Arc::new(CoverCaches::new()),
             covers_dir: paths.covers_dir(),
-            socket_dir: paths.runtime.clone(),
+            play_dirs: PlayDirs {
+                socket: paths.runtime.clone(),
+                cache: paths.cache.clone(),
+            },
             pool,
             encode_drain,
         };
@@ -625,7 +627,13 @@ impl App {
                 let Some(aid) = self.confirm_delete.take() else {
                     return;
                 };
-                // The currently-playing refusal joins with playback (chunk 6).
+                // ROD-220: the currently-playing show refuses the cascade;
+                // the confirm is already disarmed (freeze parity).
+                if self.playback.playing_aid() == Some(aid) {
+                    self.toasts
+                        .push(Kind::Warn, "can't delete, currently playing", now);
+                    return;
+                }
                 let _ = self.store.delete_show(aid);
                 // A stale undo pointing at the deleted row is cleared.
                 if self.undo.map(|(a, _, _)| a) == Some(aid) {
@@ -1028,6 +1036,7 @@ impl App {
                 self.resume_demote = None;
             }
         }
+        self.maybe_continue_play(now, tx);
         self.dirty = true;
     }
 
@@ -1102,7 +1111,25 @@ impl App {
         if !session.is_for(aid) || !session.has_grid() {
             return;
         }
+        let cursor = session.cursor();
+        self.fire_play_at(aid, cursor, false, now, tx);
+    }
+
+    /// One play fire off the engaged session's grid: `ix` is the 0-based
+    /// cell. `continued` keeps the walk's continuation armed (03 §6.4); a
+    /// user-driven fire supersedes it inside the session.
+    fn fire_play_at(&mut self, aid: i64, ix: usize, continued: bool, now: Instant, tx: &EventTx) {
+        let Some(entry) = self.detail.shown() else {
+            return;
+        };
+        if entry.anilist_id != aid {
+            return;
+        }
+        let session = &self.detail.episodes;
         let Some(serving) = session.serving() else {
+            return;
+        };
+        let Some(episode_label) = session.grid().get(ix).cloned() else {
             return;
         };
         // The serving grid minted its binding before caching (ROD-327), so a
@@ -1117,9 +1144,7 @@ impl App {
             return;
         };
         let provider = serving.to_string();
-        let cursor = session.cursor();
-        let episode_label = session.grid()[cursor].clone();
-        let episode_ix = cursor as u32 + 1;
+        let episode_ix = ix as u32 + 1;
         // Finale = last playable episode: the aired count clamps an airing
         // show's grid so an unaired tail never blocks `all caught up`.
         let playable = detail::aired_count(entry).map_or(session.grid().len() as u32, |a| {
@@ -1135,27 +1160,30 @@ impl App {
                 TitleLanguage::parse(&self.config.title_language),
             )
         );
+        let request = PlayRequest {
+            anilist_id: aid,
+            provider,
+            provider_id,
+            episode_label,
+            mal_id: entry.mal_id,
+            episode_ix,
+            finale,
+            title,
+        };
         let fb = {
             let deps = playback_deps(
                 &self.store,
                 &self.registry,
                 &self.config,
-                &self.socket_dir,
+                &self.play_dirs,
                 tx,
                 now,
             );
-            self.playback.fire(
-                PlayRequest {
-                    anilist_id: aid,
-                    provider,
-                    provider_id,
-                    episode_label,
-                    episode_ix,
-                    finale,
-                    title,
-                },
-                &deps,
-            )
+            if continued {
+                self.playback.fire_continued(request, &deps)
+            } else {
+                self.playback.fire(request, &deps)
+            }
         };
         self.apply_play_feedback(fb, now);
     }
@@ -1172,7 +1200,7 @@ impl App {
             &self.store,
             &self.registry,
             &self.config,
-            &self.socket_dir,
+            &self.play_dirs,
             tx,
             now,
         );
@@ -1188,8 +1216,8 @@ impl App {
     }
 
     /// Terminal play outcome: session settles the writes, then a recorded
-    /// finish fans out (grid progress refresh, history reload) so every
-    /// surface agrees with the store.
+    /// finish fans out (grid progress refresh, history reload), and a
+    /// hop-eligible failure walks to a sibling (03 §6.4).
     fn on_play_finished(
         &mut self,
         anilist_id: i64,
@@ -1199,20 +1227,20 @@ impl App {
         now: Instant,
         tx: &EventTx,
     ) {
-        let (fb, recorded) = {
+        let out = {
             let deps = playback_deps(
                 &self.store,
                 &self.registry,
                 &self.config,
-                &self.socket_dir,
+                &self.play_dirs,
                 tx,
                 now,
             );
             self.playback
                 .on_finished(anilist_id, position, failure, token, &deps)
         };
-        self.apply_play_feedback(fb, now);
-        if let Some(rec) = recorded {
+        self.apply_play_feedback(out.feedback, now);
+        if let Some(rec) = out.recorded {
             {
                 let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
                 self.detail.episodes.on_play_recorded(
@@ -1224,7 +1252,75 @@ impl App {
             }
             self.reload_history(now);
         }
+        if let Some(ask) = out.hop {
+            self.on_play_hop(ask, now, tx);
+        }
         self.dirty = true;
+    }
+
+    /// Fail the episode session over for a hop-eligible play failure, then
+    /// try the continuation at once: a cache-hit hop lands synchronously and
+    /// never produces an episode event to ride.
+    fn on_play_hop(&mut self, ask: HopAsk, now: Instant, tx: &EventTx) {
+        let session = &self.detail.episodes;
+        // The target left the screen, or the user re-routed mid-play: the
+        // walk has nothing to rescue.
+        if !session.is_for(ask.anilist_id)
+            || session.serving() != ask.tried.last().map(String::as_str)
+        {
+            self.playback.drop_continuation();
+            return;
+        }
+        let fb = {
+            let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+            self.detail
+                .episodes
+                .play_fail_over(&ask.tried, (ask.label, ask.ordinal), &deps)
+        };
+        self.apply_episode_feedback(fb, now);
+        self.maybe_continue_play(now, tx);
+    }
+
+    /// The play-continuation consumer (03 §6.4): once the walk lands a
+    /// sibling grid, remap the in-progress episode (exact raw label, else
+    /// 1-based ordinal) and relaunch. Runs after every episode event and
+    /// after the synchronous hop path; a walk still in flight just waits.
+    fn maybe_continue_play(&mut self, now: Instant, tx: &EventTx) {
+        if self.playback.is_playing() {
+            return;
+        }
+        let Some(cont) = self.playback.continuation() else {
+            return;
+        };
+        let aid = cont.anilist_id;
+        let session = &self.detail.episodes;
+        let translation = Translation::parse(&self.config.translation).unwrap_or(Translation::Sub);
+        if !session.is_for(aid) || cont.translation != translation || session.no_source() {
+            self.playback.drop_continuation();
+            return;
+        }
+        if session.loading().is_some() {
+            return;
+        }
+        let Some(serving) = session.serving() else {
+            return;
+        };
+        if cont.tried.iter().any(|t| t == serving) {
+            // Nothing in flight and the grid still belongs to a burned
+            // provider: the walk could not move, retire the continuation.
+            self.playback.drop_continuation();
+            return;
+        }
+        let Some(ix) = domain::map_episode_index(session.grid(), &cont.label, cont.ordinal) else {
+            // Remap miss stops the play continuation (03 §7); the label is
+            // provider text, stripped before it touches a toast.
+            let raw: String = cont.label.chars().filter(|c| !c.is_control()).collect();
+            let copy = format!("episode {raw} not found on {}", self.display_name(serving));
+            self.playback.drop_continuation();
+            self.toasts.push(Kind::Error, &copy, now);
+            return;
+        };
+        self.fire_play_at(aid, ix, true, now, tx);
     }
 
     /// Playback outcomes to the DESIGN 4.10 play rows.
@@ -1602,7 +1698,7 @@ fn playback_deps<'a>(
     store: &'a Store,
     registry: &'a Arc<ProviderRegistry>,
     config: &'a Config,
-    socket_dir: &'a std::path::Path,
+    dirs: &'a PlayDirs,
     tx: &'a EventTx,
     now: Instant,
 ) -> PlaybackDeps<'a> {
@@ -1611,12 +1707,21 @@ fn playback_deps<'a>(
         registry,
         tx,
         mpv_path: &config.mpv_path,
-        socket_dir,
+        socket_dir: &dirs.socket,
+        cache_dir: &dirs.cache,
         resume_offset_sec: config.resume_offset_sec,
         translation: Translation::parse(&config.translation).unwrap_or(Translation::Sub),
+        skip_mode: SkipMode::parse(&config.skip_mode),
         unix_now: unix_now(),
         now,
     }
+}
+
+/// The playback dirs (paths.runtime for the IPC socket, paths.cache for
+/// skip.lua), bundled so `playback_deps` stays one disjoint borrow.
+struct PlayDirs {
+    socket: PathBuf,
+    cache: PathBuf,
 }
 
 #[cfg(test)]
@@ -2847,6 +2952,164 @@ mod tests {
             1,
             "the record still lands for show 1"
         );
+    }
+
+    /// Settle every worker family INCLUDING playback, applying events as
+    /// they land so hop chains (fail → walk → land → relaunch) run to rest.
+    fn settle_play(app: &mut App, tx: &EventTx, rx: &super::super::event::EventRx, now: Instant) {
+        loop {
+            assert!(app.detail.drain(Duration::from_secs(5)));
+            assert!(app.playback.drain(Duration::from_secs(5)));
+            let Ok(ev) = rx.try_recv() else { break };
+            app.tick(ev, now, tx);
+        }
+    }
+
+    #[test]
+    fn failed_play_hops_relaunches_and_dead_ends_without_ping_pong() {
+        // Both providers list episodes; every resolve fails (stub answers
+        // Unsupported). The chain must be: play megaplay → fail → hop →
+        // senshi grid lands → auto-relaunch → fail → dead end. One shot per
+        // provider: no ping-pong back to megaplay.
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into(), "3".into()])),
+            teststub::StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into(), "3".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "play-hop",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        assert_eq!(app.detail.episodes.serving(), Some("megaplay"));
+        app.tick(ch('j'), t1, &tx);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        settle_play(&mut app, &tx, &rx, t1);
+
+        assert_eq!(
+            app.detail.episodes.serving(),
+            Some("senshi"),
+            "the walk landed the sibling grid"
+        );
+        assert_eq!(
+            app.detail.episodes.cursor(),
+            1,
+            "hop landing kept the cursor on the in-progress episode"
+        );
+        assert!(!app.playback.is_playing(), "the relaunch also failed");
+        assert!(
+            app.playback.continuation().is_none(),
+            "dead end retires the continuation"
+        );
+        let text = rendered(&mut app, 110, 32);
+        assert!(text.contains("trying senshi…"), "{text}");
+        assert!(text.contains("playback failed"), "{text}");
+        assert!(app.store.list_history().unwrap().is_empty(), "no writes");
+    }
+
+    #[test]
+    fn player_side_failure_never_hops() {
+        let (mut app, tx, rx, now) = play_harness("play-nohop");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        let token = app.playback.active_token().unwrap();
+        discard_worker_finish(&mut app, &rx);
+        app.tick(
+            Event::PlayFinished {
+                anilist_id: 1,
+                position: None,
+                failure: Some(PlayFailure::MpvNotFound),
+                token,
+            },
+            t1,
+            &tx,
+        );
+        settle_play(&mut app, &tx, &rx, t1);
+        assert_eq!(
+            app.detail.episodes.serving(),
+            Some("megaplay"),
+            "no walk fired for a player-side failure"
+        );
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("mpv not found · install mpv"), "{text}");
+    }
+
+    #[test]
+    fn continuation_remap_miss_toasts_and_stops() {
+        // The sibling grid has different labels AND fewer episodes than the
+        // played ordinal, so both remap tiers miss (03 §6.6).
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into(), "3".into()])),
+            teststub::StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(Ok(vec!["A".into(), "B".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "play-remapmiss",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(ch('G'), t1, &tx); // episode 3
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        settle_play(&mut app, &tx, &rx, t1);
+
+        assert_eq!(app.detail.episodes.serving(), Some("senshi"));
+        assert!(!app.playback.is_playing(), "no relaunch on a remap miss");
+        assert!(app.playback.continuation().is_none());
+        let text = rendered(&mut app, 110, 32);
+        assert!(text.contains("episode 3 not found on senshi"), "{text}");
+    }
+
+    #[test]
+    fn delete_refuses_the_currently_playing_show() {
+        let (mut app, tx, rx, now) = play_harness("play-delrefuse");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        let token = app.playback.active_token().unwrap();
+        discard_worker_finish(&mut app, &rx);
+        // A partial record puts the show in History while mpv still runs.
+        app.store
+            .save_progress(
+                1,
+                Translation::Sub,
+                "1",
+                30.0,
+                1400.0,
+                Some("megaplay"),
+                100,
+            )
+            .unwrap();
+        app.store.record_play(1, 1, false, 100).unwrap();
+        app.tick(ch('H'), t1, &tx);
+        press(&mut app, &tx, t1, &[ch('X'), ch('y')]);
+        assert!(
+            !app.store.list_history().unwrap().is_empty(),
+            "the playing show survives"
+        );
+        assert!(app.confirm_delete.is_none(), "refusal still disarms");
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("can't delete, currently playing"), "{text}");
+
+        // Once the play finishes, the same delete goes through.
+        app.tick(
+            Event::PlayFinished {
+                anilist_id: 1,
+                position: None,
+                failure: None,
+                token,
+            },
+            t1,
+            &tx,
+        );
+        press(&mut app, &tx, t1, &[ch('X'), ch('y')]);
+        assert!(app.store.list_history().unwrap().is_empty());
     }
 
     #[test]

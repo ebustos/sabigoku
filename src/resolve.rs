@@ -390,6 +390,14 @@ impl Walk {
         self.origin
     }
 
+    /// Mark a provider tried post-construction. The play continuation
+    /// (03 §6.4) keeps its walk's memory across relaunches: every provider
+    /// that already failed a play stays skipped in the successor walk, or a
+    /// two-provider registry would ping-pong between the same pair forever.
+    pub fn mark_tried(&mut self, provider: &str) {
+        self.tried |= mark(&self.providers, Some(provider));
+    }
+
     /// Skip-mask read that can never overflow the shift. A provider past
     /// `MAX_TRACKED_PROVIDERS` is simply not skip-tracked (visited rather than
     /// aliased onto an earlier bit); the constructors `debug_assert` the
@@ -869,6 +877,25 @@ mod tests {
             })
         );
         // Nothing left → dead-end.
+        assert_eq!(walk.advance(&w), Err(Exhausted::DeadEnd));
+    }
+
+    #[test]
+    fn mark_tried_skips_extra_providers_for_a_continuation_walk() {
+        // Play continuation (03 §6.4): megaplay and senshi already burned a
+        // play each; the successor walk must go straight to allanime.
+        let c = canon(1);
+        let w = FakeWorld::new(&REG).key("senshi", 1, "s-key");
+        let mut walk = Walk::fallback(&w, c, Some("megaplay"));
+        walk.mark_tried("senshi");
+        walk.mark_tried("not-registered"); // no-op, never a panic
+        assert_eq!(
+            walk.advance(&w),
+            Ok(Hop::Search {
+                provider: "allanime".into(),
+                anilist_id: 1
+            })
+        );
         assert_eq!(walk.advance(&w), Err(Exhausted::DeadEnd));
     }
 

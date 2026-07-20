@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::aniskip::{self, SkipMode};
 use crate::domain::{Quality, Translation};
 use crate::error::Error;
 use crate::player::{self, PlayError, PlayOpts, PlayerEvent, Position};
@@ -268,11 +269,17 @@ pub struct PlaySpec {
     pub provider: String,
     pub provider_id: String,
     pub episode_label: String,
+    /// 1-based; the AniSkip ordinal fallback (03 §9).
+    pub episode_ix: u32,
     pub translation: Translation,
     pub title: String,
     pub start_secs: f64,
     pub mpv_path: String,
     pub socket_dir: PathBuf,
+    /// AniSkip inputs (03 §9): MAL key, config mode, skip.lua home.
+    pub mal_id: Option<i64>,
+    pub skip_mode: SkipMode,
+    pub cache_dir: PathBuf,
     pub token: u64,
 }
 
@@ -298,11 +305,15 @@ pub fn spawn_play(
             provider,
             provider_id,
             episode_label,
+            episode_ix,
             translation,
             title,
             start_secs,
             mpv_path,
             socket_dir,
+            mal_id,
+            skip_mode,
+            cache_dir,
             token,
         } = spec;
         // A retired name can only arrive through a stale binding row.
@@ -315,11 +326,20 @@ pub fn spawn_play(
             });
             return;
         };
+        // AniSkip prepared once, before the attempts (04 §7.8); best-effort,
+        // a miss is a plain play.
+        let skip = aniskip::prepare(
+            mal_id,
+            aniskip::episode_number(&episode_label, episode_ix),
+            skip_mode,
+            &cache_dir,
+        );
         let opts = PlayOpts {
             mpv_path: &mpv_path,
             socket_dir: &socket_dir,
             title: &title,
             start_secs,
+            skip: skip.as_ref(),
         };
         let bridge = PositionBridge {
             tx: tx.clone(),
@@ -762,11 +782,15 @@ mod tests {
                 provider: "gone".into(),
                 provider_id: "x".into(),
                 episode_label: "1".into(),
+                episode_ix: 1,
                 translation: Translation::Sub,
                 title: "t".into(),
                 start_secs: 0.0,
                 mpv_path: "mpv".into(),
                 socket_dir: PathBuf::from("/tmp"),
+                mal_id: None,
+                skip_mode: SkipMode::None,
+                cache_dir: PathBuf::from("/tmp"),
                 token: 9,
             },
         ));

@@ -661,6 +661,34 @@ impl EpisodeSession {
         self.advance_walk(true, deps)
     }
 
+    /// Play-fallback hop (03 §6.4): a failed play walks to a sibling exactly
+    /// like a failed listing, except no absence is marked (a transient play
+    /// failure says nothing about stock) and the walk inherits every provider
+    /// the continuation already burned. Single-flight: a live fetch or walk
+    /// wins and the ask is dropped. `remap` keeps the cursor on the
+    /// in-progress episode across the hop landing (05 §10.5).
+    pub fn play_fail_over(
+        &mut self,
+        tried: &[String],
+        remap: (String, u32),
+        deps: &EpisodeDeps,
+    ) -> Vec<Feedback> {
+        if self.loading.is_some() || self.walk.is_some() {
+            return Vec::new();
+        }
+        let Some(canonical) = self.canonical.clone() else {
+            return Vec::new();
+        };
+        let mut walk = Walk::fallback(&deps.world(), canonical, None);
+        for provider in tried {
+            walk.mark_tried(provider);
+        }
+        self.remap_from = Some((remap.0, remap.1));
+        self.walk_provider = None;
+        self.walk = Some(walk);
+        self.advance_walk(true, deps)
+    }
+
     /// Post-play refresh (05 §11, DESIGN 4.6): a recorded finish re-derives
     /// the watched high-water and resume point from the store. A completed
     /// watch advances the cursor off the played cell, but only when it still

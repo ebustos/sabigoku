@@ -1055,6 +1055,8 @@ state.now` escalation.
 | Provider pin: store write failed | the pin write errors on set or clear | error | `couldn't save the provider pin` / `couldn't clear the provider pin` | no |
 | Resolve walk exhausted | every provider tried or skipped, no grid landed (§4.6 `no source` state) | error | `no source found` | no |
 | Forced-preferred miss | the §5.3 stale-stamp probe missed; the K-2 continuation walk begins | warn | `no match on {provider}` (distinct from the pin-kept copy by law) | no |
+| Play continuation: remap miss | a play-fallback hop landed a sibling grid without the in-progress episode (exact raw label, else 1-based ordinal); play continuation stops, the walk's toasts already ran (03 §6.4/§7, ROD-439) | error | `episode {raw} not found on {provider}` (`{raw}` is provider text, control-stripped) | no |
+| Delete refused: playing | `y` on an armed delete while that show is the live playback (ROD-220); the confirm disarms, nothing is deleted | warn | `can't delete, currently playing` (freeze copy) | no |
 
 Copy: single line, lowercase, no terminal punctuation; status, not prose, and
 within the §4.7 36-column copy budget (the box is 40 cols incl. the 4-col glyph

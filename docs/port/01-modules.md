@@ -80,7 +80,7 @@ this table is law:
 | `anilist` | domain, source, util |
 | `auth` | paths |
 | `sync` | anilist, auth, domain, store |
-| `aniskip` | providers/jikan, player, paths |
+| `aniskip` | providers/http, player. No jikan module (ratified lean, ROD-439): AniList supplies `mal_id` on the canonical path, absent id = no skip; the freeze's Jikan title-lookup fallback is not ported. Cache dir is passed in (paths stays a leaf import for callers). |
 | `config` | domain, paths |
 | `tui/workers` | source, store, player, resolver, anilist (the one glue point) |
 

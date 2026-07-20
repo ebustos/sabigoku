@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sabigoku::aniskip;
 use sabigoku::config::Config;
 use sabigoku::domain::{Enrichment, Quality, Translation};
 use sabigoku::paths::Paths;
@@ -168,6 +169,18 @@ fn run() -> Result<(), Err> {
     let paths = Paths::resolve()?;
     paths.ensure_dirs();
 
+    // AniSkip once before the attempts, worker-shape parity (04 §7.8);
+    // best-effort, a miss plays plain.
+    let skip = aniskip::prepare(
+        args.mal,
+        aniskip::episode_number(&label, episode_index),
+        aniskip::SkipMode::parse(&config.skip_mode),
+        &paths.cache,
+    );
+    if let Some(s) = &skip {
+        println!("aniskip: {}", s.opts);
+    }
+
     let (event_tx, event_rx) = mpsc::channel::<PlayerEvent>();
     let title = format!("{} · {label}", hit.title);
     let provider_id = hit.provider_id.clone();
@@ -178,6 +191,7 @@ fn run() -> Result<(), Err> {
             socket_dir: &paths.runtime,
             title: &title,
             start_secs,
+            skip: skip.as_ref(),
         };
         let on_event = move |event| {
             let _ = event_tx.send(event);
