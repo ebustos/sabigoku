@@ -316,6 +316,28 @@ fn present(s: Option<&str>) -> Option<&str> {
 
 /// Primary title under pref (ROD-205, DESIGN §9.1a); romaji is the universal
 /// backstop. Empty romaji is still returned last; render may show a placeholder.
+/// Drop terminal-hostile codepoints from untrusted free text before it can
+/// reach a terminal cell or an argv: C0 + DEL (ROD-247 CLONE) plus C1, bidi
+/// overrides, isolates, and zero-width chars (ratified ROD-435 widening;
+/// zigoku left those open and a TUI has no legitimate use for any of them).
+/// `char::is_control()` covers only Cc; the bidi/zero-width class is Cf and
+/// needs this explicit list (ROD-439 review).
+pub fn strip_controls(s: String) -> String {
+    fn banned(c: char) -> bool {
+        c < '\u{20}'
+            || ('\u{7F}'..='\u{9F}').contains(&c)
+            || ('\u{202A}'..='\u{202E}').contains(&c)
+            || ('\u{2066}'..='\u{2069}').contains(&c)
+            || ('\u{200B}'..='\u{200D}').contains(&c)
+            || c == '\u{FEFF}'
+    }
+    if s.chars().any(banned) {
+        s.chars().filter(|&c| !banned(c)).collect()
+    } else {
+        s
+    }
+}
+
 pub fn preferred_title<'a>(
     romaji: &'a str,
     english: Option<&'a str>,

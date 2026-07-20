@@ -311,7 +311,10 @@ impl PlaybackSession {
                     episode_ix: active.episode_ix,
                     completed,
                 });
-                if completed {
+                // The worker never sends position + failure together;
+                // keep the 4.10 mutual exclusion local anyway so a future
+                // caller cannot double-toast a completed error.
+                if completed && failure.is_none() {
                     out.feedback.push(PlayFeedback::Done {
                         episode_ix: active.episode_ix,
                         finale: active.finale,

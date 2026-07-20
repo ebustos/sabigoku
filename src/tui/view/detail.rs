@@ -681,11 +681,11 @@ fn grid_cell(
 
 /// `[NN]` in a 5-col slot; the resume arrow only fits labels up to 2 columns
 /// (DESIGN 5.3: on wider labels the colour carries resume alone). Labels are
-/// provider-controlled and this is the one edge where they meet the terminal:
-/// control bytes are stripped here so a hostile label cannot smuggle escape
-/// sequences into the buffer (ROD-441 review note).
+/// provider-controlled and this is one edge where they meet the terminal:
+/// hostile codepoints (escapes, bidi, zero-width) are stripped here via the
+/// shared ROD-435 filter (ROD-441 review note; Cf widening ROD-439 review).
 fn cell_text(label: &str, resume: bool) -> String {
-    let clean: String = label.chars().filter(|c| !c.is_control()).collect();
+    let clean = domain::strip_controls(label.to_string());
     let width = render::display_width(&clean);
     let core = if width > 3 {
         render::truncate_to_width(&clean, 3)
@@ -1198,6 +1198,11 @@ mod tests {
         // render edge, never written into the buffer.
         assert_eq!(cell_text("\x1b]0;x\x077", false), "[]0…]");
         assert!(!cell_text("\x1b[31m1", false).contains('\x1b'));
+        // The Cf class (bidi overrides, zero-width) is stripped too; it is
+        // not `is_control()` and needs the ROD-435 filter (final-gate
+        // review reproduced the gap).
+        assert_eq!(cell_text("\u{202E}1", false), "[1]");
+        assert_eq!(cell_text("\u{200B}2\u{FEFF}", false), "[2]");
     }
 
     #[test]

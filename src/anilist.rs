@@ -310,25 +310,7 @@ fn normalize_title(s: &str) -> String {
     String::from_utf8(out).expect("removing whole ascii bytes keeps utf-8 valid")
 }
 
-/// Drop terminal-hostile codepoints from AniList free text before they can
-/// reach terminal cells: C0 + DEL (ROD-247 CLONE) plus C1, bidi overrides,
-/// and zero-width chars (ratified ROD-435 widening; zigoku left those open
-/// and a TUI has no legitimate use for any of them in metadata).
-fn strip_controls(s: String) -> String {
-    fn banned(c: char) -> bool {
-        c < '\u{20}'
-            || ('\u{7F}'..='\u{9F}').contains(&c)
-            || ('\u{202A}'..='\u{202E}').contains(&c)
-            || ('\u{2066}'..='\u{2069}').contains(&c)
-            || ('\u{200B}'..='\u{200D}').contains(&c)
-            || c == '\u{FEFF}'
-    }
-    if s.chars().any(banned) {
-        s.chars().filter(|&c| !banned(c)).collect()
-    } else {
-        s
-    }
-}
+use crate::domain::strip_controls;
 
 fn strip_controls_opt(s: Option<String>) -> Option<String> {
     s.map(strip_controls)

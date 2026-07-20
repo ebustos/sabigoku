@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::domain::StreamLink;
+use crate::domain::{self, StreamLink};
 use crate::fetchguard::{GuardError, guard_fetch_url};
 use crate::proxy::{self, ProxyStartError};
 
@@ -260,7 +260,9 @@ fn build_argv(
     if link.cloaked_segments {
         argv.push("--demuxer-lavf-o=allowed_extensions=ALL".into());
     }
-    let title: String = opts.title.chars().filter(|c| !c.is_control()).collect();
+    // mpv renders this in its own window title/OSD with no framework
+    // backstop, so the full ROD-435 strip applies (bidi/zero-width included).
+    let title = domain::strip_controls(opts.title.to_string());
     if !title.is_empty() {
         argv.push(format!("--force-media-title={title}"));
         // ${media-title} expands mpv-side; the raw title never re-parses.
@@ -552,6 +554,11 @@ mod tests {
 
         let argv = build_argv(&link, &link.url, &opts("\r\n", 0.0), socket).unwrap();
         assert!(!argv.iter().any(|a| a.contains("title")));
+
+        // mpv's own title rendering has no ratatui backstop, so the bidi /
+        // zero-width class must die here too (final-gate review).
+        let argv = build_argv(&link, &link.url, &opts("A\u{202E}B\u{200B}", 0.0), socket).unwrap();
+        assert!(argv.contains(&"--force-media-title=AB".to_string()));
     }
 
     #[test]

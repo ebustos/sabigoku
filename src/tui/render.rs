@@ -233,6 +233,32 @@ pub fn draw_absent_block(
 mod tests {
     use super::*;
 
+    /// List titles (Browse/History/Discover) carry catalog text with no
+    /// app-level strip on the draw path; their safety against hostile
+    /// codepoints is ratatui's own buffer filter (Cc graphemes and width-0
+    /// graphemes are dropped by `set_stringn`). That framework guarantee is
+    /// a real security boundary here, so pin it: a ratatui upgrade that
+    /// stops filtering must fail this test, not silently reopen the hole
+    /// (final-gate review proved the backstop by execution).
+    #[test]
+    fn ratatui_buffer_drops_control_and_zero_width_graphemes() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(
+            0,
+            0,
+            "\u{202E}evil\u{200B}1\x1b[31m",
+            ratatui::style::Style::new(),
+        );
+        let cells: String = (0..20).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(!cells.contains('\u{202E}'), "bidi override reached a cell");
+        assert!(!cells.contains('\u{200B}'), "zero-width reached a cell");
+        assert!(!cells.contains('\x1b'), "escape reached a cell");
+        assert!(cells.contains("evil1"), "printable text still renders");
+    }
+
     #[test]
     fn wrap_breaks_on_words_and_respects_width() {
         let lines = wrap_text("the quick brown fox jumps over the lazy dog", 10);

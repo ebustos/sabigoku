@@ -834,6 +834,14 @@ impl App {
         } else {
             self.open_history_zoom(now, tx);
         }
+        // A cached listing lands synchronously with no episode event to
+        // clear the arm; a stranded arm would let a LATER same-show walk
+        // exhaust (track flip, failed play) spuriously demote (05 §10.6:
+        // only the auto-open's own walk may). The last-watched show's
+        // listing is almost always still cached, so this is the common path.
+        if self.detail.episodes.has_grid() {
+            self.resume_demote = None;
+        }
     }
 
     /// The failed auto-open demotes to the History list (05 §10.6); the walk
@@ -1403,8 +1411,9 @@ impl App {
         }
         let Some(ix) = domain::map_episode_index(session.grid(), &cont.label, cont.ordinal) else {
             // Remap miss stops the play continuation (03 §7); the label is
-            // provider text, stripped before it touches a toast.
-            let raw: String = cont.label.chars().filter(|c| !c.is_control()).collect();
+            // provider text, stripped before it touches a toast (ROD-435
+            // filter: escapes, bidi, zero-width).
+            let raw = domain::strip_controls(cont.label.clone());
             let copy = format!("episode {raw} not found on {}", self.display_name(serving));
             self.playback.drop_continuation();
             self.toasts.push(Kind::Error, &copy, now);
@@ -2354,6 +2363,8 @@ mod tests {
         app.tick(Event::Tick, t1, &tx);
         settle_feed(&mut app, &tx, &rx, t1);
         assert_eq!(app.toasts.iter().count(), 1, "persistent unreachable toast");
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("can't reach AniList"), "{text}");
         // Toast outlives the transient TTL while the outage holds.
         app.tick(Event::Tick, t1 + Duration::from_secs(10), &tx);
         assert_eq!(app.toasts.iter().count(), 1);
@@ -3765,6 +3776,199 @@ mod tests {
         assert_eq!(app.view, View::History);
         assert_eq!(app.pane, Pane::List);
         assert!(!app.detail.episodes.engaged_for(1), "no auto fetch");
+    }
+
+    /// The COMMON landing path: the last-watched show's listing is still in
+    /// episode_cache, so engage lands synchronously with no worker event to
+    /// clear the demote arm (final-gate review finding).
+    #[test]
+    fn cached_landing_clears_the_demote_arm_synchronously() {
+        let registry = teststub::registry(vec![teststub::StubProvider::new("megaplay")]);
+        let unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (mut app, tx, rx, now) = landing_harness("landing-cached", registry, |store| {
+            seed_played(store, 1, "Alpha");
+            let e = Enrichment {
+                anilist_id: 1,
+                title_romaji: "Alpha".into(),
+                ..Enrichment::default()
+            };
+            store.bind_provider(&e, "megaplay", "m-1", unix).unwrap();
+            store
+                .set_episode_cache(
+                    1,
+                    "megaplay",
+                    Translation::Sub,
+                    &["1".into(), "2".into(), "3".into()],
+                    None,
+                    unix,
+                )
+                .unwrap();
+        });
+        app.tick(Event::Resize(100, 30), now, &tx);
+        assert_eq!(app.detail.episodes.grid().len(), 3, "cache-hit landing");
+        assert_eq!(
+            app.resume_demote, None,
+            "a synchronous landing must clear the arm; no event will"
+        );
+        // Regression body: a LATER same-show walk exhaust (track flip, the
+        // stub answers Network) must not demote a landed surface.
+        press(&mut app, &tx, now, &[ch(':'), ch('d'), ch('u'), ch('b')]);
+        app.tick(key(KeyCode::Enter), now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(
+            app.pane,
+            Pane::Detail,
+            "05 §10.6: only the auto-open's own walk demotes"
+        );
+        assert_eq!(app.view, View::History);
+    }
+
+    #[test]
+    fn continuation_drops_on_nav_away_and_translation_flip() {
+        // Both siblings list; every resolve fails, so the first play arms a
+        // continuation and starts the walk toward senshi.
+        let build = || {
+            teststub::registry(vec![
+                teststub::StubProvider::new("megaplay")
+                    .with_key("505")
+                    .with_episodes(Ok(vec!["1".into(), "2".into(), "3".into()])),
+                teststub::StubProvider::new("senshi")
+                    .with_key("505")
+                    .with_episodes(Ok(vec!["1".into(), "2".into(), "3".into()])),
+            ])
+        };
+        // Nav-away: the next selection resets the session; the landed
+        // sibling grid belongs to nobody the continuation knows.
+        let (mut app, tx, rx, now) = harness_full(
+            "cont-navaway",
+            StubCatalog::search_scripted(vec![one_page(2)]),
+            build(),
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        assert!(app.playback.drain(Duration::from_secs(5)));
+        while let Ok(ev) = rx.try_recv() {
+            // Apply ONLY the play failure; leave the walk's fetch in flight.
+            if matches!(ev, Event::PlayFinished { .. }) {
+                app.tick(ev, t1, &tx);
+            }
+        }
+        assert!(
+            app.playback.continuation().is_some(),
+            "armed by the failure"
+        );
+        app.tick(key(KeyCode::Esc), t1, &tx);
+        app.tick(ch('j'), t1, &tx);
+        settle_play(&mut app, &tx, &rx, t1);
+        assert!(
+            app.playback.continuation().is_none(),
+            "nav-away drops the continuation"
+        );
+        assert!(!app.playback.is_playing(), "and nothing relaunched");
+
+        // Translation flip mid-walk: same arming, then :dub before the
+        // sibling grid lands.
+        let (mut app, tx, rx, now) = harness_full(
+            "cont-transflip",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            build(),
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        assert!(app.playback.drain(Duration::from_secs(5)));
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, Event::PlayFinished { .. }) {
+                app.tick(ev, t1, &tx);
+            }
+        }
+        assert!(app.playback.continuation().is_some());
+        press(&mut app, &tx, t1, &[ch(':'), ch('d'), ch('u'), ch('b')]);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        settle_play(&mut app, &tx, &rx, t1);
+        assert!(
+            app.playback.continuation().is_none(),
+            "a sub continuation must not relaunch on the dub track"
+        );
+        assert!(!app.playback.is_playing());
+    }
+
+    #[test]
+    fn ctrl_c_skips_a_dirty_settings_persist_and_fkey_leave_saves() {
+        let (mut app, tx, now) = sized("settings-ctrlc", 100, 32);
+        std::fs::create_dir_all(app.config_file.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&app.config_file);
+        app.tick(ch('S'), now, &tx);
+        press(&mut app, &tx, now, &[ch('j'), ch('l')]);
+        assert!(app.settings.dirty);
+        app.tick(
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            now,
+            &tx,
+        );
+        assert!(app.quit);
+        assert!(
+            !app.config_file.exists(),
+            "the emergency exit never persists"
+        );
+
+        // The F-key leave routes through the same persist as the letters.
+        let (mut app, tx, now) = sized("settings-fkey", 100, 32);
+        std::fs::create_dir_all(app.config_file.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&app.config_file);
+        app.tick(ch('S'), now, &tx);
+        press(&mut app, &tx, now, &[ch('j'), ch('l')]);
+        app.tick(key(KeyCode::F(1)), now, &tx);
+        assert_eq!(app.view, View::Browse);
+        assert_eq!(Config::load(&app.config_file).default_quality, "worst");
+        std::fs::remove_file(&app.config_file).ok();
+    }
+
+    /// Copy-pins for the §4.10 rows that only had variant-level coverage
+    /// (final-gate review): the rendered string is the contract.
+    #[test]
+    fn episode_toast_copy_covers_the_remaining_matrix_rows() {
+        let (mut app, _tx, now) = harness("episode-copy");
+        let cases: Vec<(Feedback, &str)> = vec![
+            (
+                Feedback::Fail {
+                    provider: "megaplay".into(),
+                    class: FetchClass::Http,
+                },
+                "megaplay returned an error",
+            ),
+            (
+                Feedback::Fail {
+                    provider: "megaplay".into(),
+                    class: FetchClass::Data,
+                },
+                "couldn't load episodes",
+            ),
+            (
+                Feedback::NoMatch {
+                    provider: "senshi".into(),
+                },
+                "no match on senshi",
+            ),
+            (Feedback::PinPending, "still resolving, try again shortly"),
+            (Feedback::PinNothing, "no source: nothing to pin"),
+            (
+                Feedback::PinSaveFailed { clearing: false },
+                "couldn't save the provider pin",
+            ),
+            (
+                Feedback::PinSaveFailed { clearing: true },
+                "couldn't clear the provider pin",
+            ),
+        ];
+        for (feedback, copy) in cases {
+            app.apply_episode_feedback(vec![feedback], now);
+            let text = rendered(&mut app, 100, 30);
+            assert!(text.contains(copy), "expected {copy:?} in {text}");
+            app.toasts = Toasts::default();
+        }
     }
 
     #[test]
