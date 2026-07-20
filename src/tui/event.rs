@@ -8,15 +8,49 @@ use std::time::Duration;
 use image::DynamicImage;
 use ratatui::crossterm::event::{self as ct, KeyEvent};
 
+use crate::domain::Enrichment;
+use crate::player::Position;
+use crate::providers::{DiscoverAxis, ProviderError, SearchHit};
+
 use super::workers::{CancelFlag, Drain};
 
-/// One demo grid card (ROD-438 shell); the real DiscoverState rows replace
-/// this in ROD-439.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DemoCard {
-    pub anilist_id: i64,
-    pub title: String,
-    pub cover_url: Option<String>,
+/// Provider failure classes as event payload; the toast copy mapping lives in
+/// `failure_class_copy` (app.rs, DESIGN 4.10). `Unsupported` earns no toast:
+/// a search-less provider inside a walk is routine, not a failure the user
+/// must see (03 §8.1: it must not poison absence either).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchClass {
+    Network,
+    Blocked,
+    Down,
+    Http,
+    Data,
+    Unsupported,
+}
+
+impl From<&ProviderError> for FetchClass {
+    fn from(e: &ProviderError) -> FetchClass {
+        match e {
+            ProviderError::Network => FetchClass::Network,
+            ProviderError::Forbidden { .. } => FetchClass::Blocked,
+            ProviderError::Server { .. } => FetchClass::Down,
+            ProviderError::Http { .. } => FetchClass::Http,
+            ProviderError::Decode(_) => FetchClass::Data,
+            ProviderError::Unsupported => FetchClass::Unsupported,
+        }
+    }
+}
+
+/// Play failure classes as event payload (04 §4.5); copy mapping lives in
+/// `play_failure_copy` (app.rs, DESIGN 4.10). `Internal` is the residual
+/// non-HTTP, non-mpv bucket behind the `playback failed` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayFailure {
+    MpvNotFound,
+    MpvFailed,
+    OpenFailed,
+    Resolve(FetchClass),
+    Internal,
 }
 
 /// No `Eq`: cover events carry pixel payloads (`DynamicImage` is `PartialEq`
@@ -52,12 +86,77 @@ pub enum Event {
     /// the pool's own channel (ratatui-image types are not comparable, so
     /// they stay out of this enum); tick applies it on the UI thread.
     CoverEncodeReady,
-    /// Demo feed for the ROD-438 shell grid; DiscoverFeed replaces it (439).
-    DemoFeedLoaded {
-        cards: Vec<DemoCard>,
+    /// One feed page (04 §4.2). Files into the axis slot; an out-of-order
+    /// page is discarded by the slot logic, never by a generation token.
+    DiscoverFeed {
+        axis: DiscoverAxis,
+        page: u32,
+        entries: Vec<Enrichment>,
+        has_next: bool,
     },
-    DemoFeedFailed {
+    DiscoverFeedError {
+        axis: DiscoverAxis,
         cause: String,
+    },
+    /// Browse catalogue search page (04 §4.2). Stale if `query` no longer
+    /// matches the live buffer; the token is the query string itself.
+    SearchDone {
+        query: String,
+        page: u32,
+        results: Vec<Enrichment>,
+    },
+    SearchFailed {
+        query: String,
+        cause: String,
+    },
+    /// Provider episode listing (04 §4.2). `token` is the episode session's
+    /// generation: every fire supersedes, so only the latest token applies.
+    EpisodesDone {
+        anilist_id: i64,
+        provider: String,
+        provider_id: String,
+        episodes: Vec<String>,
+        token: u64,
+    },
+    EpisodesError {
+        anilist_id: i64,
+        provider: String,
+        class: FetchClass,
+        token: u64,
+    },
+    /// Tier-C candidates; scored offline on the UI thread (03 §4.2).
+    ProviderSearchDone {
+        anilist_id: i64,
+        provider: String,
+        hits: Vec<SearchHit>,
+        token: u64,
+    },
+    ProviderSearchError {
+        anilist_id: i64,
+        provider: String,
+        class: FetchClass,
+        token: u64,
+    },
+    /// Observed playback position (04 §4.5), throttled at the worker bridge
+    /// so mpv's per-frame cadence never floods the queue.
+    PlayPosition {
+        anilist_id: i64,
+        position: Position,
+        token: u64,
+    },
+    /// A relaunch is scheduled (04 §7.8); fires before the backoff sleep.
+    PlayRetry {
+        anilist_id: i64,
+        attempt: u32,
+        token: u64,
+    },
+    /// Terminal play outcome. `position` from a run that played, `failure`
+    /// from one that aborted; player.rs guarantees they never co-occur.
+    PlayFinished {
+        anilist_id: i64,
+        position: Option<Position>,
+        failure: Option<PlayFailure>,
+        token: u64,
     },
 }
 

@@ -2193,6 +2193,8 @@ dependencies = [
  "signal-hook",
  "thiserror 2.0.18",
  "toml",
+ "unicode-segmentation",
+ "unicode-width",
  "url",
 ]
 

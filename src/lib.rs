@@ -2,6 +2,7 @@
 //! The import-arrow table there is law; each module states its own edges.
 
 pub mod anilist;
+pub mod aniskip;
 pub mod config;
 pub mod domain;
 pub mod error;

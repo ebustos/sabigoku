@@ -35,6 +35,9 @@ pub const MAX_COVER_DIMENSION: u32 = 2560;
 /// Same id+url (detail) or same url (discover) failure suppress window
 /// (zigoku ROD-110, 04 §8); a url change clears immediately.
 pub const RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+/// Protocol-pool key for the single detail cover; grid slots key by url, and
+/// urls are absolute so they can never collide with this.
+pub const DETAIL_KEY: &str = "detail";
 const FETCH_DEADLINE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

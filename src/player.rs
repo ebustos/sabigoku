@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::domain::StreamLink;
+use crate::domain::{self, StreamLink};
 use crate::fetchguard::{GuardError, guard_fetch_url};
 use crate::proxy::{self, ProxyStartError};
 
@@ -61,6 +61,17 @@ pub struct PlayOpts<'a> {
     pub title: &'a str,
     /// Resume start (03 §6.3.1 rule computed caller-side); emitted only when > 0.
     pub start_secs: f64,
+    /// AniSkip adjunct (03 §9), prepared caller-side; None = plain play.
+    pub skip: Option<&'a SkipScript>,
+}
+
+/// mpv auto-skip wiring: the script path and its `--script-opts` payload.
+/// Both are app-constructed (cache path + formatted floats), never provider
+/// bytes, so they ride argv without the provider-field vetting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkipScript {
+    pub path: PathBuf,
+    pub opts: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -249,7 +260,9 @@ fn build_argv(
     if link.cloaked_segments {
         argv.push("--demuxer-lavf-o=allowed_extensions=ALL".into());
     }
-    let title: String = opts.title.chars().filter(|c| !c.is_control()).collect();
+    // mpv renders this in its own window title/OSD with no framework
+    // backstop, so the full ROD-435 strip applies (bidi/zero-width included).
+    let title = domain::strip_controls(opts.title.to_string());
     if !title.is_empty() {
         argv.push(format!("--force-media-title={title}"));
         // ${media-title} expands mpv-side; the raw title never re-parses.
@@ -258,6 +271,10 @@ fn build_argv(
     argv.push(format!("--input-ipc-server={}", socket.display()));
     if opts.start_secs.is_finite() && opts.start_secs > 0.0 {
         argv.push(format!("--start={}", opts.start_secs));
+    }
+    if let Some(skip) = opts.skip {
+        argv.push(format!("--script={}", skip.path.display()));
+        argv.push(format!("--script-opts={}", skip.opts));
     }
     argv.push(play_url.to_string());
     Ok(argv)
@@ -443,6 +460,7 @@ mod tests {
             socket_dir: Path::new("/run/user/1000/sabigoku"),
             title,
             start_secs: start,
+            skip: None,
         }
     }
 
@@ -536,6 +554,11 @@ mod tests {
 
         let argv = build_argv(&link, &link.url, &opts("\r\n", 0.0), socket).unwrap();
         assert!(!argv.iter().any(|a| a.contains("title")));
+
+        // mpv's own title rendering has no ratatui backstop, so the bidi /
+        // zero-width class must die here too (final-gate review).
+        let argv = build_argv(&link, &link.url, &opts("A\u{202E}B\u{200B}", 0.0), socket).unwrap();
+        assert!(argv.contains(&"--force-media-title=AB".to_string()));
     }
 
     #[test]
@@ -546,6 +569,27 @@ mod tests {
             let argv = build_argv(&link, &link.url, &opts("t", start), socket).unwrap();
             assert!(!argv.iter().any(|a| a.starts_with("--start=")));
         }
+    }
+
+    #[test]
+    fn argv_skip_script_lands_in_table_position() {
+        let link = full_link();
+        let socket = Path::new("/tmp/s.sock");
+        let skip = SkipScript {
+            path: PathBuf::from("/cache/skip.lua"),
+            opts: "aniskip-op_start=12.5,aniskip-mode=both".into(),
+        };
+        let mut o = opts("t", 42.5);
+        o.skip = Some(&skip);
+        let argv = build_argv(&link, &link.url, &o, socket).unwrap();
+        let at = |needle: &str| argv.iter().position(|a| a == needle).unwrap();
+        assert_eq!(
+            at("--script=/cache/skip.lua") + 1,
+            at("--script-opts=aniskip-op_start=12.5,aniskip-mode=both"),
+        );
+        // Table order (03 §6.3.1): aniskip after --start, before the url.
+        assert!(at("--script=/cache/skip.lua") > at("--start=42.5"));
+        assert_eq!(argv.last().unwrap(), &link.url);
     }
 
     #[test]
@@ -793,6 +837,7 @@ mod tests {
             socket_dir: Path::new("/tmp"),
             title: "t",
             start_secs: 0.0,
+            skip: None,
         };
         let err = play(&opts, || Ok(link.clone()), |_| {}).unwrap_err();
         assert!(matches!(err, PlayError::UnsafeUrl(GuardError::BlockedHost)));
@@ -807,6 +852,7 @@ mod tests {
             socket_dir: Path::new("/tmp"),
             title: "t",
             start_secs: 0.0,
+            skip: None,
         };
         // Spawn (not UnsafeUrl) proves the guard ran on the upstream url and
         // the engaged loopback url was handed to mpv untouched.
@@ -821,6 +867,7 @@ mod tests {
             socket_dir: Path::new("/tmp"),
             title: "t",
             start_secs: 0.0,
+            skip: None,
         };
         let err = play(&opts, || Err("hash rotated".into()), |_| {}).unwrap_err();
         assert!(matches!(err, PlayError::Resolve(_)));
@@ -863,6 +910,7 @@ mod tests {
             socket_dir: &dir,
             title: "t",
             start_secs: 0.0,
+            skip: None,
         };
         let outcome = play(&opts, || Ok(link.clone()), |_| {}).unwrap();
         assert_eq!(outcome.attempts, 1);

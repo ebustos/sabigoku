@@ -4,7 +4,7 @@
 //!
 //! Headless by design. Every decision is a pure function over a
 //! `ResolveWorld` (the store + registry reads it needs) returning an action;
-//! the TUI worker layer (ROD-437) performs the fetch/search/stamp the action
+//! the TUI worker layer (ROD-439) performs the fetch/search/stamp the action
 //! names. No threads, no network, no `Store` here, so the walk contracts are
 //! pinned by offline tests.
 //!
@@ -345,7 +345,7 @@ impl Walk {
     ///
     /// PRECONDITION: `target` must be a live registry name. Unlike
     /// `route_preferred`, this takes no world and cannot check `registered`, so
-    /// the caller (the `v`-flip UI, ROD-437) must only pass providers the
+    /// the caller (the `v`-flip UI, ROD-439) must only pass providers the
     /// registry offers, or `advance` will search a name the store cannot key.
     pub fn pin_flip(canonical: Enrichment, target: String) -> Walk {
         let anilist_id = canonical.anilist_id;
@@ -388,6 +388,14 @@ impl Walk {
 
     pub fn origin(&self) -> WalkOrigin {
         self.origin
+    }
+
+    /// Mark a provider tried post-construction. The play continuation
+    /// (03 §6.4) keeps its walk's memory across relaunches: every provider
+    /// that already failed a play stays skipped in the successor walk, or a
+    /// two-provider registry would ping-pong between the same pair forever.
+    pub fn mark_tried(&mut self, provider: &str) {
+        self.tried |= mark(&self.providers, Some(provider));
     }
 
     /// Skip-mask read that can never overflow the shift. A provider past
@@ -869,6 +877,25 @@ mod tests {
             })
         );
         // Nothing left → dead-end.
+        assert_eq!(walk.advance(&w), Err(Exhausted::DeadEnd));
+    }
+
+    #[test]
+    fn mark_tried_skips_extra_providers_for_a_continuation_walk() {
+        // Play continuation (03 §6.4): megaplay and senshi already burned a
+        // play each; the successor walk must go straight to allanime.
+        let c = canon(1);
+        let w = FakeWorld::new(&REG).key("senshi", 1, "s-key");
+        let mut walk = Walk::fallback(&w, c, Some("megaplay"));
+        walk.mark_tried("senshi");
+        walk.mark_tried("not-registered"); // no-op, never a panic
+        assert_eq!(
+            walk.advance(&w),
+            Ok(Hop::Search {
+                provider: "allanime".into(),
+                anilist_id: 1
+            })
+        );
         assert_eq!(walk.advance(&w), Err(Exhausted::DeadEnd));
     }
 

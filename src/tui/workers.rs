@@ -3,18 +3,22 @@
 //! queue; drain only at teardown. Supersede is detach + stale-token drop,
 //! NEVER a join on the hot path.
 
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::domain::Translation;
+use crate::aniskip::{self, SkipMode};
+use crate::domain::{Quality, Translation};
 use crate::error::Error;
-use crate::player::Position;
-use crate::providers::{CatalogProvider, DiscoverAxis};
+use crate::player::{self, PlayError, PlayOpts, PlayerEvent, Position};
+use crate::providers::{
+    CatalogProvider, DiscoverAxis, ProviderError, ProviderRegistry, SEARCH_PAGE_SIZE, SearchOptions,
+};
 use crate::store::Store;
 use crate::tui::covers::{self, CoverCaches};
-use crate::tui::event::{DemoCard, Event, EventTx};
+use crate::tui::event::{Event, EventTx, FetchClass, PlayFailure};
 
 /// The 02 §4b post-play gate, the one owner of the finish writes (01 §3 glue).
 /// No meaningful position, no writes of any kind; the player already collapsed
@@ -87,31 +91,334 @@ pub fn spawn_discover_cover_fetch(
     })
 }
 
-/// Demo feed for the ROD-438 shell: one trending page. The per-axis
-/// DiscoverFeed worker with catalog_cache upsert replaces this (ROD-439).
+/// One discover feed page (04 §7.5): single-flight per axis, slot-filed by
+/// (axis, page) on arrival, so no generation token is needed.
 #[must_use]
-pub fn spawn_demo_feed(drain: &Drain, tx: EventTx) -> bool {
-    drain.spawn("demo-feed", move || {
-        let page =
-            crate::anilist::AniList::new().and_then(|api| api.discover(DiscoverAxis::Trending, 1));
-        let event = match page {
-            Ok(page) => Event::DemoFeedLoaded {
-                cards: page
-                    .entries
-                    .into_iter()
-                    .map(|e| DemoCard {
-                        anilist_id: e.anilist_id,
-                        title: e.title_romaji,
-                        cover_url: e.cover_url,
-                    })
-                    .collect(),
+pub fn spawn_discover_feed(
+    drain: &Drain,
+    tx: EventTx,
+    catalog: Arc<dyn CatalogProvider>,
+    axis: DiscoverAxis,
+    page: u32,
+) -> bool {
+    drain.spawn("discover-feed", move || {
+        let event = match catalog.discover(axis, page) {
+            Ok(result) => Event::DiscoverFeed {
+                axis,
+                page,
+                entries: result.entries,
+                has_next: result.has_next,
             },
-            Err(cause) => Event::DemoFeedFailed {
+            Err(cause) => Event::DiscoverFeedError {
+                axis,
                 cause: cause.to_string(),
             },
         };
         tx.post(event);
     })
+}
+
+/// One Browse catalogue-search page (04 §4.2): stale results are dropped in
+/// tick by comparing `query` against the live buffer, never by generation.
+#[must_use]
+pub fn spawn_search(
+    drain: &Drain,
+    tx: EventTx,
+    catalog: Arc<dyn CatalogProvider>,
+    query: String,
+    page: u32,
+) -> bool {
+    drain.spawn("search", move || {
+        let event = match catalog.search(&query, page) {
+            Ok(result) => Event::SearchDone {
+                query,
+                page,
+                results: result.entries,
+            },
+            Err(cause) => Event::SearchFailed {
+                query,
+                cause: cause.to_string(),
+            },
+        };
+        tx.post(event);
+    })
+}
+
+/// One episode listing fetch, described as data so the spawn stays under the
+/// argument lint and the session can log/replay the spec in tests.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EpisodeFetch {
+    pub anilist_id: i64,
+    pub provider: String,
+    pub provider_id: String,
+    pub translation: Translation,
+    /// Mints a 1..N grid on listing-less providers (03 §2).
+    pub count_hint: Option<u32>,
+    pub token: u64,
+}
+
+/// Provider episode listing (03 §6.1). Staleness is the session generation
+/// `token`; the UI never joins, it drops mismatches in tick.
+#[must_use]
+pub fn spawn_episodes(
+    drain: &Drain,
+    tx: EventTx,
+    registry: Arc<ProviderRegistry>,
+    fetch: EpisodeFetch,
+) -> bool {
+    drain.spawn("episodes", move || {
+        let EpisodeFetch {
+            anilist_id,
+            provider,
+            provider_id,
+            translation,
+            count_hint,
+            token,
+        } = fetch;
+        let event = match registry.by_name(&provider) {
+            Some(p) => match p.episodes(&provider_id, translation, count_hint) {
+                Ok(episodes) => Event::EpisodesDone {
+                    anilist_id,
+                    provider,
+                    provider_id,
+                    episodes,
+                    token,
+                },
+                Err(cause) => Event::EpisodesError {
+                    anilist_id,
+                    provider,
+                    class: (&cause).into(),
+                    token,
+                },
+            },
+            // A retired name can only reach here through a stale binding row;
+            // surface it as a data failure, never fetch on primary (03 §3.2).
+            None => Event::EpisodesError {
+                anilist_id,
+                provider,
+                class: FetchClass::Data,
+                token,
+            },
+        };
+        tx.post(event);
+    })
+}
+
+/// One tier-C binding search (03 §4.2, page 1 of `SEARCH_PAGE_SIZE`); the
+/// scorers run offline on the UI thread when the hits land.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderSearch {
+    pub anilist_id: i64,
+    pub provider: String,
+    pub query: String,
+    pub translation: Translation,
+    pub token: u64,
+}
+
+#[must_use]
+pub fn spawn_provider_search(
+    drain: &Drain,
+    tx: EventTx,
+    registry: Arc<ProviderRegistry>,
+    search: ProviderSearch,
+) -> bool {
+    drain.spawn("provider-search", move || {
+        let ProviderSearch {
+            anilist_id,
+            provider,
+            query,
+            translation,
+            token,
+        } = search;
+        let opts = SearchOptions {
+            translation,
+            limit: SEARCH_PAGE_SIZE,
+            page: 1,
+        };
+        let event = match registry.by_name(&provider) {
+            Some(p) => match p.search(&query, &opts) {
+                Ok(hits) => Event::ProviderSearchDone {
+                    anilist_id,
+                    provider,
+                    hits,
+                    token,
+                },
+                Err(cause) => Event::ProviderSearchError {
+                    anilist_id,
+                    provider,
+                    class: (&cause).into(),
+                    token,
+                },
+            },
+            None => Event::ProviderSearchError {
+                anilist_id,
+                provider,
+                class: FetchClass::Data,
+                token,
+            },
+        };
+        tx.post(event);
+    })
+}
+
+/// One play, described as data: everything the worker needs without touching
+/// App state (the resolve runs per attempt inside `player::play`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaySpec {
+    pub anilist_id: i64,
+    pub provider: String,
+    pub provider_id: String,
+    pub episode_label: String,
+    /// 1-based; the AniSkip ordinal fallback (03 §9).
+    pub episode_ix: u32,
+    pub translation: Translation,
+    /// The Settings cap policy, applied at variant selection (DESIGN 5.5).
+    pub quality: Quality,
+    pub title: String,
+    pub start_secs: f64,
+    pub mpv_path: String,
+    pub socket_dir: PathBuf,
+    /// AniSkip inputs (03 §9): MAL key, config mode, skip.lua home.
+    pub mal_id: Option<i64>,
+    pub skip_mode: SkipMode,
+    pub cache_dir: PathBuf,
+    pub token: u64,
+}
+
+/// Floor between position posts. mpv emits `time-pos` per frame; the UI only
+/// needs the launching-cell flip and the 30s checkpoint cadence, so the
+/// bridge throttles here rather than flooding the queue (ROD-437 note).
+const POSITION_POST_FLOOR: Duration = Duration::from_millis(500);
+
+/// The play worker (04 §7.8): resolve + mpv + IPC live inside `player::play`;
+/// this glue forwards its events with the session token and posts the one
+/// terminal outcome. The worker outlives supersede checks by design; the UI
+/// drops stale tokens in tick and never joins.
+#[must_use]
+pub fn spawn_play(
+    drain: &Drain,
+    tx: EventTx,
+    registry: Arc<ProviderRegistry>,
+    spec: PlaySpec,
+) -> bool {
+    drain.spawn("play", move || {
+        let PlaySpec {
+            anilist_id,
+            provider,
+            provider_id,
+            episode_label,
+            episode_ix,
+            translation,
+            quality,
+            title,
+            start_secs,
+            mpv_path,
+            socket_dir,
+            mal_id,
+            skip_mode,
+            cache_dir,
+            token,
+        } = spec;
+        // A retired name can only arrive through a stale binding row.
+        let Some(p) = registry.by_name(&provider) else {
+            tx.post(Event::PlayFinished {
+                anilist_id,
+                position: None,
+                failure: Some(PlayFailure::Resolve(FetchClass::Data)),
+                token,
+            });
+            return;
+        };
+        // AniSkip prepared once, before the attempts (04 §7.8); best-effort,
+        // a miss is a plain play.
+        let skip = aniskip::prepare(
+            mal_id,
+            aniskip::episode_number(&episode_label, episode_ix),
+            skip_mode,
+            &cache_dir,
+        );
+        let opts = PlayOpts {
+            mpv_path: &mpv_path,
+            socket_dir: &socket_dir,
+            title: &title,
+            start_secs,
+            skip: skip.as_ref(),
+        };
+        let bridge = PositionBridge {
+            tx: tx.clone(),
+            anilist_id,
+            token,
+            last: Arc::new(Mutex::new(None)),
+        };
+        let result = player::play(
+            &opts,
+            || {
+                p.resolve(&provider_id, &episode_label, translation, quality)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            },
+            move |event| bridge.forward(event),
+        );
+        let (position, failure) = match result {
+            Ok(outcome) => (outcome.position, None),
+            Err(e) => (None, Some(play_failure(&e))),
+        };
+        tx.post(Event::PlayFinished {
+            anilist_id,
+            position,
+            failure,
+            token,
+        });
+    })
+}
+
+/// `PlayError` → the POD classes the toast matrix keys on (DESIGN 4.10).
+/// Guard/proxy/wait failures land in `Internal`: residual, `playback failed`.
+fn play_failure(e: &PlayError) -> PlayFailure {
+    match e {
+        PlayError::Resolve(cause) => cause
+            .downcast_ref::<ProviderError>()
+            .map_or(PlayFailure::Internal, |pe| PlayFailure::Resolve(pe.into())),
+        PlayError::Spawn { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+            PlayFailure::MpvNotFound
+        }
+        PlayError::OpenFailed { .. } => PlayFailure::OpenFailed,
+        PlayError::Exit { .. } => PlayFailure::MpvFailed,
+        _ => PlayFailure::Internal,
+    }
+}
+
+/// Clone-per-attempt event forwarder (player.rs takes `on_event` by value per
+/// attempt); the shared throttle clock keeps the floor across attempts.
+#[derive(Clone)]
+struct PositionBridge {
+    tx: EventTx,
+    anilist_id: i64,
+    token: u64,
+    last: Arc<Mutex<Option<Instant>>>,
+}
+
+impl PositionBridge {
+    fn forward(&self, event: PlayerEvent) {
+        match event {
+            PlayerEvent::Retry { attempt } => self.tx.post(Event::PlayRetry {
+                anilist_id: self.anilist_id,
+                attempt,
+                token: self.token,
+            }),
+            PlayerEvent::Position(position) => {
+                let mut last = self.last.lock().unwrap();
+                let now = Instant::now();
+                if last.is_none_or(|t| now.saturating_duration_since(t) >= POSITION_POST_FLOOR) {
+                    *last = Some(now);
+                    self.tx.post(Event::PlayPosition {
+                        anilist_id: self.anilist_id,
+                        position,
+                        token: self.token,
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Inflight accounting for one worker family (04 §5.1).
@@ -376,6 +683,131 @@ mod tests {
         let history = store.list_history().unwrap();
         assert_eq!(history[0].play_count, 1);
         assert_eq!(history[0].progress, 0, "no duration, no ratchet");
+    }
+
+    #[test]
+    fn play_failure_maps_every_error_shape() {
+        use std::os::unix::process::ExitStatusExt;
+        let resolve_err = |e: ProviderError| {
+            PlayError::Resolve(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        };
+        assert_eq!(
+            play_failure(&resolve_err(ProviderError::Forbidden { status: 403 })),
+            PlayFailure::Resolve(FetchClass::Blocked)
+        );
+        assert_eq!(
+            play_failure(&resolve_err(ProviderError::Network)),
+            PlayFailure::Resolve(FetchClass::Network)
+        );
+        // A non-provider resolve error is the residual bucket.
+        assert_eq!(
+            play_failure(&PlayError::Resolve("weird".into())),
+            PlayFailure::Internal
+        );
+        assert_eq!(
+            play_failure(&PlayError::Spawn {
+                mpv: "mpv".into(),
+                source: io::Error::from(io::ErrorKind::NotFound),
+            }),
+            PlayFailure::MpvNotFound
+        );
+        assert_eq!(
+            play_failure(&PlayError::Spawn {
+                mpv: "mpv".into(),
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            }),
+            PlayFailure::Internal
+        );
+        assert_eq!(
+            play_failure(&PlayError::OpenFailed { attempts: 3 }),
+            PlayFailure::OpenFailed
+        );
+        assert_eq!(
+            play_failure(&PlayError::Exit {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+            }),
+            PlayFailure::MpvFailed
+        );
+    }
+
+    #[test]
+    fn position_bridge_throttles_positions_but_never_retries() {
+        let (tx, rx) = event::channel();
+        let bridge = PositionBridge {
+            tx,
+            anilist_id: 7,
+            token: 3,
+            last: Arc::new(Mutex::new(None)),
+        };
+        let at = |secs: f64| {
+            PlayerEvent::Position(Position {
+                secs,
+                duration: None,
+            })
+        };
+        bridge.forward(at(1.0));
+        bridge.forward(at(1.1));
+        bridge.forward(PlayerEvent::Retry { attempt: 2 });
+        bridge.forward(at(1.2));
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events,
+            [
+                Event::PlayPosition {
+                    anilist_id: 7,
+                    position: Position {
+                        secs: 1.0,
+                        duration: None
+                    },
+                    token: 3,
+                },
+                Event::PlayRetry {
+                    anilist_id: 7,
+                    attempt: 2,
+                    token: 3,
+                },
+            ],
+            "the first position passes, the burst is folded, retry always posts"
+        );
+    }
+
+    #[test]
+    fn spawn_play_with_a_retired_name_posts_the_data_failure() {
+        let (tx, rx) = event::channel();
+        let drain = Drain::default();
+        let registry = crate::tui::episodes::teststub::inert_registry();
+        assert!(spawn_play(
+            &drain,
+            tx,
+            registry,
+            PlaySpec {
+                anilist_id: 7,
+                provider: "gone".into(),
+                provider_id: "x".into(),
+                episode_label: "1".into(),
+                episode_ix: 1,
+                translation: Translation::Sub,
+                quality: Quality::Best,
+                title: "t".into(),
+                start_secs: 0.0,
+                mpv_path: "mpv".into(),
+                socket_dir: PathBuf::from("/tmp"),
+                mal_id: None,
+                skip_mode: SkipMode::None,
+                cache_dir: PathBuf::from("/tmp"),
+                token: 9,
+            },
+        ));
+        assert!(drain.drain(Duration::from_secs(5)));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Event::PlayFinished {
+                anilist_id: 7,
+                position: None,
+                failure: Some(PlayFailure::Resolve(FetchClass::Data)),
+                token: 9,
+            }
+        );
     }
 
     #[test]

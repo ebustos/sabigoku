@@ -1,0 +1,414 @@
+//! Browse: catalogue search over AniList (DESIGN 6.2, 8.4; 04 §4.2, §8).
+//! Owns its search transport: debounce, drain, and staleness live here.
+//! App routes keys and events in; deps arrive as scoped borrows.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+use crate::domain::{Enrichment, preferred_title};
+use crate::providers::CatalogProvider;
+use crate::store::{Store, enrichment_ttl_secs};
+use crate::tui::clock::{AsyncStart, Debounce};
+use crate::tui::event::EventTx;
+use crate::tui::render::{self, draw_absent_block};
+use crate::tui::theme::Palette;
+use crate::tui::view::ViewEnv;
+use crate::tui::workers::{self, Drain};
+
+/// Armed on the edited keystroke; fires when `now >= deadline` (04 §8).
+pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Episode-count meta field earns space only on a wide pane; title > score >
+/// eps (DESIGN 4.1).
+const EPS_FIELD_MIN_W: u16 = 40;
+
+#[derive(Default)]
+pub struct BrowseState {
+    pub query: String,
+    results: Vec<Enrichment>,
+    cursor: usize,
+    scroll: usize,
+    /// Spinner + slow escalation while a fetch is in flight; cleared when the
+    /// answer for the live buffer lands (a stale answer keeps it spinning).
+    started: Option<AsyncStart>,
+    debounce: Debounce,
+    drain: Drain,
+    /// The query the visible results answered, for the 8.4 empty state.
+    answered: Option<String>,
+}
+
+impl BrowseState {
+    pub fn selected(&self) -> Option<&Enrichment> {
+        self.results.get(self.cursor)
+    }
+
+    pub fn count(&self) -> usize {
+        self.results.len()
+    }
+
+    /// Every buffer edit re-arms the debounce (DESIGN 6.2).
+    pub fn on_query_edited(&mut self, now: Instant) {
+        self.debounce.arm(now, SEARCH_DEBOUNCE);
+    }
+
+    /// Tick hook: fire the debounced fetch. An empty buffer fetches nothing
+    /// (the existing results stay; no flash to empty, DESIGN 6.4).
+    pub fn maybe_fire(&mut self, now: Instant, tx: &EventTx, catalog: &Arc<dyn CatalogProvider>) {
+        if !self.debounce.fire(now) || self.query.is_empty() {
+            return;
+        }
+        self.started = Some(AsyncStart::new(now));
+        let spawned = workers::spawn_search(
+            &self.drain,
+            tx.clone(),
+            Arc::clone(catalog),
+            self.query.clone(),
+            1,
+        );
+        if !spawned {
+            self.started = None;
+        }
+    }
+
+    /// Apply a search answer; stale if the buffer moved on (04 §6). Applied
+    /// rows upsert catalog_cache best-effort (04 §10). True when applied
+    /// (the recovery signal that clears the persistent AniList toast).
+    pub fn on_done(
+        &mut self,
+        query: &str,
+        results: Vec<Enrichment>,
+        store: &Store,
+        now_unix: i64,
+    ) -> bool {
+        if query != self.query {
+            return false;
+        }
+        self.started = None;
+        for e in &results {
+            let ttl = enrichment_ttl_secs(e.status.as_deref());
+            let _ = store.upsert_catalog_cache(e, now_unix, Some(now_unix + ttl));
+        }
+        self.results = results;
+        self.cursor = 0;
+        self.scroll = 0;
+        self.answered = Some(query.to_string());
+        true
+    }
+
+    /// A failed fetch keeps the current results (DESIGN 8.5: cached results
+    /// stay visible during an outage). True when it answered the live buffer.
+    pub fn on_failed(&mut self, query: &str) -> bool {
+        if query != self.query {
+            return false;
+        }
+        self.started = None;
+        true
+    }
+
+    /// j/k with clamp; g/G jump (DESIGN 6.1). `visible` is the list height.
+    pub fn nav(&mut self, dy: i64, visible: usize) {
+        if self.results.is_empty() {
+            return;
+        }
+        let last = (self.results.len() - 1) as i64;
+        self.cursor = (self.cursor as i64 + dy).clamp(0, last) as usize;
+        self.clamp_scroll(visible);
+    }
+
+    pub fn jump(&mut self, top: bool, visible: usize) {
+        if self.results.is_empty() {
+            return;
+        }
+        self.cursor = if top { 0 } else { self.results.len() - 1 };
+        self.clamp_scroll(visible);
+    }
+
+    fn clamp_scroll(&mut self, visible: usize) {
+        let visible = visible.max(1);
+        self.scroll = self.scroll.min(self.cursor);
+        if self.cursor >= self.scroll + visible {
+            self.scroll = self.cursor + 1 - visible;
+        }
+    }
+
+    pub fn drain(&self, timeout: Duration) -> bool {
+        self.drain.drain(timeout)
+    }
+}
+
+/// The list column (DESIGN 4.1). The detail pane is drawn by the detail
+/// module; App composes the two.
+pub fn draw_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    palette: &Palette,
+    state: &BrowseState,
+    env: &ViewEnv,
+    list_focused: bool,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    if state.results.is_empty() {
+        draw_empty(frame, area, palette, state);
+        return;
+    }
+    let visible = area.height as usize;
+    for (i, entry) in state.results.iter().enumerate().skip(state.scroll) {
+        if i >= state.scroll + visible {
+            break;
+        }
+        let y = area.y + (i - state.scroll) as u16;
+        let row = Rect::new(area.x, y, area.width, 1);
+        draw_row(
+            frame,
+            row,
+            palette,
+            entry,
+            env,
+            i == state.cursor,
+            list_focused,
+        );
+    }
+}
+
+/// One list row: `[glyph] [title…] [eps] [score]`, selection per the
+/// focus-aware table (DESIGN 4.1).
+fn draw_row(
+    frame: &mut Frame<'_>,
+    row: Rect,
+    palette: &Palette,
+    entry: &Enrichment,
+    env: &ViewEnv,
+    selected: bool,
+    list_focused: bool,
+) {
+    if selected && list_focused {
+        frame.render_widget(
+            ratatui::widgets::Block::new().style(Style::new().bg(palette.surface)),
+            row,
+        );
+    }
+    let title_style = match (selected, list_focused) {
+        (true, true) => Style::new().fg(palette.focus).add_modifier(Modifier::BOLD),
+        (true, false) => Style::new().fg(palette.focus),
+        _ => Style::new().fg(palette.fg),
+    };
+    let marker_style = if selected && list_focused {
+        Style::new().fg(palette.focus)
+    } else {
+        Style::new().fg(palette.focus).add_modifier(Modifier::DIM)
+    };
+
+    // Right-anchored score badge against the pane edge (DESIGN 4.3), with the
+    // episode count to its left on a wide pane; the title never squeezes.
+    let badge = render::score_badge(entry.score);
+    let badge_w = badge.len() as u16;
+    let mut right_edge = row.width.saturating_sub(1);
+    if badge_w + 3 <= right_edge {
+        let x = row.x + right_edge - badge_w;
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                badge,
+                render::score_style(palette, entry.score, false),
+            )),
+            Rect::new(x, row.y, badge_w, 1),
+        );
+        right_edge -= badge_w + 1;
+    }
+    if row.width >= EPS_FIELD_MIN_W
+        && let Some(eps) = entry.total_episodes
+    {
+        let field = format!("{eps}ep");
+        let w = field.len() as u16;
+        if w + 3 <= right_edge {
+            let x = row.x + right_edge - w;
+            frame.render_widget(
+                Paragraph::new(Span::styled(field, Style::new().fg(palette.fg3))),
+                Rect::new(x, row.y, w, 1),
+            );
+            right_edge -= w + 1;
+        }
+    }
+
+    let mut spans = vec![Span::raw(" ")];
+    if selected {
+        spans.push(Span::styled("▸ ", marker_style));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+    let title = preferred_title(
+        &entry.title_romaji,
+        entry.title_english.as_deref(),
+        entry.title_native.as_deref(),
+        env.pref,
+    );
+    let budget = right_edge.saturating_sub(4) as usize;
+    spans.push(Span::styled(
+        render::truncate_to_width(title, budget).into_owned(),
+        title_style,
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), row);
+}
+
+/// First-run vs zero-results (DESIGN 8.3, 8.4): a query that answered empty
+/// names itself; before any answer, Browse teaches the next action.
+fn draw_empty(frame: &mut Frame<'_>, area: Rect, palette: &Palette, state: &BrowseState) {
+    if let Some(answered) = &state.answered
+        && !state.query.is_empty()
+    {
+        let mid = area.height / 2;
+        render::draw_centered(
+            frame,
+            area,
+            mid,
+            Line::from(Span::styled(
+                format!("no results for \"{answered}\""),
+                Style::new().fg(palette.fg2).add_modifier(Modifier::ITALIC),
+            )),
+        );
+        render::draw_centered(
+            frame,
+            area,
+            mid + 1,
+            Line::from(Span::styled(
+                "try a different spelling",
+                Style::new().fg(palette.fg3).add_modifier(Modifier::ITALIC),
+            )),
+        );
+        return;
+    }
+    draw_absent_block(
+        frame,
+        area,
+        palette,
+        "search the catalogue",
+        ("/", "find anime"),
+        ("P", "save"),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{CatalogError, CatalogPage};
+    use crate::tui::event;
+
+    fn entry(id: i64) -> Enrichment {
+        Enrichment {
+            anilist_id: id,
+            title_romaji: format!("Show {id}"),
+            ..Enrichment::default()
+        }
+    }
+
+    fn store() -> Store {
+        Store::open_memory().unwrap()
+    }
+
+    struct NoCatalog;
+    impl CatalogProvider for NoCatalog {
+        fn search(&self, _q: &str, _p: u32) -> Result<CatalogPage, CatalogError> {
+            Err(CatalogError::Network)
+        }
+        fn discover(
+            &self,
+            _a: crate::providers::DiscoverAxis,
+            _p: u32,
+        ) -> Result<CatalogPage, CatalogError> {
+            Err(CatalogError::Network)
+        }
+        fn enrich(&self, _id: i64) -> Result<Option<Enrichment>, CatalogError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn debounce_gates_the_fetch() {
+        let mut b = BrowseState::default();
+        let (tx, _rx) = event::channel();
+        let catalog: Arc<dyn CatalogProvider> = Arc::new(NoCatalog);
+        let t0 = Instant::now();
+        b.query.push('f');
+        b.on_query_edited(t0);
+        b.maybe_fire(
+            t0 + SEARCH_DEBOUNCE - Duration::from_millis(1),
+            &tx,
+            &catalog,
+        );
+        assert!(b.started.is_none(), "before the deadline nothing fires");
+        b.maybe_fire(t0 + SEARCH_DEBOUNCE, &tx, &catalog);
+        assert!(b.started.is_some(), "deadline fires the fetch");
+        assert!(b.drain(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn empty_query_never_fetches() {
+        let mut b = BrowseState::default();
+        let (tx, _rx) = event::channel();
+        let catalog: Arc<dyn CatalogProvider> = Arc::new(NoCatalog);
+        let t0 = Instant::now();
+        b.on_query_edited(t0);
+        b.maybe_fire(t0 + SEARCH_DEBOUNCE, &tx, &catalog);
+        assert!(b.started.is_none());
+        assert_eq!(b.drain.inflight(), 0);
+    }
+
+    #[test]
+    fn stale_results_are_dropped_and_keep_the_spinner() {
+        let mut b = BrowseState::default();
+        let s = store();
+        b.query = "frieren".into();
+        b.started = Some(AsyncStart::new(Instant::now()));
+        assert!(!b.on_done("frier", vec![entry(1)], &s, 1000), "stale query");
+        assert!(b.results.is_empty());
+        assert!(b.started.is_some(), "a newer fetch is still owed");
+        assert!(b.on_done("frieren", vec![entry(2)], &s, 1000));
+        assert_eq!(b.count(), 1);
+        assert!(b.started.is_none());
+    }
+
+    #[test]
+    fn applied_results_upsert_catalog_cache() {
+        let mut b = BrowseState::default();
+        let s = store();
+        b.query = "x".into();
+        assert!(b.on_done("x", vec![entry(7)], &s, 1000));
+        assert!(s.get_catalog(7).unwrap().is_some());
+    }
+
+    #[test]
+    fn failure_keeps_current_results() {
+        let mut b = BrowseState::default();
+        let s = store();
+        b.query = "a".into();
+        b.on_done("a", vec![entry(1), entry(2)], &s, 1000);
+        b.query = "ab".into();
+        assert!(b.on_failed("ab"));
+        assert_eq!(b.count(), 2, "outage keeps cached results (DESIGN 8.5)");
+        assert!(!b.on_failed("zzz"), "stale failure is not an answer");
+    }
+
+    #[test]
+    fn nav_clamps_and_jumps() {
+        let mut b = BrowseState::default();
+        let s = store();
+        b.query = "a".into();
+        b.on_done("a", (1..=10).map(entry).collect(), &s, 1000);
+        b.nav(-1, 5);
+        assert_eq!(b.cursor, 0);
+        b.nav(3, 5);
+        assert_eq!(b.cursor, 3);
+        b.jump(false, 5);
+        assert_eq!(b.cursor, 9);
+        assert_eq!(b.scroll, 5, "scroll follows the jump");
+        b.jump(true, 5);
+        assert_eq!(b.cursor, 0);
+        assert_eq!(b.scroll, 0);
+    }
+}

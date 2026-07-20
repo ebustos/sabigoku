@@ -71,10 +71,14 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Save surfaces errors (06 §2.1): Settings and the quit report need them.
+    /// Save surfaces errors (06 §2.1): Settings and the quit report need
+    /// them. Write-to-temp + rename: a crash mid-write must never leave a
+    /// torn file that silently loads as defaults (ROD-439 review).
     pub fn save(&self, path: &Path) -> Result<(), Error> {
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(path, text).map_err(|e| Error::io(path, e))
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text).map_err(|e| Error::io(&tmp, e))?;
+        std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))
     }
 
     /// 06 §2.2: clamp to [1, 16] at read.
@@ -145,11 +149,27 @@ mod tests {
 
     #[test]
     fn save_failure_surfaces_io_error_with_path() {
+        // The temp-then-rename write fails at the temp file when the dir is
+        // gone; the surfaced path still points into the failing dir.
         let path = Path::new("/nonexistent-dir-sabigoku/config.toml");
         match Config::default().save(path) {
-            Err(Error::Io { path: p, .. }) => assert_eq!(p, path),
+            Err(Error::Io { path: p, .. }) => assert_eq!(p.parent(), path.parent()),
             other => panic!("expected Error::Io, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn save_is_temp_then_rename_and_leaves_no_temp_behind() {
+        let path = tmp("atomic.toml");
+        let cfg = Config {
+            image_protocol: "kitty".into(),
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        assert!(!path.with_extension("toml.tmp").exists());
+        // A non-default value for a key no Settings row surfaces survives
+        // the round-trip (the file is fully rewritten, never merged).
+        assert_eq!(Config::load(&path).image_protocol, "kitty");
     }
 
     #[test]
