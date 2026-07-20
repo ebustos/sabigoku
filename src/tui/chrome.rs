@@ -43,10 +43,29 @@ impl Tab {
 
 const TABS: [Tab; 4] = [Tab::Browse, Tab::History, Tab::Discover, Tab::Settings];
 
-/// Width-degradation breakpoints (DESIGN 3.4).
-const W_FULL_CHIP: u16 = 78;
-const W_FULL: u16 = 66;
-const W_BRIEF: u16 = 42;
+/// `  ░  ` between the wordmark and the tabs.
+const HAIRLINE: &str = "  ░  ";
+/// ` · ` between tabs.
+const TAB_SEP: &str = " · ";
+
+/// Assembled display width of a tab run (`full` labels or `brief`), separators
+/// included. Tier selection measures against the real content so it survives a
+/// wordmark or label change instead of trusting a hand-tuned breakpoint.
+fn tabs_width(full: bool) -> usize {
+    let sep = display_width(TAB_SEP) * (TABS.len() - 1);
+    let labels: usize = TABS
+        .iter()
+        .map(|t| {
+            if full {
+                let (k, l) = t.full();
+                display_width(k) + display_width(l)
+            } else {
+                display_width(t.brief())
+            }
+        })
+        .sum();
+    sep + labels
+}
 
 #[derive(Debug)]
 pub struct TopBar {
@@ -64,17 +83,28 @@ pub fn draw_top_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, top: &
     let mut spans: Vec<Span<'_>> = vec![
         Span::raw("  "),
         Span::styled(
-            "SABIGOKU",
+            "錆獄 sabigoku",
             Style::new().fg(palette.fg).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled("░", Style::new().fg(palette.chrome)),
-        Span::raw("  "),
     ];
+    // The ░ hairline separates the wordmark from the tabs; the narrowest tier
+    // drops it so the single active label clears the fixed right-edge dot.
+    let hairline = |spans: &mut Vec<Span<'_>>| {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("░", Style::new().fg(palette.chrome)));
+        spans.push(Span::raw("  "));
+    };
     let active_key = Style::new().fg(palette.focus);
     let active_label = Style::new().fg(palette.focus).add_modifier(Modifier::BOLD);
     let sep = Style::new().fg(palette.fg3);
-    if area.width >= W_FULL {
+    // Content must end before the fixed right-edge dot (col width-2), so measure
+    // each form against the columns ahead of it. Widest that fits wins.
+    let avail = area.width.saturating_sub(2) as usize;
+    let base_w = 2 + display_width("錆獄 sabigoku") + display_width(HAIRLINE);
+    let full_w = base_w + tabs_width(true);
+    let brief_w = base_w + tabs_width(false);
+    if full_w <= avail {
+        hairline(&mut spans);
         for (i, tab) in TABS.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" · ", sep));
@@ -89,13 +119,14 @@ pub fn draw_top_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, top: &
             spans.push(Span::styled(key, ks));
             spans.push(Span::styled(label, ls));
         }
-        if area.width >= W_FULL_CHIP
-            && let Some(chip) = &top.season_chip
+        if let Some(chip) = &top.season_chip
+            && full_w + 2 + display_width(chip) <= avail
         {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(chip.clone(), Style::new().fg(palette.fg2)));
         }
-    } else if area.width >= W_BRIEF {
+    } else if brief_w <= avail {
+        hairline(&mut spans);
         for (i, tab) in TABS.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" · ", sep));
@@ -108,6 +139,7 @@ pub fn draw_top_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, top: &
             spans.push(Span::styled(tab.brief(), style));
         }
     } else {
+        spans.push(Span::raw("  "));
         let (key, label) = top.tab.full();
         spans.push(Span::styled(key, active_key));
         spans.push(Span::styled(label, active_label));
@@ -296,7 +328,7 @@ pub fn draw_bottom_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, bar
                         .fg(palette.hot)
                         .add_modifier(Modifier::SLOW_BLINK),
                 ),
-                Span::raw("  "),
+                Span::raw(" "),
             ];
             for seg in help_segments(*line) {
                 spans.push(match seg {
@@ -395,6 +427,7 @@ pub fn draw_bottom_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, bar
 #[cfg(test)]
 mod tests {
     use super::super::render::cour_chip;
+    use super::{Tab, TopBar, draw_top_bar};
     use crate::domain::current_cour;
 
     /// The chip end to end: `domain::current_cour` owns the civil math and the
@@ -410,6 +443,41 @@ mod tests {
         ];
         for (secs, want) in cases {
             assert_eq!(cour_chip(current_cour(secs)), want, "at {secs}");
+        }
+    }
+
+    fn top_row(width: u16, tab: Tab, chip: Option<&str>) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        term.draw(|f| {
+            draw_top_bar(
+                f,
+                f.area(),
+                &crate::tui::theme::TERMINAL_GHOST,
+                &TopBar {
+                    tab,
+                    season_chip: chip.map(str::to_string),
+                    dot_lit: false,
+                },
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        (0..width).map(|x| buf[(x, 0)].symbol()).collect()
+    }
+
+    /// The fixed right-edge dot must never land inside a tab label: the exact
+    /// regression the kanji wordmark reopened at the old fixed breakpoints.
+    /// Sweep across both tier boundaries; the active label stays intact.
+    #[test]
+    fn top_bar_never_lets_the_dot_clobber_a_tab_label() {
+        for w in 29u16..=120 {
+            // Settings is the last tab, so its full label is the one the
+            // right-edge dot is most likely to clip.
+            let row = top_row(w, Tab::Settings, Some("夏 2026"));
+            let intact = row.contains("[S]ettings") || (row.contains("[S]") && !row.contains("[S]e"));
+            assert!(intact, "width {w}: active tab label corrupted: {row:?}");
         }
     }
 }

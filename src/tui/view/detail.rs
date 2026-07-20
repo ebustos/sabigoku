@@ -37,9 +37,9 @@ use crate::tui::workers::{self, Drain};
 pub const COVER_SETTLE: Duration = Duration::from_millis(150);
 
 /// Rows reserved below the cover in the single-column layout: worst-case
-/// header (now including the §5.3a meta line + Provider/Pinned row), a
-/// 2-line synopsis, the grid's spacer, and 2 grid rows, so the episode grid
-/// always keeps >= 2 visible rows (DESIGN 3.3).
+/// header + the compact meta line, a 2-line synopsis, the grid's spacer, the
+/// provider caption that heads the grid (§5.3a), and 2 grid rows, so the
+/// episode grid always keeps >= 2 visible rows (DESIGN 3.3).
 const COVER_RESERVE: u16 = 14;
 /// Below this a squashed poster is dropped outright, never a sliver.
 const MIN_COVER_ROWS: u16 = 6;
@@ -60,6 +60,20 @@ pub fn synopsis_cap(remaining: u16) -> u16 {
     remaining.saturating_sub(GRID_RESERVE)
 }
 
+/// Focused-grid row budget below the header (DESIGN 3.3). Layout below `y`:
+/// synopsis, a 1-row spacer, the provider caption (§5.3a: it heads the grid),
+/// then the grid. The synopsis yields so the grid keeps >= 2 rows; the
+/// provider caption draws only when a grid row still follows it, never
+/// orphaned above an empty region. Returns `(synopsis_rows, show_provider)`.
+fn body_budget(remaining: u16, syn_natural: u16, grid_rows: u16, has_provider: bool) -> (u16, bool) {
+    let prov = u16::from(has_provider);
+    let syn_rows = syn_natural
+        .min(remaining.saturating_sub(1 + prov + grid_rows).max(2))
+        .min(remaining.saturating_sub(1 + prov + 2));
+    let show_provider = has_provider && syn_rows + 2 < remaining;
+    (syn_rows, show_provider)
+}
+
 /// Cover tier from the effective column width (DESIGN 3.2): never terminal
 /// width, and hard-capped at 20 cols.
 fn cover_width(detail_w: u16) -> u16 {
@@ -74,9 +88,9 @@ fn cover_width(detail_w: u16) -> u16 {
 const CELL_W: u16 = 5;
 
 /// Two-internal-column gate (DESIGN 3.2), keyed to the pane's OWN width. The
-/// split needs the surface to allow it (Browse's in-pane detail keeps the
-/// single stack at any width); the §5.3a rail additionally needs the
-/// surface's `two_col` flag, which only History-origin surfaces set.
+/// split needs the surface to allow it (`split_ok`); Browse's in-pane detail
+/// keeps the single stack at any width. It gates the cover/content column
+/// split only: the metadata is one compact line at every width (§5.3a).
 pub const DETAIL_TWO_COL_MIN: u16 = 100;
 
 /// Gap between the cover column and the content column in the split layout.
@@ -247,8 +261,8 @@ impl DetailState {
 
 /// The persistent right-hand pane: surface-tier background marks the pane
 /// boundary without a border (DESIGN 3.1). `focused` lights the grid cursor;
-/// `split_ok`/`bloom` are the §5.3a surface flags: Browse keeps the single
-/// stack and never blooms, History splits and blooms past the width gate.
+/// `split_ok` gates the two-column cover|content split (Browse keeps the
+/// single stack, History splits past the width gate).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_pane(
     frame: &mut Frame<'_>,
@@ -259,20 +273,16 @@ pub fn draw_pane(
     pool: &mut ProtocolPool,
     focused: bool,
     split_ok: bool,
-    bloom: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    frame.render_widget(Block::new().style(Style::new().bg(palette.surface)), area);
-    draw_content(
-        frame, area, palette, state, env, pool, focused, split_ok, bloom,
-    );
+    frame.render_widget(Block::new().style(Style::new().bg(palette.bg)), area);
+    draw_content(frame, area, palette, state, env, pool, focused, split_ok);
 }
 
 /// The full-screen zoom: the split layout at `DETAIL_TWO_COL_MIN`, single
-/// stack below (DESIGN 5.3). `bloom` is the surface `two_col` flag: only a
-/// History-origin zoom blooms the §5.3a rail; the layout split is width-only.
+/// stack below (DESIGN 5.3).
 pub fn draw_zoom(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -280,14 +290,13 @@ pub fn draw_zoom(
     state: &DetailState,
     env: &ViewEnv,
     pool: &mut ProtocolPool,
-    bloom: bool,
 ) {
     let body = Rect {
         x: area.x + 2,
         width: area.width.saturating_sub(3),
         ..area
     };
-    draw_content(frame, body, palette, state, env, pool, true, true, bloom);
+    draw_content(frame, body, palette, state, env, pool, true, true);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -300,15 +309,12 @@ fn draw_content(
     pool: &mut ProtocolPool,
     focused: bool,
     split_ok: bool,
-    bloom: bool,
 ) {
     let Some(entry) = state.shown() else {
         return;
     };
     if split_ok && area.width >= DETAIL_TWO_COL_MIN {
-        draw_split(
-            frame, area, palette, state, entry, env, pool, focused, bloom,
-        );
+        draw_split(frame, area, palette, state, entry, env, pool, focused);
         return;
     }
     let width = area.width as usize;
@@ -334,16 +340,24 @@ fn draw_content(
         }
     }
 
-    let mut lines = header_lines(entry, palette, env, width);
-    // Compact meta (§5.3a): the joined line plus the dedicated
-    // Provider/Pinned row; the rail never blooms in the single stack.
-    let fields = detail_meta_fields(entry, &state.episodes);
-    lines.push(meta_line(&fields, palette));
-    if let Some(line) = provider_line(&fields, palette) {
-        lines.push(line);
+    let header = header_lines(entry, palette, env, width);
+    for line in &header {
+        if y >= area.height {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(line.clone()),
+            Rect::new(area.x, area.y + y, area.width, 1),
+        );
+        y += 1;
     }
 
-    for line in &lines {
+    // Section rule between the score line and the compact meta line (DESIGN
+    // 3.6). The provider row rides with the episode grid, not the show info.
+    y = draw_hairline(frame, area, palette, y);
+    let fields = detail_meta_fields(entry, &state.episodes);
+    let meta = [meta_line(&fields, palette)];
+    for line in &meta {
         if y >= area.height {
             break;
         }
@@ -407,7 +421,6 @@ fn draw_split(
     env: &ViewEnv,
     pool: &mut ProtocolPool,
     focused: bool,
-    bloom: bool,
 ) {
     let left_w = (area.width * 38 / 100).max(20);
     let cover_w = cover_width(left_w);
@@ -444,41 +457,14 @@ fn draw_split(
 
     let fields = detail_meta_fields(entry, &state.episodes);
     y = draw_hairline(frame, content, palette, y);
-    if bloom {
-        // Rail rows walk the priority order top-down; a short pane sheds the
-        // lowest-priority rows first (§5.3a). The reserve keeps the closing
-        // hairline, a 2-row synopsis, and the grid's spacer + 2 rows.
-        let reserve = 1 + 2 + GRID_RESERVE;
-        let max_rows = content.height.saturating_sub(y + reserve) as usize;
-        for f in fields.iter().take(max_rows) {
-            let value_style = if f.dim {
-                Style::new().fg(palette.fg3)
-            } else {
-                Style::new().fg(palette.fg2)
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(format!("{:<10}", f.label), Style::new().fg(palette.fg3)),
-                    Span::styled(f.value.clone(), value_style),
-                ])),
-                Rect::new(content.x + 1, content.y + y, content.width - 1, 1),
-            );
-            y += 1;
-        }
-    } else {
-        let compact: Vec<Line<'static>> = std::iter::once(meta_line(&fields, palette))
-            .chain(provider_line(&fields, palette))
-            .collect();
-        for line in compact {
-            if y >= content.height {
-                return;
-            }
-            frame.render_widget(
-                Paragraph::new(line),
-                Rect::new(content.x + 1, content.y + y, content.width - 1, 1),
-            );
-            y += 1;
-        }
+    // One compact meta line at every width; the provider row rides with the
+    // episode grid, not the show info.
+    if y < content.height {
+        frame.render_widget(
+            Paragraph::new(meta_line(&fields, palette)),
+            Rect::new(content.x + 1, content.y + y, content.width - 1, 1),
+        );
+        y += 1;
     }
     y = draw_hairline(frame, content, palette, y);
 
@@ -525,19 +511,27 @@ fn draw_body(
         draw_synopsis(frame, area, palette, entry, state.scroll, y, cap);
         return;
     }
-    let indent_w = area.width.saturating_sub(2) as usize;
     let syn_natural = entry
         .description
         .as_deref()
-        .map_or(1, |t| render::wrap_text(t, indent_w).len() as u16);
+        .map_or(1, |t| render::wrap_text(t, area.width as usize).len() as u16);
     let cols = grid_cols(area.width);
-    let grid_need = (session.grid().len().div_ceil(cols).max(1)) as u16;
-    let budget = remaining.saturating_sub(1);
-    let syn_rows = syn_natural
-        .min(budget.saturating_sub(grid_need).max(2))
-        .min(budget.saturating_sub(2));
+    let grid_rows = (session.grid().len().div_ceil(cols).max(1)) as u16;
+    let fields = detail_meta_fields(entry, session);
+    let provider = provider_line(&fields, palette);
+    let (syn_rows, show_provider) =
+        body_budget(remaining, syn_natural, grid_rows, provider.is_some());
     draw_synopsis(frame, area, palette, entry, state.scroll, y, syn_rows);
-    let grid_y = y + syn_rows + 1;
+    let mut grid_y = y + syn_rows + 1;
+    if show_provider
+        && let Some(pline) = provider
+    {
+        frame.render_widget(
+            Paragraph::new(pline),
+            Rect::new(area.x, area.y + grid_y, area.width, 1),
+        );
+        grid_y += 1;
+    }
     let grid_h = area.height.saturating_sub(grid_y);
     if grid_h == 0 {
         return;
@@ -757,8 +751,10 @@ fn detail_meta_fields(entry: &Enrichment, session: &EpisodeSession) -> Vec<MetaF
     if let Some(studios) = studios_value(&entry.studios) {
         out.push(plain("Studios", studios, false));
     }
+    // Rank rides the compact line last (§5.3a), so it is the first field the
+    // line sheds when width tightens.
     if let Some(rank) = rank_value(entry) {
-        out.push(plain("Rank", rank, true));
+        out.push(plain("Rank", rank, false));
     }
     if session.engaged_for(entry.anilist_id) {
         if let Some((value, dim)) = provider_value(session) {
@@ -887,6 +883,13 @@ fn provider_line(fields: &[MetaField], palette: &Palette) -> Option<Line<'static
             Style::new().fg(palette.fg2),
         ));
     }
+    // Cycle-provider affordance (the `v` key), keybind-hint styling (§7.5).
+    spans.push(Span::styled(" · [", Style::new().fg(palette.fg3)));
+    spans.push(Span::styled(
+        "v",
+        Style::new().fg(palette.fg2).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled("]", Style::new().fg(palette.fg3)));
     Some(Line::from(spans))
 }
 
@@ -944,15 +947,14 @@ fn draw_synopsis(
     if cap == 0 {
         return;
     }
-    let indent = 2u16;
-    let width = area.width.saturating_sub(indent) as usize;
+    let width = area.width as usize;
     let Some(text) = entry.description.as_deref() else {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "no synopsis yet",
                 Style::new().fg(palette.fg2).add_modifier(Modifier::ITALIC),
             )),
-            Rect::new(area.x + indent, area.y + y, area.width - indent, 1),
+            Rect::new(area.x, area.y + y, area.width, 1),
         );
         return;
     };
@@ -970,12 +972,7 @@ fn draw_synopsis(
         }
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
-            Rect::new(
-                area.x + indent,
-                area.y + y + i as u16,
-                area.width - indent,
-                1,
-            ),
+            Rect::new(area.x, area.y + y + i as u16, area.width, 1),
         );
     }
 }
@@ -1049,7 +1046,7 @@ fn chips_line<'a>(entry: &Enrichment, palette: &Palette, env: &ViewEnv) -> Optio
         push(&mut spans, label.to_string(), tone.style(palette));
     }
     if let Some(chip) = season_chip_text(entry.season, entry.year, env.kanji) {
-        push(&mut spans, chip, Style::new().fg(palette.fg2));
+        push(&mut spans, chip, Style::new().fg(palette.focus));
     }
     if let Some(countdown) = countdown_label(
         entry.next_airing_at,
@@ -1130,6 +1127,30 @@ mod tests {
     use crate::domain::TitleLanguage;
     use crate::tui::event;
     use ratatui_image::picker::Picker;
+
+    /// The focused-grid budget: the grid keeps >= 2 rows when the pane can
+    /// hold them, and the provider caption is never orphaned above an empty
+    /// grid at tight heights (ROD-458 review).
+    #[test]
+    fn body_budget_keeps_grid_rows_and_never_orphans_provider() {
+        // Roomy: full synopsis, caption shown, grid keeps its rows.
+        let (syn, prov) = body_budget(30, 8, 4, true);
+        assert!(prov);
+        let grid_h = 30 - (syn + 1 + 1);
+        assert!(grid_h >= 2, "grid keeps >= 2 rows, got {grid_h}");
+        // Tight: caption yields rather than sit above an empty grid.
+        for remaining in 0u16..=8 {
+            let (syn, show) = body_budget(remaining, 8, 4, true);
+            let grid_y = syn + 1 + u16::from(show);
+            let grid_h = remaining.saturating_sub(grid_y);
+            assert!(
+                !show || grid_h >= 1,
+                "remaining {remaining}: caption orphaned (grid_h {grid_h})"
+            );
+        }
+        // No provider row: never claims to show one.
+        assert!(!body_budget(30, 8, 4, false).1);
+    }
 
     fn entry(id: i64) -> Enrichment {
         Enrichment {
@@ -1272,8 +1293,10 @@ mod tests {
         assert_eq!(fields[6].value, "▸megaplay -senshi ?allanime");
         assert!(!fields[6].dim);
         assert_eq!(fields[7].value, "senshi");
-        assert!(fields.iter().skip(5).all(|f| f.rail_only));
-        assert!(fields.iter().take(5).all(|f| !f.rail_only));
+        // Rank (field 5) now rides the compact line; only Provider/Pinned are
+        // excluded from it (they ride the grid).
+        assert!(fields.iter().skip(6).all(|f| f.rail_only));
+        assert!(fields.iter().take(6).all(|f| !f.rail_only));
     }
 
     #[test]
@@ -1316,10 +1339,14 @@ mod tests {
             &detail_meta_fields(&rich_entry(), &session),
             palette,
         ));
-        assert_eq!(full, "28 eps · TV · Light novel · 24 min · Madhouse");
+        assert_eq!(
+            full,
+            "28 eps · TV · Light novel · 24 min · Madhouse · #12 rated 2023",
+            "Rank rides the compact line, last"
+        );
         assert!(
-            !full.contains("rated"),
-            "rail-only fields stay off the line"
+            !full.contains("megaplay"),
+            "Provider/Pinned stay off the line (they ride the grid)"
         );
     }
 
@@ -1337,7 +1364,7 @@ mod tests {
         let fields = detail_meta_fields(&entry(1), &pinned);
         assert_eq!(
             line_text(&provider_line(&fields, palette).unwrap()),
-            "▸megaplay +senshi · pin senshi"
+            "▸megaplay +senshi · pin senshi · [v]"
         );
         let unpinned = EpisodeSession::seeded(
             1,
@@ -1349,8 +1376,8 @@ mod tests {
         let fields = detail_meta_fields(&entry(1), &unpinned);
         assert_eq!(
             line_text(&provider_line(&fields, palette).unwrap()),
-            "▸megaplay",
-            "no trailing separator when unpinned"
+            "▸megaplay · [v]",
+            "cycle hint always trails; no pin segment when unpinned"
         );
         // No engaged session: the whole row is skipped.
         let fields = detail_meta_fields(&entry(1), &EpisodeSession::default());

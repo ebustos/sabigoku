@@ -1,0 +1,40 @@
+  地獄 zigoku ░ [B]rowse · [H]istory · [D]iscover · [S]ettings                                                        ·
+
+    Player
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+▸   mpv path                        mpv                                                                  enter to edit
+    default quality                 best                                                                 hjkl to cycle
+    translation                     sub                                                                  hjkl to cycle
+    resume offset                   5s                                                                   hjkl to cycle
+    skip mode                       both                                                                 hjkl to cycle
+
+    Catalog
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    enrichment sync                 automatic
+    cover art cache                 ~/.cache/zigoku/covers
+    provider                        megaplay (default)                                                   hjkl to cycle
+
+    Interface
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    cover art                       [████ on ████]                                                     space to toggle
+    kanji chips                     [████ on ████]                                                     space to toggle
+    palette                         terminal_ghost                                                       hjkl to cycle
+    landing view                    history                                                              hjkl to cycle
+    title language                  romaji                                                               hjkl to cycle
+
+    AniList Sync
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    account                         not connected
+    connect                                                                                           enter to connect
+    sync                            [████ on ████]                                                     space to toggle
+
+    Updates
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    current version                 v0.4.8
+    check                           [████ on ████]                                                     space to toggle
+
+
+
+
+
+ ▌ hjkl navigate · space toggle · enter edit · q save+quit
