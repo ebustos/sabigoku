@@ -45,15 +45,18 @@ use Cov::{Deferred, Pending, Seeded};
 /// chapter so 05 stays the index; cites name a representative enforcing test.
 const CONTRACTS: &[Contract] = &[
     // 1 · Navigation, quit, Esc chain
-    c("1.1", "list motion stays in bounds; g/G ends; empty is a no-op", Seeded("tui::app::help_line_tracks_view_pane_and_empty_history")),
+    c("1.1", "list motion stays in bounds; scrollIntoView keeps the cursor visible", Seeded("tui::view::history::scroll_keeps_the_cursor_and_its_header_visible")),
     c("1.2", "q / Ctrl-C quit; Settings saves dirty first; never back-nav", Seeded("tui::app::q_quits_from_every_view_in_normal_mode")),
     c("1.3", "Esc chain matrix per DESIGN; zoom demotes to origin pane", Seeded("tui::app::esc_chain_table")),
     c("1.4", "pane focus: h/l at width>=60; narrow has no second pane", Seeded("tui::app::h_l_toggle_panes_per_the_focus_table")),
     // 2 · History cursor and setHistory
-    c("2", "cursor follows focused show identity across reorder; filter clamps", Seeded("tui::app::history_filter_narrows_counts_and_esc_restores")),
+    c("2", "cursor follows focused show identity across reorder; filter clamps", Seeded("tui::view::history::cursor_follows_identity_across_reorder_and_clamps")),
+    c("2", "cursor walks group order, not store order; geometry counts headers", Seeded("tui::view::history::order_walks_groups_not_store_order")),
+    c("2", "filter matches any present title form; Esc resets", Seeded("tui::view::history::filter_matches_any_title_form_and_esc_resets")),
     // 3 · Hard delete (ROD-220)
     c("3", "X then y deletes with cascade; only y fires; never the playing show", Seeded("tui::app::hard_delete_confirm_freezes_fires_and_cancels")),
     c("3", "delete refuses the currently-playing show", Seeded("tui::app::delete_refuses_the_currently_playing_show")),
+    c("3", "cascade drops progress/cache/bindings/pin/absence/route", Seeded("store::delete_show_cascades_children")),
     // 4 · Status, undo, recompute, add (ROD-139/189/193)
     c("4", "p/x/c/w transition status in store + memory; u undoes last", Seeded("tui::app::history_status_keys_transition_store_and_memory_with_undo")),
     c("4", "r recomputes from episode_progress; recompute survives a pending undo", Seeded("tui::app::recompute_survives_a_pending_undo")),
@@ -78,29 +81,30 @@ const CONTRACTS: &[Contract] = &[
     c("8", "three-state worker: transport error skips stamp and persist", Pending("M2 enrichment worker")),
     // 9 · Titles (ROD-205)
     c("9", "primary title follows title_language with fallback chain", Seeded("domain::preferred_title_fallback_chains")),
-    c("9", "history filter searches any present title form", Seeded("tui::app::history_filter_narrows_counts_and_esc_restores")),
+    c("9", "history filter searches any present title form", Seeded("tui::view::history::filter_matches_any_title_form_and_esc_resets")),
     // 10 · Resolve, preferred, pin, fallback, prewarm
-    c("10.0", "classification + result handling: bind/reveal/toast, unbound persists + warns", Seeded("resolve::classify_open")),
-    c("10.0", "tier floors and registry-order tie-break; preference breaks the tie", Seeded("resolve::route_pref")),
-    c("10.1", "history open fetches on the owning provider; browse dispatches to verdict", Seeded("resolve::open_history")),
-    c("10.1", "browse scroll fires zero episode fetches; detail entry lazy-loads", Seeded("tui::view::detail::discrete_nav_syncs_immediately")),
-    c("10.2", "unpinned open re-routes off stale binding to preferred (ROD-398)", Seeded("resolve::route_preferred")),
-    c("10.2", "pin ignores global preference; settled opens pref directly", Seeded("resolve::route_pref")),
-    c("10.3", "failed fetch hops to next tier-A; reuses sibling before probe", Seeded("resolve::fallback")),
-    c("10.3", "fresh absence skipped, stale re-probes; exhausted walk dead-ends", Seeded("resolve::exhaust")),
-    c("10.3", "empty listing walks the ladder; never binds an empty grid (ROD-368)", Seeded("resolve::advance")),
+    c("10.0", "classification: tier-major binding beats an earlier key; unbound persists + warns", Seeded("resolve::classify_is_tier_major_binding_beats_earlier_key")),
+    c("10.0", "tier-A uses effective order then needs-search; existing binding wins", Seeded("resolve::classify_tier_a_uses_effective_order_then_needs_search")),
+    c("10.1", "history open fetches on the owning provider; pin opens only its own binding", Seeded("resolve::history_pin_opens_only_its_own_binding")),
+    c("10.1", "browse scroll fires zero episode fetches; detail entry lazy-loads", Seeded("tui::view::detail::continuous_scroll_settles_before_fetching")),
+    c("10.2", "unpinned open re-routes off stale binding to preferred (ROD-398)", Seeded("resolve::route_stale_forces_once_and_stamps_before_fetch")),
+    c("10.2", "settled under pref opens the binding directly, no restamp loop", Seeded("resolve::route_settled_opens_binding_without_restamp")),
+    c("10.3", "failed fetch hops provider-major: binding, absence, key, then search", Seeded("resolve::fallback_walk_is_provider_major_binding_then_absence_then_key_then_search")),
+    c("10.3", "fresh absence respected on a non-manual walk; transient error hops", Seeded("tui::episodes::transient_error_hops_without_marking_absence")),
+    c("10.3", "empty listing marks absence and walks the ladder; never binds empty (ROD-368)", Seeded("tui::episodes::empty_listing_marks_absence_and_walks_the_ladder")),
+    c("10.3", "exhausted walk dead-ends into no-source, frees the walk", Seeded("tui::episodes::exhausted_walk_dead_ends_into_no_source")),
     c("10.3", "mapEpisodeIndex prefers raw then ordinal else null", Seeded("domain::map_episode_index_prefers_raw_falls_back_to_ordinal_else_none")),
     c("10.3", "stream fail relaunches hop, one shot per provider per walk", Seeded("tui::app::failed_play_hops_relaunches_and_dead_ends_without_ping_pong")),
     c("10.4", "prewarm candidates = unchecked only; results mint hidden bind/negative", Pending("M2 prewarm walk (ROD-449)")),
-    c("10.5", "v cycles unpinned -> each provider -> unpinned; pin leads fallback order", Seeded("resolve::pin_flip")),
-    c("10.5", "v flip keeps cursor on in-progress episode (R-9)", Seeded("tui::app::v_cycles_the_pin_with_toasts_and_flip")),
+    c("10.5", "v cycles unpinned -> each provider -> unpinned; pin keeps on miss", Seeded("resolve::pin_flip_probes_through_absence_and_keeps_pin_on_miss")),
+    c("10.5", "v flip keeps cursor on the in-progress episode (R-9); retired pin unpins", Seeded("tui::episodes::pin_cycle_sets_flips_and_clears")),
     c("10.6", "resume target = most-recent row; failed auto-open demotes to History", Seeded("tui::app::last_watched_landing_demotes_when_the_walk_exhausts")),
     c("10.6", "fires only on first history load; successful load clears the demote arm", Seeded("tui::app::cached_landing_clears_the_demote_arm_synchronously")),
-    c("10.7", "grid cursor seeds from progress; resume overrides; completed -> ep one", Seeded("tui::view::detail::set_target_resets_scroll_only_on_a_new_show")),
+    c("10.7", "grid cursor seeds from progress; resume overrides; completed -> ep one", Seeded("tui::episodes::cursor_seeds_from_progress_resume_and_completion")),
     // 11 · Playback session
     c("11", "position_update refreshes live fields; checkpoint ~30s", Seeded("player::ipc_handshake_events_and_final_position")),
     c("11", "meaningful final persists; no observed position keeps the checkpoint", Seeded("player::ipc_without_meaningful_position_keeps_the_gate_shut")),
-    c("11", "partial watch records play, not progress/dim/advance (R-14)", Seeded("tui::app::partial_finish_records_silently_and_marks_resume")),
+    c("11", "partial watch records play, not progress/dim/advance (R-14)", Seeded("tui::workers::partial_watch_lands_in_history_without_ratchet")),
     c("11", "completed advances cursor + dims; final episode toasts all-caught-up", Seeded("tui::app::finale_finish_toasts_all_caught_up")),
     c("11", "other-show playback never advances this detail; double firePlay no-op", Seeded("tui::app::cross_show_finish_never_touches_the_new_detail")),
     c("11", "landing/reroute progress joins are raise-only (02 4b / ROD-346)", Seeded("store::raise_to_union_never_lowers")),
@@ -109,15 +113,16 @@ const CONTRACTS: &[Contract] = &[
     c("12", "live pixels win over stale failure; cover_art off never fetches", Seeded("tui::view::detail::cover_art_off_never_fetches")),
     c("12", "stale cover never installs for a moved selection; single-flight", Seeded("tui::view::detail::stale_cover_never_installs_for_a_moved_selection")),
     // 13 · Settings
-    c("13", "cycle presets wrap; translation/palette/landing live-sync", Seeded("tui::view::settings::palette_cycle_projects_live")),
-    c("13", "mpv_path edit round-trip; edit mode swallows F-keys; Esc cancels", Seeded("tui::view::settings::settings_edit_mode_swallows_view_keys_and_esc_stays")),
-    c("13", "q dirty without path warns then quits; save round-trip on q", Seeded("tui::view::settings::settings_missing_config_dir_warns_and_skips")),
-    c("13", "preferred-provider wheel matches registry injection (ROD-344)", Seeded("resolve::route_pref")),
-    c("13", "connect row is an action (AniList sync)", Pending("M2 connect modal (ROD-448)")),
+    c("13", "cycle presets wrap; unrecognized stored value snaps valid", Seeded("tui::view::settings::cycle_rows_step_their_wheels_both_ways")),
+    c("13", "mpv_path edit round-trip; empty never commits blank; edit swallows globals", Seeded("tui::view::settings::edit_mode_swallows_globals_and_rejects_control_chars")),
+    c("13", "translation / palette / landing live-sync on cycle", Seeded("tui::app::palette_cycle_projects_live")),
+    c("13", "preferred-provider wheel: unset -> names -> unset (ROD-344)", Seeded("tui::view::settings::provider_wheel_walks_unset_then_names_then_unset")),
+    c("13", "connect row is an action (not a cycle); side-effect inert until ROD-448", Seeded("tui::view::settings::connect_row_reports_the_action")),
     c("13", "reloadAuth must not free a token still used by in-flight flush", Pending("M2 sync rail (ROD-448)")),
     // 14 · Toasts and async chrome
-    c("14", "topic singleton; persistent error not evicted; transient overflow evicts oldest", Seeded("tui::app::toasts_overlay_the_frame")),
+    c("14", "topic singleton refreshes in place; persistent survives; overflow evicts oldest", Seeded("tui::toast::persistent_topic_refreshes_in_place")),
     c("14", "Browse failure never marks History unavailable (T-3)", Seeded("tui::app::search_outage_toasts_persistently_and_recovers")),
+    c("14", "copy budget truncates with ellipsis", Seeded("tui::toast::copy_is_truncated_to_the_36_col_budget")),
     c("14", "sync flush whispers; update_available low-key whisper", Pending("M2 sync rail (ROD-448)")),
     // 15 · Detail chrome / provider caption
     c("15", "meta field order and ? degrade; two-column keyed on pane width (T-16)", Seeded("tui::view::detail::meta_fields_walk_the_priority_order")),
@@ -129,7 +134,7 @@ const CONTRACTS: &[Contract] = &[
     c("16", "command mode: dub toggle; unknown command flashes and toasts", Seeded("tui::app::unknown_command_flashes_and_toasts")),
     // 17 · Cross-cutting store contracts enforced via TUI
     c("17", "upsert/enrich never clobbers user state", Seeded("store::catalog_merge_null_never_wipes")),
-    c("17", "progress on show, not forked per provider", Seeded("store::raise_to_union_never_lowers")),
+    c("17", "sibling providers union into one show progress, never forked per provider", Seeded("store::raise_to_union_never_lowers")),
     c("17", "catalog_cache carries Discover/Browse paint without refetch", Seeded("store::catalog_upsert_round_trips")),
     c("17", "pin/absence/route off the enrichment path", Seeded("store::pin_and_route_round_trip")),
 ];
@@ -158,16 +163,38 @@ const LEDGER: &[BugCheck] = &[
     b("ID-5", "CLONE: enrich must not freeze aired-so-far as total", Seeded("store::stale_total_clears_only_on_stamped_airing_answer")),
     b("ID-7", "CLONE: rusqlite bundled so stock macOS does not segfault", Deferred("build-time crate choice (Cargo.toml); no runtime test")),
     b("K-1", "OPEN: resume marker one behind after source switch; ships as a limitation", Deferred("02 L1 string equality; repair UX is a future ticket")),
-    b("K-2", "FIX-IN-RUST: search-only preferred miss falls back, no blank dead-end", Seeded("resolve::forced_preferred")),
-    b("R-1", "CLONE: preferred/pin/fallback/empty/demote matrix", Seeded("resolve::fallback")),
+    b("K-2", "FIX-IN-RUST: search-only preferred miss falls back, no blank dead-end", Seeded("resolve::forced_preferred_miss_triggers_k2_continuation_not_dead_end")),
+    b("R-1", "CLONE: preferred/pin/fallback/empty/demote matrix", Seeded("resolve::fallback_walk_is_provider_major_binding_then_absence_then_key_then_search")),
+    b("R-2", "CLONE: manual flip to empty keeps pin, falls back, names the miss", Seeded("tui::episodes::pin_flip_miss_keeps_pin_and_grid")),
+    b("R-3", "CLONE: backup-only show walks providers before giving up", Seeded("tui::episodes::empty_listing_marks_absence_and_walks_the_ladder")),
+    b("R-4", "CLONE: empty listing walks the ladder, never bound as success (ROD-368)", Seeded("tui::episodes::empty_listing_marks_absence_and_walks_the_ladder")),
+    b("R-5", "CLONE: stream open / CDN block retries then toasts", Seeded("player::open_failed_retries_with_backoff_then_succeeds")),
+    b("R-6", "CLONE: playback failure surfaces an error, never aborts", Seeded("player::other_exit_codes_fail_without_retry")),
+    b("R-7", "CLONE: softsubs fetch / retry / content-based track pick", Deferred("M2 subtitle pipeline; not ported in M1")),
+    b("R-8", "CLONE: quality cap honoured on the fallback provider", Seeded("domain::quality_parse_and_cap")),
     b("R-9", "CLONE: provider flip keeps the in-progress episode cursor", Seeded("tui::app::v_cycles_the_pin_with_toasts_and_flip")),
     b("R-10", "CLONE: SSRF / unsafe link check on all resolve paths", Seeded("player::private_stream_url_is_blocked_before_spawn")),
     b("R-11", "CLONE: post-play refresh follows the watched show", Seeded("tui::app::cross_show_finish_never_touches_the_new_detail")),
     b("R-12", "CLONE: still-airing show never auto-completes", Seeded("domain::after_play_still_airing_never_auto_completes")),
     b("R-13", "CLONE: progress unclamped in store; clamp is render-time only", Seeded("store::progress_storage_is_unclamped")),
     b("R-14", "CLONE: partial (0.80 natural end) vs fully_watched (0.95)", Seeded("domain::natural_end_is_the_080_tier")),
-    b("T-1", "CLONE: superseded episode prefetch detached, not joined", Seeded("tui::app::discard_worker_finish")),
-    b("T-15", "CLONE: history filter matches all title forms, not only romaji", Seeded("tui::app::history_filter_narrows_counts_and_esc_restores")),
+    b("T-1", "CLONE: superseded episode prefetch detached, not joined", Seeded("tui::episodes::superseded_result_is_dropped_not_installed")),
+    b("T-2", "CLONE (intent): quit drains workers without deadlock; times out instead of hanging", Seeded("tui::workers::drain_times_out_instead_of_hanging")),
+    b("T-3", "CLONE: Browse task_error never marks History unavailable (ROD-234)", Seeded("tui::app::search_outage_toasts_persistently_and_recovers")),
+    b("T-4", "CLONE: Discover fetch off-thread with deadlines", Deferred("M2 discover feed depth (ROD-449)")),
+    b("T-5", "CLONE: Discover covers survive relative URL / WebP", Deferred("M2 discover covers")),
+    b("T-6", "CLONE->FIX-IN-RUST: Discover links canonically (AniList id), not by re-title-match", Seeded("store::catalog_upsert_round_trips")),
+    b("T-7", "CLONE: Discover axis cycle overflow wraps", Seeded("tui::app::discover_axis_keys")),
+    b("T-8", "CLONE: Discover over-fetch cap on large monitors", Deferred("M2 discover feed depth (ROD-449)")),
+    b("T-9", "CLONE: episode grid does not bleed Browse preview from History (ROD-222)", Seeded("tui::app::history_pane_entry_engages_and_list_focus_hides_the_grid")),
+    b("T-10", "CLONE: watched-dim seeds from store for Browse, not only History", Seeded("tui::episodes::cursor_seeds_from_progress_resume_and_completion")),
+    b("T-11", "CLONE: long episode grid never strays a wrong number", Seeded("tui::view::detail::grid_cell_text_shapes_and_strips_control_bytes")),
+    b("T-12", "CLONE: CJK wrap never splits codepoints; center accounts for wide cols", Deferred("M2 CJK text measure (render layer)")),
+    b("T-13", "CLONE: Kitty acks drain and stay quiet", Deferred("conditional on the Kitty cover path, not the M1 halfblock default")),
+    b("T-14", "CLONE (intent): cover decode peak memory kept under a ceiling", Seeded("tui::view::detail::cover_cap_protects_the_grid_at_the_worst_case")),
+    b("T-15", "CLONE: history filter matches all title forms, not only romaji", Seeded("tui::view::history::filter_matches_any_title_form_and_esc_resets")),
+    b("T-16", "CLONE: two-column detail measured on the pane, not the terminal", Seeded("tui::view::detail::meta_fields_walk_the_priority_order")),
+    b("T-17", "CLONE: history detail grid renders on first focus at any width", Seeded("tui::app::history_pane_entry_engages_and_list_focus_hides_the_grid")),
     b("A-1", "CLONE (must-not): auth refuses control-byte tokens", Pending("M2 auth module (ROD-448)")),
     b("A-2", "CLONE (must-not): verify Viewer before persisting the token", Pending("M2 auth module (ROD-448)")),
     b("A-3", "CLONE (must-not): pull-then-push, never wipe AniList on first sync", Pending("M2 sync rail (ROD-448)")),
@@ -191,8 +218,10 @@ fn every_05_section_is_present() {
     }
 }
 
-/// Cites look like a test path; Pending/Deferred notes are never blank. A row
-/// that claims coverage must point somewhere; a gap must say why.
+/// Cites look like a test path; Pending/Deferred notes are never blank. This
+/// cannot prove a cite resolves to a real `#[test]` (the integration binary
+/// can't see inline unit tests), so a wrong cite still passes here: spot-check
+/// cites on review against the actual test names, that guard is human.
 #[test]
 fn dispositions_are_well_formed() {
     for c in CONTRACTS {
@@ -261,8 +290,9 @@ fn coverage_report() {
     }
 }
 
-// --- Live cross-module contracts: the seam no single inline unit test spans,
-// driven through the public API (domain law observed through store writes).
+// --- Live anchors: these drive the domain-through-store public API end to end,
+// so the harness executes real code, not only the registry. They overlap the
+// store's own inline tests by design (belt-and-suspenders at the crate edge).
 
 fn show(anilist_id: i64, total: u32, status: &str) -> Enrichment {
     Enrichment {
