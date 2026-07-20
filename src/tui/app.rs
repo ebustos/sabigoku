@@ -86,6 +86,7 @@ pub struct App {
     caches: Arc<CoverCaches>,
     covers_dir: PathBuf,
     play_dirs: PlayDirs,
+    config_file: PathBuf,
     pub(super) pool: ProtocolPool,
     pub(super) encode_drain: Drain,
 }
@@ -138,6 +139,7 @@ impl App {
                 socket: paths.runtime.clone(),
                 cache: paths.cache.clone(),
             },
+            config_file: paths.config_file(),
             pool,
             encode_drain,
         };
@@ -218,6 +220,15 @@ impl App {
             self.dirty = true;
             return;
         }
+        // Settings owns its keys in normal mode; a field under edit swallows
+        // everything (F-keys and view letters are text there, DESIGN 5.5).
+        if self.view == View::Settings
+            && self.mode == InputMode::Normal
+            && self.on_settings_key(key, now, tx)
+        {
+            self.dirty = true;
+            return;
+        }
         if let KeyCode::F(n @ 1..=4) = key.code {
             self.on_fkey(n, now);
             return;
@@ -232,7 +243,7 @@ impl App {
 
     fn on_normal_key(&mut self, key: KeyEvent, now: Instant, tx: &EventTx) {
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.on_quit(now),
             KeyCode::Char('B') => self.switch_view(View::Browse, now),
             KeyCode::Char('H') => self.switch_view(View::History, now),
             KeyCode::Char('D') => self.switch_view(View::Discover, now),
@@ -284,6 +295,9 @@ impl App {
     fn switch_view(&mut self, target: View, now: Instant) {
         if self.view == target {
             return;
+        }
+        if self.view == View::Settings {
+            self.persist_settings(now);
         }
         self.view = target;
         self.pane = Pane::List;
@@ -756,7 +770,7 @@ impl App {
         let command = std::mem::take(&mut self.command);
         self.mode = InputMode::Normal;
         match command.trim() {
-            "q" => self.quit = true,
+            "q" => self.on_quit(now),
             "dub" => self.toggle_translation(now, tx),
             "sync" | "cache clear" => {}
             _ => self.on_unknown_command(now),
@@ -1099,6 +1113,82 @@ impl App {
             .unwrap_or_else(|| provider.to_string())
     }
 
+    /// The Settings tab needs runtime facts (registry names, cache path)
+    /// beyond the palette + state every other view gets.
+    fn draw_settings(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let names: Vec<&str> = self.registry.iter().map(|p| p.name()).collect();
+        let covers_dir = settings::tilde_path(&self.covers_dir);
+        let env = settings::SettingsEnv {
+            config: &self.config,
+            providers: &names,
+            covers_dir: &covers_dir,
+        };
+        settings::draw(frame, area, self.palette, &self.settings, &env);
+    }
+
+    /// One Settings keypress (DESIGN 5.5): the state mutates config and
+    /// reports; App projects the live pieces and leaves persistence to the
+    /// leave/quit path. Returns whether the key was consumed.
+    fn on_settings_key(&mut self, key: KeyEvent, now: Instant, tx: &EventTx) -> bool {
+        let translation_before = self.config.translation.clone();
+        let names: Vec<&str> = self.registry.iter().map(|p| p.name()).collect();
+        let outcome = self.settings.on_key(key.code, &mut self.config, &names);
+        match outcome {
+            settings::KeyOutcome::Ignored => false,
+            settings::KeyOutcome::Consumed => true,
+            settings::KeyOutcome::ConfigChanged => {
+                self.on_settings_config_changed(&translation_before, now, tx);
+                true
+            }
+            // Inert until the connect modal lands (ROD-448).
+            settings::KeyOutcome::ConnectRequested => true,
+        }
+    }
+
+    /// Live projections after a Settings mutation: the palette repaints on
+    /// the next frame; a translation change re-keys an engaged grid exactly
+    /// like the `:dub` command (same reset, no walk storm).
+    fn on_settings_config_changed(&mut self, translation_before: &str, now: Instant, tx: &EventTx) {
+        self.palette = theme::by_name(&self.config.palette);
+        if self.config.translation != translation_before {
+            let engaged = self
+                .detail
+                .shown()
+                .is_some_and(|e| self.detail.episodes.engaged_for(e.anilist_id));
+            if engaged {
+                self.detail.episodes.reset();
+                self.engage_detail(now, tx);
+            }
+        }
+    }
+
+    /// Quit (`q` / `:q`): a dirty Settings tab persists first (DESIGN 7.2);
+    /// Ctrl-C stays the emergency exit that skips this.
+    fn on_quit(&mut self, now: Instant) {
+        if self.view == View::Settings {
+            self.persist_settings(now);
+        }
+        self.quit = true;
+    }
+
+    /// Save-if-dirty on leaving Settings (freeze ROD-210); the §4.10 rows
+    /// name the three outcomes. A missing config dir skips the write.
+    fn persist_settings(&mut self, now: Instant) {
+        if !self.settings.dirty {
+            return;
+        }
+        self.settings.dirty = false;
+        if !self.config_file.parent().is_some_and(|dir| dir.is_dir()) {
+            self.toasts
+                .push(Kind::Warn, "no config dir · not saved", now);
+            return;
+        }
+        match self.config.save(&self.config_file) {
+            Ok(()) => self.toasts.push(Kind::Success, "settings saved", now),
+            Err(_) => self.toasts.push(Kind::Error, "settings save failed", now),
+        }
+    }
+
     /// Enter on a focused grid plays the cursor episode through the serving
     /// binding (03 §6.3); inert without a landed grid. The double-play guard
     /// lives in the session.
@@ -1379,7 +1469,7 @@ impl App {
             View::History => self.draw_history(frame, rows.content, now),
             View::Detail => self.draw_zoom(frame, rows.content, now),
             View::Discover => self.draw_discover(frame, rows.content, now),
-            View::Settings => settings::draw(frame, rows.content, self.palette, &self.settings),
+            View::Settings => self.draw_settings(frame, rows.content),
         }
         chrome::draw_bottom_bar(frame, rows.bottom, self.palette, &self.bottom_bar(now));
         self.toasts.draw(frame, area, self.palette);
@@ -1621,6 +1711,7 @@ impl App {
             },
             View::Detail => HelpLine::Zoom,
             View::Discover => HelpLine::Discover,
+            View::Settings if self.settings.editing() => HelpLine::SettingsEdit,
             View::Settings => HelpLine::Settings,
         }
     }
@@ -1711,6 +1802,7 @@ fn playback_deps<'a>(
         cache_dir: &dirs.cache,
         resume_offset_sec: config.resume_offset_sec,
         translation: Translation::parse(&config.translation).unwrap_or(Translation::Sub),
+        quality: domain::Quality::parse(&config.default_quality),
         skip_mode: SkipMode::parse(&config.skip_mode),
         unix_now: unix_now(),
         now,
@@ -3110,6 +3202,127 @@ mod tests {
         );
         press(&mut app, &tx, t1, &[ch('X'), ch('y')]);
         assert!(app.store.list_history().unwrap().is_empty());
+    }
+
+    // ── Settings (chunk 7) ──────────────────────────────────────────────
+
+    #[test]
+    fn settings_renders_the_5_5_anatomy() {
+        let (mut app, tx, now) = sized("settings-render", 100, 32);
+        app.tick(ch('S'), now, &tx);
+        let text = rendered(&mut app, 100, 32);
+        for needle in [
+            "Player",
+            "Catalog",
+            "Interface",
+            "AniList Sync",
+            "mpv path",
+            "enter to edit",
+            "megaplay (default)",
+            "[████ on ████]",
+            "metadata refresh",
+            "automatic",
+            "not connected",
+            "enter to connect",
+            "5s",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in {text}");
+        }
+    }
+
+    #[test]
+    fn settings_cycle_dirties_and_leaving_persists_with_toast() {
+        let (mut app, tx, now) = sized("settings-persist", 100, 32);
+        std::fs::create_dir_all(app.config_file.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&app.config_file);
+        app.tick(ch('S'), now, &tx);
+        press(&mut app, &tx, now, &[ch('j'), ch('l')]);
+        assert_eq!(app.config.default_quality, "worst");
+        assert!(app.settings.dirty);
+        app.tick(ch('B'), now, &tx);
+        assert_eq!(app.view, View::Browse, "leave persisted, then switched");
+        assert!(!app.settings.dirty);
+        let text = rendered(&mut app, 100, 32);
+        assert!(text.contains("settings saved"), "{text}");
+        let saved = Config::load(&app.config_file);
+        assert_eq!(saved.default_quality, "worst");
+        std::fs::remove_file(&app.config_file).ok();
+    }
+
+    #[test]
+    fn settings_missing_config_dir_warns_and_skips() {
+        let (mut app, tx, now) = sized("settings-nodir", 100, 32);
+        app.config_file = std::path::PathBuf::from("/nonexistent-sabigoku-dir/config.toml");
+        app.tick(ch('S'), now, &tx);
+        press(&mut app, &tx, now, &[ch('j'), ch('l'), ch('B')]);
+        let text = rendered(&mut app, 100, 32);
+        assert!(text.contains("no config dir · not saved"), "{text}");
+    }
+
+    #[test]
+    fn q_in_settings_persists_a_dirty_tab_then_quits() {
+        let (mut app, tx, now) = sized("settings-quit", 100, 32);
+        std::fs::create_dir_all(app.config_file.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&app.config_file);
+        app.tick(ch('S'), now, &tx);
+        press(
+            &mut app,
+            &tx,
+            now,
+            &[ch('j'), ch('j'), ch('j'), ch('l'), ch('q')],
+        );
+        assert!(app.quit);
+        assert_eq!(Config::load(&app.config_file).resume_offset_sec, 10);
+        std::fs::remove_file(&app.config_file).ok();
+    }
+
+    #[test]
+    fn palette_cycle_projects_live() {
+        let (mut app, tx, now) = sized("settings-palette", 100, 32);
+        app.tick(ch('S'), now, &tx);
+        // Down to the palette row (index 8), cycle once.
+        for _ in 0..8 {
+            app.tick(ch('j'), now, &tx);
+        }
+        app.tick(ch('l'), now, &tx);
+        assert_eq!(app.config.palette, "phosphor");
+        assert_eq!(app.palette.name, "phosphor", "repaints on the next frame");
+    }
+
+    #[test]
+    fn translation_cycle_rekeys_an_engaged_grid() {
+        let (mut app, tx, rx, now) = play_harness("settings-trans");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        assert!(app.detail.episodes.has_grid());
+        app.tick(ch('S'), t1, &tx);
+        press(&mut app, &tx, t1, &[ch('j'), ch('j'), ch('l')]);
+        assert_eq!(app.config.translation, "dub");
+        assert!(
+            !app.detail.episodes.has_grid(),
+            "the sub grid must not survive a track flip (ROD-329)"
+        );
+        settle_feed(&mut app, &tx, &rx, t1);
+    }
+
+    #[test]
+    fn settings_edit_mode_swallows_view_keys_and_esc_stays() {
+        let (mut app, tx, now) = sized("settings-edit", 100, 32);
+        app.tick(ch('S'), now, &tx);
+        app.tick(key(KeyCode::Enter), now, &tx);
+        assert!(app.settings.editing());
+        // View letters and F-keys are text / swallowed while editing.
+        press(&mut app, &tx, now, &[ch('B'), key(KeyCode::F(1))]);
+        assert_eq!(app.view, View::Settings);
+        let text = rendered(&mut app, 100, 32);
+        assert!(text.contains("type value"), "edit help line shows");
+        app.tick(key(KeyCode::Enter), now, &tx);
+        assert_eq!(app.config.mpv_path, "mpvB", "B was text, F1 dropped");
+        // Esc outside edit mode never leaves Settings (DESIGN 7.4).
+        app.tick(key(KeyCode::Esc), now, &tx);
+        assert_eq!(app.view, View::Settings);
+        // The letter routes again once the edit is over.
+        app.tick(ch('B'), now, &tx);
+        assert_eq!(app.view, View::Browse);
     }
 
     #[test]

@@ -272,6 +272,8 @@ pub struct PlaySpec {
     /// 1-based; the AniSkip ordinal fallback (03 §9).
     pub episode_ix: u32,
     pub translation: Translation,
+    /// The Settings cap policy, applied at variant selection (DESIGN 5.5).
+    pub quality: Quality,
     pub title: String,
     pub start_secs: f64,
     pub mpv_path: String,
@@ -307,6 +309,7 @@ pub fn spawn_play(
             episode_label,
             episode_ix,
             translation,
+            quality,
             title,
             start_secs,
             mpv_path,
@@ -350,7 +353,7 @@ pub fn spawn_play(
         let result = player::play(
             &opts,
             || {
-                p.resolve(&provider_id, &episode_label, translation, Quality::Best)
+                p.resolve(&provider_id, &episode_label, translation, quality)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             },
             move |event| bridge.forward(event),
@@ -784,6 +787,7 @@ mod tests {
                 episode_label: "1".into(),
                 episode_ix: 1,
                 translation: Translation::Sub,
+                quality: Quality::Best,
                 title: "t".into(),
                 start_secs: 0.0,
                 mpv_path: "mpv".into(),

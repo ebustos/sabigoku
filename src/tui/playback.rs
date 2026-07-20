@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::aniskip::SkipMode;
-use crate::domain::{self, Translation};
+use crate::domain::{self, Quality, Translation};
 use crate::player::Position;
 use crate::providers::ProviderRegistry;
 use crate::store::Store;
@@ -36,6 +36,7 @@ pub struct PlaybackDeps<'a> {
     pub cache_dir: &'a Path,
     pub resume_offset_sec: u32,
     pub translation: Translation,
+    pub quality: Quality,
     pub skip_mode: SkipMode,
     pub unix_now: i64,
     pub now: Instant,
@@ -189,6 +190,7 @@ impl PlaybackSession {
                 episode_label: req.episode_label.clone(),
                 episode_ix: req.episode_ix,
                 translation: deps.translation,
+                quality: deps.quality,
                 title: req.title,
                 start_secs,
                 mpv_path: deps.mpv_path.to_string(),
@@ -446,6 +448,7 @@ mod tests {
                 cache_dir: Path::new("/tmp"),
                 resume_offset_sec: 5,
                 translation: Translation::Sub,
+                quality: Quality::Best,
                 skip_mode: SkipMode::None,
                 unix_now: 1000,
                 now,
