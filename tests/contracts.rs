@@ -45,7 +45,8 @@ use Cov::{Deferred, Pending, Seeded};
 /// chapter so 05 stays the index; cites name a representative enforcing test.
 const CONTRACTS: &[Contract] = &[
     // 1 · Navigation, quit, Esc chain
-    c("1.1", "list motion stays in bounds; scrollIntoView keeps the cursor visible", Seeded("tui::view::history::scroll_keeps_the_cursor_and_its_header_visible")),
+    c("1.1", "j/k clamp to bounds; g/G jump to ends; scroll follows the jump", Seeded("tui::view::browse::nav_clamps_and_jumps")),
+    c("1.1", "scrollIntoView keeps the cursor and its header visible", Seeded("tui::view::history::scroll_keeps_the_cursor_and_its_header_visible")),
     c("1.2", "q / Ctrl-C quit; Settings saves dirty first; never back-nav", Seeded("tui::app::q_quits_from_every_view_in_normal_mode")),
     c("1.3", "Esc chain matrix per DESIGN; zoom demotes to origin pane", Seeded("tui::app::esc_chain_table")),
     c("1.4", "pane focus: h/l at width>=60; narrow has no second pane", Seeded("tui::app::h_l_toggle_panes_per_the_focus_table")),
@@ -171,7 +172,7 @@ const LEDGER: &[BugCheck] = &[
     b("R-5", "CLONE: stream open / CDN block retries then toasts", Seeded("player::open_failed_retries_with_backoff_then_succeeds")),
     b("R-6", "CLONE: playback failure surfaces an error, never aborts", Seeded("player::other_exit_codes_fail_without_retry")),
     b("R-7", "CLONE: softsubs fetch / retry / content-based track pick", Deferred("M2 subtitle pipeline; not ported in M1")),
-    b("R-8", "CLONE: quality cap honoured on the fallback provider", Seeded("domain::quality_parse_and_cap")),
+    b("R-8", "FIX-IN-RUST: cap is one shared HLS seam every provider routes through, no fallback-only path to drop it", Seeded("providers::hls::select_variant_cap_policy_picks_the_right_rung")),
     b("R-9", "CLONE: provider flip keeps the in-progress episode cursor", Seeded("tui::app::v_cycles_the_pin_with_toasts_and_flip")),
     b("R-10", "CLONE: SSRF / unsafe link check on all resolve paths", Seeded("player::private_stream_url_is_blocked_before_spawn")),
     b("R-11", "CLONE: post-play refresh follows the watched show", Seeded("tui::app::cross_show_finish_never_touches_the_new_detail")),
