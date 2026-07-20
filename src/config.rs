@@ -45,7 +45,7 @@ impl Default for Config {
             cover_art: true,
             kanji_chips: true,
             palette: "terminal_ghost".into(),
-            landing: "history".into(),
+            landing: "last_watched".into(),
             title_language: "romaji".into(),
             discover_cover_concurrency: 4,
             preferred_provider: String::new(),

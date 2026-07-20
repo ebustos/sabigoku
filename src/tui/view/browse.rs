@@ -26,6 +26,13 @@ pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Episode-count meta field earns space only on a wide pane; title > score >
 /// eps (DESIGN 4.1).
 const EPS_FIELD_MIN_W: u16 = 40;
+/// Fixed meta-column widths (freeze parity): score `[100]`/`[--]`, eps
+/// `1000 ep` worst case, with a gap between title, eps, and score. The marker
+/// glyph plus its trailing space is two cells.
+const SCORE_W: u16 = 5;
+const EPS_W: u16 = 7;
+const META_GAP: u16 = 2;
+const MARKER_W: u16 = 2;
 
 #[derive(Default)]
 pub struct BrowseState {
@@ -205,55 +212,65 @@ fn draw_row(
         Style::new().fg(palette.focus).add_modifier(Modifier::DIM)
     };
 
-    // Right-anchored score badge against the pane edge (DESIGN 4.3), with the
-    // episode count to its left on a wide pane; the title never squeezes.
-    let badge = render::score_badge(entry.score);
-    let badge_w = badge.len() as u16;
-    let mut right_edge = row.width.saturating_sub(1);
-    if badge_w + 3 <= right_edge {
-        let x = row.x + right_edge - badge_w;
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                badge,
-                render::score_style(palette, entry.score, false),
-            )),
-            Rect::new(x, row.y, badge_w, 1),
-        );
-        right_edge -= badge_w + 1;
-    }
-    if row.width >= EPS_FIELD_MIN_W
-        && let Some(eps) = entry.total_episodes
-    {
-        let field = format!("{eps}ep");
-        let w = field.len() as u16;
-        if w + 3 <= right_edge {
-            let x = row.x + right_edge - w;
-            frame.render_widget(
-                Paragraph::new(Span::styled(field, Style::new().fg(palette.fg3))),
-                Rect::new(x, row.y, w, 1),
-            );
-            right_edge -= w + 1;
-        }
-    }
-
-    let mut spans = vec![Span::raw(" ")];
-    if selected {
-        spans.push(Span::styled("▸ ", marker_style));
+    // Fixed meta columns against the pane's right edge (DESIGN 4.3): score
+    // always, episode count to its left on a wide pane. Fixed edges keep the
+    // title's truncation point steady so the columns never jitter row-to-row.
+    let show_eps = row.width >= EPS_FIELD_MIN_W;
+    let score_x = row.width.saturating_sub(SCORE_W);
+    let (eps_x, title_right) = if show_eps {
+        let eps_x = score_x.saturating_sub(META_GAP + EPS_W);
+        (Some(eps_x), eps_x.saturating_sub(META_GAP))
     } else {
-        spans.push(Span::raw("  "));
-    }
+        (None, score_x.saturating_sub(META_GAP))
+    };
+
+    // Marker + title first, clipped to the fixed meta edge; the meta columns
+    // then render on top of their reserved right zone. The marker sits flush
+    // at the pane origin so the list aligns with the rest of the chrome.
+    let marker = if selected { "▸ " } else { "  " };
     let title = preferred_title(
         &entry.title_romaji,
         entry.title_english.as_deref(),
         entry.title_native.as_deref(),
         env.pref,
     );
-    let budget = right_edge.saturating_sub(4) as usize;
-    spans.push(Span::styled(
-        render::truncate_to_width(title, budget).into_owned(),
-        title_style,
-    ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), row);
+    let title_budget = title_right.saturating_sub(MARKER_W) as usize;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(marker, marker_style),
+            Span::styled(
+                render::truncate_to_width(title, title_budget).into_owned(),
+                title_style,
+            ),
+        ])),
+        row,
+    );
+
+    // `{n} ep` when the count is known, else `[--]`; right-aligned in the
+    // fixed slot (fg3), only on a wide pane.
+    if let Some(eps_x) = eps_x {
+        let field = match entry.total_episodes {
+            Some(t) => format!("{t} ep"),
+            None => "[--]".to_string(),
+        };
+        let w = field.len() as u16;
+        let x = row.x + eps_x + EPS_W.saturating_sub(w);
+        frame.render_widget(
+            Paragraph::new(Span::styled(field, Style::new().fg(palette.fg3))),
+            Rect::new(x, row.y, w, 1),
+        );
+    }
+
+    let badge = render::score_badge(entry.score);
+    let bw = badge.len() as u16;
+    let x = row.x + score_x + SCORE_W.saturating_sub(bw);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            badge,
+            render::score_style(palette, entry.score, false),
+        )),
+        Rect::new(x, row.y, bw, 1),
+    );
 }
 
 /// First-run vs zero-results (DESIGN 8.3, 8.4): a query that answered empty

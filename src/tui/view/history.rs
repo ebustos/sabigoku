@@ -243,19 +243,17 @@ impl HistoryState {
             .filter(|(_, count)| *count > 0)
             .collect();
         for (g, &(status, count)) in groups.iter().enumerate() {
+            // Packed 2-row entries (title + bar), a blank only between status
+            // groups: a watchlist is a scannable list, not a card gallery.
+            if g > 0 {
+                lines.push(Li::Blank);
+            }
             lines.push(Li::Header { status, count });
             lines.push(Li::Rule);
-            for i in 0..count {
-                if i > 0 {
-                    lines.push(Li::Blank);
-                }
+            for _ in 0..count {
                 lines.push(Li::Title { ord });
                 lines.push(Li::Bar { ord });
                 ord += 1;
-            }
-            lines.push(Li::Rule);
-            if g + 1 < groups.len() {
-                lines.push(Li::Blank);
             }
         }
         lines
@@ -401,11 +399,11 @@ fn draw_title_row(
     } else {
         Style::new().fg(palette.fg)
     };
-    let width = area.width.saturating_sub(6) as usize;
+    let width = area.width.saturating_sub(4) as usize;
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                format!("  {} ", status_glyph(show.list_status)),
+                format!("{} ", status_glyph(show.list_status)),
                 glyph_style,
             ),
             Span::styled(
@@ -442,7 +440,7 @@ fn draw_bar_row(
     );
     let fill_style = render::bar_fill_color(palette, show.list_status, selected, focused);
     let frac_style = render::bar_frac_color(palette, show.list_status, selected, focused);
-    let mut spans = vec![Span::styled("    [", Style::new().fg(palette.chrome))];
+    let mut spans = vec![Span::styled("[", Style::new().fg(palette.chrome))];
     for i in 0..width {
         let (glyph, style) = if Some(i) == resume_cell {
             ("◐", fill_style)
@@ -642,6 +640,8 @@ mod tests {
             show(3, "C", ListStatus::Completed, 12),
         ]);
         let lines = s.layout();
+        // Packed entries (title + bar, no inter-item blank), one header
+        // hairline per group, a blank only between groups.
         assert_eq!(
             lines,
             vec![
@@ -652,10 +652,8 @@ mod tests {
                 Li::Rule,
                 Li::Title { ord: 0 },
                 Li::Bar { ord: 0 },
-                Li::Blank,
                 Li::Title { ord: 1 },
                 Li::Bar { ord: 1 },
-                Li::Rule,
                 Li::Blank,
                 Li::Header {
                     status: ListStatus::Completed,
@@ -664,7 +662,6 @@ mod tests {
                 Li::Rule,
                 Li::Title { ord: 2 },
                 Li::Bar { ord: 2 },
-                Li::Rule,
             ]
         );
     }

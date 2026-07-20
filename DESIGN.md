@@ -304,7 +304,7 @@ Sample widths:
 | Constant | Home | Value | Meaning |
 |---|---|---|---|
 | `PANE_SPLIT_MIN` | `src/tui/layout.rs` | `60` | Browse and History split to two panes at or above this width; below it, single-column list only. Also the single detail-surface threshold: at or above this width, a focused detail pane renders its interactive episode grid **in-pane** and `Enter` plays from it; `Space` still promotes to the roomier full-screen zoom at any width. There is no separate mid-tier zoom gate (ratified: §10). |
-| `DETAIL_TWO_COL_MIN` | `src/tui/view/detail.rs` | `100` | Gates the two-internal-column split (§5.3) wherever a detail pane is drawn, keyed to that pane's **own width**, not the terminal. Governs both the History persistent two-pane (engages at `term ≥ 168`, once the 38% list is subtracted) and the full-screen zoom's internal split (engages at `term ≥ 102`, since the zoom's pane is `term - 2`). Clearing it is also one of the two conditions that bloom the §5.3a metadata rail; the other is the surface's own `two_col` flag, which Browse-origin detail never sets. |
+| `DETAIL_TWO_COL_MIN` | `src/tui/view/detail.rs` | `100` | Gates the two-internal-column split (§5.3) wherever a detail pane is drawn, keyed to that pane's **own width**, not the terminal. Governs both the History persistent two-pane (engages at `term ≥ 168`, once the 38% list is subtracted) and the full-screen zoom's internal split (engages at `term ≥ 102`, since the zoom's pane is `term - 2`). It gates layout only; the metadata is one compact line at every width (§5.3a). |
 
 `PANE_SPLIT_MIN = 60` is where the in-pane grid begins: grid columns
 `≈ detail_w / 5` give a narrow but real ≈ 5 columns at 60 cols, growing to ≈ 8
@@ -1074,7 +1074,7 @@ short name keeps these within the 36-column budget, and a long-named provider is
 truncated by the toast push. `network unreachable` carries no `{provider}`; it
 names the user's own connectivity, not a provider. `can't reach AniList` names
 AniList directly: the catalog brain is a single fixed dependency and sits outside
-the provider registry. The rail's Pinned field shows `name()`, not
+the provider registry. The provider row's Pinned field shows `name()`, not
 `display_name()` (§5.3a; §10 logs the split).
 
 The four provider cause classes (`network-down`, `blocked`, `server-down`,
@@ -1205,10 +1205,9 @@ the 120-col terminal below is one illustration of it. `active_view` becomes
 demotes back to the two-pane view with `active_pane = .detail`. This surface is
 reached identically from Browse, History, and Discover.
 
-120-col terminal, zoom entered from History (the metadata rail below only blooms
-for a History-origin zoom, §5.3a; entered from Browse at the same width, the
-metadata stays the compact `28 eps · TV` line plus its dedicated Provider/Pinned
-row):
+120-col terminal, zoom entered from History. The metadata is the compact `28 eps ·
+TV` line at every origin and width (§5.3a); the provider row rides the top of the
+episode grid, not the show info:
 
 ```
                                                                                          [context: top bar, full width]
@@ -1218,14 +1217,12 @@ row):
   [   20 × 7 cells      ]    放映中  冬 2024                                            [h chip, m chip]
   [                     ]   ✦ [96/100] · Fantasy · Adventure · Drama                   [h+bold score, d·, m genres]
                             ─────────────────────────────────────────────────────       [border.hair]
-                             Episodes  28                                                [d label, m value]
-                             Format    TV                                                [d label, m value]
+                            28 eps · TV · Manga · 24 min · Madhouse · #12 rated 2024     [compact meta line, m; Rank last, sheds first]
                             ─────────────────────────────────────────────────────       [border.hair]
                              An elf mage who once defeated the Demon King now            [m synopsis, word-wrapped]
                              wanders the continent without purpose, until she
                              meets a young girl named Fern…
-                            ─────────────────────────────────────────────────────
-                             Episodes
+                            ▸megaplay ?senshi ?allanime · [v]                            [provider row atop the grid; m, [v] cycle hint]
                             [1][2][3][4][5][6][▸7][8][9][10][11][12]               [d watched, h▸ resume, m unwatched]
                             [13][14][15][16][17][18][19][20][21][22][23][24]
                             [25][26][27][28]
@@ -1258,69 +1255,45 @@ Notes:
 - The two-column internal split (cover left / content right) uses the same
   `left_w = max(20, pane_w * 38 / 100)` formula. At ≥ 160-col the layout gains
   density (§5.4a) with `right_w ≈ 96` giving ≈ 19 grid columns.
-- The metadata block (`Episodes` / `Format` above the synopsis hairline) is the
-  rail form; §5.3a specifies the full eight-field grammar (Episodes, Format,
-  Source, Duration, Studios, Rank, Provider, Pinned). This mock keeps the two-row
-  baseline for brevity rather than redrawing the full rail. The
-  `nextAiringEpisode` countdown lands on the chips row (§4.4), not here. `v
+- The metadata is the compact `· `-joined line (§5.3a): Episodes, Format, Source,
+  Duration, Studios, Rank. Provider and Pinned are not on it; they ride the top of
+  the episode grid as the `▸{serving} … · [v]` row. The `nextAiringEpisode`
+  countdown lands on the chips row (§4.4), not here. `v
   provider` in the help line cycles the provider pin; it is live on this zoom
   surface, same as the in-pane grid.
 
-### 5.3a Detail Metadata: Compact Line vs. Labeled Rail
+### 5.3a Detail Metadata: The Compact Line
 
-One ordered field list, two render densities. `detail_meta_fields()`
-(`src/tui/app.rs`) returns an ordered list of `MetaField` (`{label, value, unit,
-dim, rail_only}`), highest-priority field first: **Episodes**, **Format**,
-**Source**, **Duration**, **Studios**, **Rank**, **Provider**, **Pinned**. Rank,
-Provider, and Pinned carry the `rail_only` flag. The first six are AniList
-metadata about the show itself. Provider and Pinned are not: Provider reads the
-provider bindings (`anime` binding rows + `provider_absences`) plus the live
-session's serving provider; Pinned reads the `provider_pins` table. Provider is
-appended only when the open show carries a canonical AniList identity, Pinned only
-when it also carries a per-show provider pin. (Value examples below use two
-registry providers, `allanime` and `altsrc`; `allanime` is the first implemented,
-`altsrc` an illustrative name for the next.)
+One ordered field list, one density at every width and origin. `detail_meta_fields()`
+(`src/tui/view/detail.rs`) returns an ordered list of `MetaField` (`{label, value,
+unit, dim, rail_only}`), highest-priority field first: **Episodes**, **Format**,
+**Source**, **Duration**, **Studios**, **Rank**, **Provider**, **Pinned**. The
+first six are AniList metadata about the show; Provider and Pinned are not:
+Provider reads the provider bindings (`anime` binding rows + `provider_absences`)
+plus the live session's serving provider, Pinned reads the `provider_pins` table.
 
-`draw_header` (`src/tui/view/detail.rs`) renders the field list through one of two
-functions, selected by a `bloom: bool` parameter, so the two forms can't drift
-apart: same source, same order, same value strings:
+The six show fields render on the **compact line** (`meta_line`), values joined
+with ` · ` on one row (separator `fg3`, values `fg2`, `fg3` when a value's `dim`
+flag is set). A unit suffix renders here (`13 eps`; Format carries no unit), and a
+separator sits only *between* two emitted fields, so an absent field never leaves
+an orphan `·` (§8.1). **Rank rides last**, so it is the first field the line sheds
+when width tightens.
 
-- **`draw_meta_line`**: the compact form: values joined with ` · ` on one row
-  (separator `fg3`, values `fg2`, `fg3` when a value's `dim` flag is set). A unit
-  suffix renders only here (`13 eps`; Format carries no unit). A separator sits
-  only *between* two emitted fields, so an absent field never leaves an orphan `·`
-  (§8.1). It skips any field flagged `rail_only` outright: one shared conditional,
-  not a per-field branch.
-- **`draw_meta_rail`**: the roomy form: `Label  Value` stacked one field per row,
-  an 8-col label gutter (`fg3`) with values aligned at column 10 (`fg2`, `fg3`
-  when `dim`). The rail walks the same priority order top-down, so a pane too
-  short to hold every row drops the **lowest**-priority rows first. Episodes,
-  emitted first, never drops; Pinned, appended last, is the first to shed, then
-  Provider just ahead of it.
+**Provider and Pinned ride the grid, not the show info.** They carry the
+`rail_only` flag (kept off `meta_line`) and render as a dedicated row at the top
+of the episode grid via `provider_line`: `▸{serving} {bindings} · pin {pinned} ·
+[v]`, where `[v]` is the cycle-provider affordance (the `v` key, §7.5
+keybind-hint styling). The row appears only when the grid is engaged (a focused
+detail surface), because the provider/pin state is a "how this will play"
+affordance that belongs with the grid you play from, not the show metadata.
+(This replaces the earlier compact-line-vs-labeled-rail design; the §5.3a rail and
+its `bloom`/`two_col` gating are gone. ROD-458.)
 
-**Episodes is the floor.** It always renders, never omitted: when neither the
-per-track count (`eps_sub`/`eps_dub`) nor `total_episodes` is known (no show
-focused, or a show with no metadata yet) it degrades to a dim `?` (`fg3`, the
-`dim` flag) instead of disappearing, so neither form is ever empty. Every other
-field can be omitted outright: each simply isn't emitted when its underlying value
-is null (§8.1: no orphan separator, no bare rail row).
-
-**The rail needs two conditions, not one.** `draw_header`'s `bloom` argument is
-`two_col && is_two_column(w)`: the caller's `two_col` flag **and** the pane
-clearing `DETAIL_TWO_COL_MIN` (100, §3.2). `two_col` is keyed per surface, not
-just by width:
-
-| Surface | `two_col` | Rail engages at |
-|---|---|---|
-| Browse in-pane detail | always `false` | never: always the compact line, at any width (Browse's in-pane detail keeps the single stack) |
-| History in-pane detail (§5.4a) | always `true` | `detail_w ≥ 100`, i.e. `term ≥ 168` |
-| Full-screen zoom, Browse-origin (§5.3) | always `false` | never: always the compact line, at any terminal width |
-| Full-screen zoom, History-origin (§5.3) | always `true` | `body_w ≥ 100`, i.e. `term ≥ 102` |
-
-So width alone doesn't bloom the metadata: a wide Browse-origin zoom still shows
-the compact line, because `detail_origin` gates `two_col` before width is even
-checked. History's in-pane split needs a genuinely wide terminal (168 cols)
-because the rail only claims the ~38%-width left column, not the full pane.
+**Episodes is the floor.** It always renders, never omitted: when `total_episodes`
+is unknown (no show focused, or a show with no metadata yet) it degrades to a dim
+`?` (`fg3`, the `dim` flag) instead of disappearing, so the line is never empty.
+Every other field can be omitted outright: each simply isn't emitted when its
+underlying value is null (§8.1: no orphan separator).
 
 **Field formatting:**
 
@@ -2889,7 +2862,7 @@ strings elsewhere.
 |---|---|
 | `src/tui/theme.rs` | Every color token (§1.1) and the four `Palette` instances (§1.4) |
 | `src/tui/layout.rs` | `pane_split(w)` and `PANE_SPLIT_MIN` (§3.2) |
-| `src/tui/view/detail.rs` | `DETAIL_TWO_COL_MIN`, `cover_height_cap` / `synopsis_cap` (§3.3), `draw_meta_line` / `draw_meta_rail` / `draw_provider_line` / `draw_alt_titles` (§5.3a, §4.4) |
+| `src/tui/view/detail.rs` | `DETAIL_TWO_COL_MIN`, `cover_height_cap` / `synopsis_cap` (§3.3), `meta_line` / `provider_line` / `alt_rows` (§5.3a, §4.4) |
 | `src/tui/view/discover.rs` | `GENRE_GLYPHS` (must match §3.8a exactly), card-grid geometry (§3.8) |
 | `src/tui/view/browse.rs` / `src/tui/view/history.rs` | List-row rendering (§4.1), History preview stack (§5.4a) |
 | `src/tui/view/settings.rs` + `src/tui/settings_state.rs` | Settings rows; the compile-time section-boundary assertion (§5.5) |

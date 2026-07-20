@@ -253,10 +253,10 @@ impl App {
             KeyCode::Esc => self.on_escape(),
             KeyCode::Char(' ') => self.on_space(now, tx),
             KeyCode::Enter => self.on_enter(now, tx),
-            KeyCode::Char('h') => self.on_h(),
-            KeyCode::Char('l') => self.on_l(now, tx),
-            KeyCode::Char('j') => self.on_j(now),
-            KeyCode::Char('k') => self.on_k(now),
+            KeyCode::Char('h') | KeyCode::Left => self.on_h(),
+            KeyCode::Char('l') | KeyCode::Right => self.on_l(now, tx),
+            KeyCode::Char('j') | KeyCode::Down => self.on_j(now),
+            KeyCode::Char('k') | KeyCode::Up => self.on_k(now),
             KeyCode::Char('g') => self.on_jump(true, now),
             KeyCode::Char('G') => self.on_jump(false, now),
             KeyCode::Char('v') => self.on_pin_cycle(now, tx),
@@ -1532,7 +1532,6 @@ impl App {
                 &mut self.pool,
                 self.pane == Pane::Detail,
                 false,
-                false,
             );
         } else {
             let list = ratatui::layout::Rect::new(
@@ -1581,9 +1580,8 @@ impl App {
                 &env,
                 &mut self.pool,
                 self.pane == Pane::Detail,
-                // History's pane is the one in-pane surface that splits and
-                // blooms the rail past DETAIL_TWO_COL_MIN (DESIGN 5.3a).
-                true,
+                // History's pane is the one in-pane surface that splits to two
+                // columns past DETAIL_TWO_COL_MIN (DESIGN 5.3).
                 true,
             );
         } else {
@@ -1599,17 +1597,7 @@ impl App {
 
     fn draw_zoom(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
         let env = self.view_env(now);
-        // Only a History-origin zoom sets the two_col flag that blooms the
-        // §5.3a rail; the layout split itself is width-keyed in the view.
-        detail::draw_zoom(
-            frame,
-            area,
-            self.palette,
-            &self.detail,
-            &env,
-            &mut self.pool,
-            self.origin == Origin::History,
-        );
+        detail::draw_zoom(frame, area, self.palette, &self.detail, &env, &mut self.pool);
     }
 
     fn draw_discover(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
@@ -1638,12 +1626,16 @@ impl App {
                 Origin::Discover => Tab::Discover,
             },
         };
-        // Browse falls back to the current cour; History mirrors the focused
-        // row with the cour fallback (DESIGN 8.3); Discover tracks the
-        // selected card and the zoom its committed show, both with no
-        // fallback; Settings shows no chip (DESIGN 3.4, 7.3).
+        // Browse and History both mirror the focused row's season with the
+        // cour fallback (DESIGN 8.3); Discover tracks the selected card and the
+        // zoom its committed show, both with no fallback; Settings shows no
+        // chip (DESIGN 3.4, 7.3).
         let season_chip = match self.view {
-            View::Browse => Some(render::cour_chip(domain::current_cour(unix_now()))),
+            View::Browse => self
+                .browse
+                .selected()
+                .and_then(|e| render::season_chip(e.season, e.year))
+                .or_else(|| Some(render::cour_chip(domain::current_cour(unix_now())))),
             View::History => self
                 .history
                 .selected()
@@ -3391,7 +3383,7 @@ mod tests {
     }
 
     #[test]
-    fn zoom_metadata_blooms_only_for_history_origin() {
+    fn zoom_metadata_stays_compact_at_every_origin() {
         let page = Ok(CatalogPage {
             entries: vec![Enrichment {
                 kind: Some("TV".into()),
@@ -3424,23 +3416,25 @@ mod tests {
         assert_eq!(app.view, View::Detail);
         assert_eq!(app.origin, Origin::Browse);
 
-        // Browse-origin zoom at 110: split layout, compact metadata.
+        // Compact metadata line, no label→value rail, provider row with the
+        // grid. Origin must not change any of that (the §5.3a rail is gone).
         let browse_zoom = rendered(&mut app, 110, 32);
-        assert!(browse_zoom.contains("12 eps"), "{browse_zoom}");
-        assert!(browse_zoom.contains("▸megaplay"), "provider row renders");
+        assert!(browse_zoom.contains("12 eps · TV"), "{browse_zoom}");
+        assert!(browse_zoom.contains("▸megaplay"), "provider rides the grid");
         assert!(
-            !browse_zoom.contains("Duration"),
-            "no rail labels on a Browse-origin zoom"
+            !browse_zoom.contains("Duration") && !browse_zoom.contains("Episodes"),
+            "no rail labels: {browse_zoom}"
         );
 
-        // Same zoom, History origin: the rail blooms with labeled rows.
         app.origin = Origin::History;
         app.dirty = true;
         let history_zoom = rendered(&mut app, 110, 32);
-        assert!(history_zoom.contains("Episodes"), "{history_zoom}");
-        assert!(history_zoom.contains("Duration"), "{history_zoom}");
-        assert!(history_zoom.contains("Madhouse"), "{history_zoom}");
+        assert!(history_zoom.contains("12 eps · TV"), "{history_zoom}");
         assert!(history_zoom.contains("▸megaplay"), "{history_zoom}");
+        assert!(
+            !history_zoom.contains("Duration") && !history_zoom.contains("Episodes"),
+            "History origin no longer blooms a rail: {history_zoom}"
+        );
     }
 
     #[test]

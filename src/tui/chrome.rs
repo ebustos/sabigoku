@@ -64,17 +64,22 @@ pub fn draw_top_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, top: &
     let mut spans: Vec<Span<'_>> = vec![
         Span::raw("  "),
         Span::styled(
-            "SABIGOKU",
+            "錆獄 sabigoku",
             Style::new().fg(palette.fg).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled("░", Style::new().fg(palette.chrome)),
-        Span::raw("  "),
     ];
+    // The ░ hairline separates the wordmark from the tabs; the narrowest tier
+    // drops it so the single active label clears the fixed right-edge dot.
+    let hairline = |spans: &mut Vec<Span<'_>>| {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("░", Style::new().fg(palette.chrome)));
+        spans.push(Span::raw("  "));
+    };
     let active_key = Style::new().fg(palette.focus);
     let active_label = Style::new().fg(palette.focus).add_modifier(Modifier::BOLD);
     let sep = Style::new().fg(palette.fg3);
     if area.width >= W_FULL {
+        hairline(&mut spans);
         for (i, tab) in TABS.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" · ", sep));
@@ -96,6 +101,7 @@ pub fn draw_top_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, top: &
             spans.push(Span::styled(chip.clone(), Style::new().fg(palette.fg2)));
         }
     } else if area.width >= W_BRIEF {
+        hairline(&mut spans);
         for (i, tab) in TABS.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" · ", sep));
@@ -108,6 +114,7 @@ pub fn draw_top_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, top: &
             spans.push(Span::styled(tab.brief(), style));
         }
     } else {
+        spans.push(Span::raw("  "));
         let (key, label) = top.tab.full();
         spans.push(Span::styled(key, active_key));
         spans.push(Span::styled(label, active_label));
@@ -296,7 +303,7 @@ pub fn draw_bottom_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, bar
                         .fg(palette.hot)
                         .add_modifier(Modifier::SLOW_BLINK),
                 ),
-                Span::raw("  "),
+                Span::raw(" "),
             ];
             for seg in help_segments(*line) {
                 spans.push(match seg {
