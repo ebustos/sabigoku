@@ -247,13 +247,14 @@ fn draw_row(
     );
 
     // `{n} ep` when the count is known, else `[--]`; right-aligned in the
-    // fixed slot (fg3), only on a wide pane.
+    // fixed slot (fg3), only on a wide pane. Clamp to the slot so an
+    // out-of-range count can never bleed into the score column.
     if let Some(eps_x) = eps_x {
         let field = match entry.total_episodes {
             Some(t) => format!("{t} ep"),
             None => "[--]".to_string(),
         };
-        let w = field.len() as u16;
+        let w = (field.len() as u16).min(EPS_W);
         let x = row.x + eps_x + EPS_W.saturating_sub(w);
         frame.render_widget(
             Paragraph::new(Span::styled(field, Style::new().fg(palette.fg3))),
@@ -342,6 +343,39 @@ mod tests {
         }
         fn enrich(&self, _id: i64) -> Result<Option<Enrichment>, CatalogError> {
             Ok(None)
+        }
+    }
+
+    /// The fixed meta columns never overlap the title, at any width from the
+    /// list-pane floor up: widest badge + widest eps field against a title
+    /// long enough to want the whole row (ROD-458 review, F5/F6).
+    #[test]
+    fn row_meta_columns_never_overlap_the_title() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut e = entry(1);
+        e.title_romaji = "A Very Long Title That Would Happily Run Into The Meta Zone".into();
+        e.score = Some(100); // widest badge, "[100]"
+        e.total_episodes = Some(1000); // widest eps, "1000 ep"
+        let env = ViewEnv {
+            pref: crate::domain::TitleLanguage::Romaji,
+            kanji: false,
+            cour: crate::domain::current_cour(0),
+            unix_now: 0,
+            now: Instant::now(),
+            play: None,
+        };
+        let pal = &crate::tui::theme::TERMINAL_GHOST;
+        for w in 30u16..=80 {
+            let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
+            term.draw(|f| draw_row(f, Rect::new(0, 0, w, 1), pal, &e, &env, true, true))
+                .unwrap();
+            let buf = term.backend().buffer();
+            let row: String = (0..w).map(|x| buf[(x, 0)].symbol()).collect();
+            assert!(row.contains("[100]"), "width {w}: score clipped: {row:?}");
+            if w >= EPS_FIELD_MIN_W {
+                assert!(row.contains("1000 ep"), "width {w}: eps clipped: {row:?}");
+            }
         }
     }
 

@@ -37,9 +37,9 @@ use crate::tui::workers::{self, Drain};
 pub const COVER_SETTLE: Duration = Duration::from_millis(150);
 
 /// Rows reserved below the cover in the single-column layout: worst-case
-/// header (now including the §5.3a meta line + Provider/Pinned row), a
-/// 2-line synopsis, the grid's spacer, and 2 grid rows, so the episode grid
-/// always keeps >= 2 visible rows (DESIGN 3.3).
+/// header + the compact meta line, a 2-line synopsis, the grid's spacer, the
+/// provider caption that heads the grid (§5.3a), and 2 grid rows, so the
+/// episode grid always keeps >= 2 visible rows (DESIGN 3.3).
 const COVER_RESERVE: u16 = 14;
 /// Below this a squashed poster is dropped outright, never a sliver.
 const MIN_COVER_ROWS: u16 = 6;
@@ -60,6 +60,20 @@ pub fn synopsis_cap(remaining: u16) -> u16 {
     remaining.saturating_sub(GRID_RESERVE)
 }
 
+/// Focused-grid row budget below the header (DESIGN 3.3). Layout below `y`:
+/// synopsis, a 1-row spacer, the provider caption (§5.3a: it heads the grid),
+/// then the grid. The synopsis yields so the grid keeps >= 2 rows; the
+/// provider caption draws only when a grid row still follows it, never
+/// orphaned above an empty region. Returns `(synopsis_rows, show_provider)`.
+fn body_budget(remaining: u16, syn_natural: u16, grid_rows: u16, has_provider: bool) -> (u16, bool) {
+    let prov = u16::from(has_provider);
+    let syn_rows = syn_natural
+        .min(remaining.saturating_sub(1 + prov + grid_rows).max(2))
+        .min(remaining.saturating_sub(1 + prov + 2));
+    let show_provider = has_provider && syn_rows + 2 < remaining;
+    (syn_rows, show_provider)
+}
+
 /// Cover tier from the effective column width (DESIGN 3.2): never terminal
 /// width, and hard-capped at 20 cols.
 fn cover_width(detail_w: u16) -> u16 {
@@ -74,9 +88,9 @@ fn cover_width(detail_w: u16) -> u16 {
 const CELL_W: u16 = 5;
 
 /// Two-internal-column gate (DESIGN 3.2), keyed to the pane's OWN width. The
-/// split needs the surface to allow it (Browse's in-pane detail keeps the
-/// single stack at any width); the §5.3a rail additionally needs the
-/// surface's `two_col` flag, which only History-origin surfaces set.
+/// split needs the surface to allow it (`split_ok`); Browse's in-pane detail
+/// keeps the single stack at any width. It gates the cover/content column
+/// split only: the metadata is one compact line at every width (§5.3a).
 pub const DETAIL_TWO_COL_MIN: u16 = 100;
 
 /// Gap between the cover column and the content column in the split layout.
@@ -249,6 +263,7 @@ impl DetailState {
 /// boundary without a border (DESIGN 3.1). `focused` lights the grid cursor;
 /// `split_ok` gates the two-column cover|content split (Browse keeps the
 /// single stack, History splits past the width gate).
+#[allow(clippy::too_many_arguments)]
 pub fn draw_pane(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -284,6 +299,7 @@ pub fn draw_zoom(
     draw_content(frame, body, palette, state, env, pool, true, true);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_content(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -500,18 +516,15 @@ fn draw_body(
         .as_deref()
         .map_or(1, |t| render::wrap_text(t, area.width as usize).len() as u16);
     let cols = grid_cols(area.width);
-    // Grid rows plus the provider row that heads them (DESIGN 5.3a: the
-    // provider caption belongs to the grid, not the show info).
-    let grid_need = (session.grid().len().div_ceil(cols).max(1)) as u16 + 1;
-    let budget = remaining.saturating_sub(1);
-    let syn_rows = syn_natural
-        .min(budget.saturating_sub(grid_need).max(2))
-        .min(budget.saturating_sub(2));
+    let grid_rows = (session.grid().len().div_ceil(cols).max(1)) as u16;
+    let fields = detail_meta_fields(entry, session);
+    let provider = provider_line(&fields, palette);
+    let (syn_rows, show_provider) =
+        body_budget(remaining, syn_natural, grid_rows, provider.is_some());
     draw_synopsis(frame, area, palette, entry, state.scroll, y, syn_rows);
     let mut grid_y = y + syn_rows + 1;
-    let fields = detail_meta_fields(entry, session);
-    if let Some(pline) = provider_line(&fields, palette)
-        && grid_y < area.height
+    if show_provider
+        && let Some(pline) = provider
     {
         frame.render_widget(
             Paragraph::new(pline),
@@ -1114,6 +1127,30 @@ mod tests {
     use crate::domain::TitleLanguage;
     use crate::tui::event;
     use ratatui_image::picker::Picker;
+
+    /// The focused-grid budget: the grid keeps >= 2 rows when the pane can
+    /// hold them, and the provider caption is never orphaned above an empty
+    /// grid at tight heights (ROD-458 review).
+    #[test]
+    fn body_budget_keeps_grid_rows_and_never_orphans_provider() {
+        // Roomy: full synopsis, caption shown, grid keeps its rows.
+        let (syn, prov) = body_budget(30, 8, 4, true);
+        assert!(prov);
+        let grid_h = 30 - (syn + 1 + 1);
+        assert!(grid_h >= 2, "grid keeps >= 2 rows, got {grid_h}");
+        // Tight: caption yields rather than sit above an empty grid.
+        for remaining in 0u16..=8 {
+            let (syn, show) = body_budget(remaining, 8, 4, true);
+            let grid_y = syn + 1 + u16::from(show);
+            let grid_h = remaining.saturating_sub(grid_y);
+            assert!(
+                !show || grid_h >= 1,
+                "remaining {remaining}: caption orphaned (grid_h {grid_h})"
+            );
+        }
+        // No provider row: never claims to show one.
+        assert!(!body_budget(30, 8, 4, false).1);
+    }
 
     fn entry(id: i64) -> Enrichment {
         Enrichment {
