@@ -1299,19 +1299,19 @@ underlying value is null (§8.1: no orphan separator).
 
 - **Source**: AniList `source` enum (`MANGA`, `LIGHT_NOVEL`, `ORIGINAL`,
   `VISUAL_NOVEL`, `GAME`, `WEB_NOVEL`, …), rendered title-case with underscores
-  turned to spaces: `LIGHT_NOVEL` → `Light novel`, `ORIGINAL` → `Original`. Rail
-  label `Source`. Nullable column, mirrors `kind`.
+  turned to spaces: `LIGHT_NOVEL` → `Light novel`, `ORIGINAL` → `Original`.
+  ~~Rail label `Source`.~~ Nullable column, mirrors `kind`.
 - **Duration**: AniList `duration` (per-episode runtime, minutes), rendered
   `{n} min` (e.g. `24 min`); omitted when null or zero: a 0-minute runtime is a
-  missing value, not a fact. Rail label `Duration`. Nullable column.
+  missing value, not a fact. ~~Rail label `Duration`.~~ Nullable column.
 - **Studios**: AniList `studios{nodes{name}}`, narrowed to *main* animation
   studios via AniList's `isMain` flag (`studios(isMain:true){nodes{name}}`).
   Persisted as its own `studios` column ('\n'-joined blob, split on read,
   `COALESCE` on upsert so a null re-fetch never clobbers a stored list; the §8
   DB-safety rule applies to every nullable metadata column, not just this one).
   Collapse-format: `A` for one studio, `A, B` for two, `A, B +N` beyond two,
-  capped at 2 named studios so a long co-production credit list can't blow out the
-  rail's gutter (§10 logs the cap). Rail label `Studios`.
+  capped at 2 named studios ~~so a long co-production credit list can't blow out the
+  rail's gutter~~ (§10 logs the cap). ~~Rail label `Studios`.~~
 - **Rank**: AniList `rankings{rank type context year season allTime}`. Selection
   prefers a **contextual** ranking (`allTime: false`, season- or year-scoped) over
   an all-time one when both exist; render `#{rank} rated {year}` / `#{rank}
@@ -1319,17 +1319,17 @@ underlying value is null (§8.1: no orphan separator).
   the all-time fallback. The season name is dropped even for a season-scoped
   ranking, since the header's own season/year chip (§4.4) already carries that
   context on the same screen. When both a contextual RATED and a contextual
-  POPULAR ranking exist, RATED wins the tie-break (§10). Rail label `Rank`.
+  POPULAR ranking exist, RATED wins the tie-break (§10). ~~Rail label `Rank`.~~
   Persisted as three pre-selected scalar columns, `rank` / `rank_type` /
   `rank_year`, rather than a raw blob: `select_rank` picks the best ranking once
   at fetch time, so render just composes the stored values.
-- **Provider**: rail label `Provider` (8 chars, fills the gutter with no
-  truncation). It folds two related but distinct signals into one value string,
+- **Provider**: ~~rail label `Provider` (8 chars, fills the gutter with no
+  truncation).~~ It folds two related but distinct signals into one value string,
   one token per registry provider in fixed **registry (construction) order**, not
   the per-walk preference order (a resolve-order hint, not a stable reference
   list; reordering this line per session preference would make the same show's
-  rail read differently across sessions, fighting the "scan the same column, same
-  order, every show" habit the rail is built for):
+  ~~rail~~ line read differently across sessions, fighting the "scan the same
+  column, same order, every show" habit the ~~rail~~ line is built for):
 
   - **availability**: does a binding exist for this provider (the canonical row
     joined on that source), does a fresh negative exist (`provider_absences`,
@@ -1388,7 +1388,7 @@ underlying value is null (§8.1: no orphan separator).
   DB/session state rather than a manual choice, but both sit below the AniList
   sextet, which describes the show itself.
 
-**Compact form: Provider and Pinned get their own dedicated row.** Below
+~~**Compact form: Provider and Pinned get their own dedicated row.** Below
 `DETAIL_TWO_COL_MIN` the rail never blooms, so a `rail_only` Provider and Pinned
 would be invisible on every compact-width detail pane, exactly the width most
 terminals run at day to day. They are not folded into the `·`-joined meta line:
@@ -1400,9 +1400,9 @@ which is not part of the generic field-list iteration either renderer uses. It
 finds the already-computed Provider and Pinned entries in the same field list (a
 small linear scan by label, at most eight entries) and composes them into one
 bespoke row, reusing their `value`/`dim` as already computed for the rail; no
-recomputation, no new app-level state.
+recomputation, no new app-level state.~~
 
-Grammar: Provider's segment reuses its rail value verbatim (`▸allanime +altsrc`);
+~~Grammar: Provider's segment reuses its rail value verbatim (`▸allanime +altsrc`);
 the marker glyphs already self-describe. When a pin exists, a `·` separator
 (`fg3`, matching the meta line's own separator) plus a `pin ` prefix plus the
 pin's raw provider name follow: `▸allanime +altsrc · pin altsrc`. The `pin `
@@ -1412,20 +1412,25 @@ third provider token rather than the pin. When unpinned, the row is just the
 Provider segment, no trailing separator. Pinned's segment is always `fg2` when
 shown (no dim state; presence or absence). The `pin ` marker is a literal composed
 directly in `draw_provider_line`, not a `MetaField`-level mechanism; `MetaField`
-stays exactly `{label, value, unit, dim, rail_only}` (§10).
+stays exactly `{label, value, unit, dim, rail_only}` (§10).~~
 
-Omission: the whole row is skipped, no row consumed, when the show has no
+~~Omission: the whole row is skipped, no row consumed, when the show has no
 canonical identity, the same gate Provider itself uses. Placement is fixed
 directly under the meta line and above the hairline into synopsis. A
 height-starved pane drops this row the same way every other single conditional
 row in `draw_header` does; no new shed mechanism, since this row sits outside the
-rail's own height-shed loop entirely.
+rail's own height-shed loop entirely.~~
+
+(This whole "compact form" special case is gone: `provider_line` is now the only
+form, unconditional, drawn atop the episode grid rather than beneath the meta
+line. Current grammar and omission rule are stated above. ROD-458.)
 
 The `nextAiringEpisode` countdown does **not** join this field list; it renders on
 the **chips row** (`state.now`, §4.4) instead, because it is a live,
-clock-relative signal, not a stored snapshot the rail's static model fits. Both
-renderers iterate the field list generically (plus the one shared `rail_only`
-skip in `draw_meta_line`), so a new field is a `detail_meta_fields` data change
+clock-relative signal, not a stored snapshot ~~the rail's~~ (the compact line's,
+ROD-458) static model fits. Both renderers iterate the field list generically
+(plus the one shared `rail_only` skip in ~~`draw_meta_line`~~ `meta_line`), so a
+new field is a `detail_meta_fields` data change
 only, no further renderer edits. The full survey of AniList fields considered and
 rejected for this list is in §10 (metadata field survey).
 
@@ -1603,11 +1608,13 @@ Notes:
   cover URL is null; `[--/100]` in [d] when score is null; `no synopsis yet` in
   [m]+italic when synopsis is null; chips omitted when null.
 - The `28 eps · TV` row is the compact-line form of the metadata grammar (§5.3a):
-  `detail_w ≈ 70` at 120 cols is below `DETAIL_TWO_COL_MIN` (100), so the rail
+  ~~`detail_w ≈ 70` at 120 cols is below `DETAIL_TWO_COL_MIN` (100), so the rail
   doesn't bloom here; it does once the pane clears 100 (`term ≥ 168`, below). The
   dedicated Provider/Pinned row (§5.3a) renders below this compact line; this mock
-  keeps the two-field baseline for brevity. `v provider` in the help line cycles
-  the provider pin; it is live on this in-pane surface, same as the zoom.
+  keeps the two-field baseline for brevity.~~ This is the only form, at every
+  width and origin; the Provider/Pinned row rides the top of the episode grid
+  instead of the header (ROD-458). `v provider` in the help line cycles the
+  provider pin; it is live on this in-pane surface, same as the zoom.
 
 ---
 
@@ -1624,12 +1631,10 @@ focus, the zoom gets the full canvas: `left_w ≈ 60`, `right_w ≈ 96`,
   [   20 × 7 cells]    放映中  冬 2024
   [               ]   ✦ [96/100] · Fantasy · Adventure · Drama
                       ────────────────────────────────────────────────────────────────────────────────────
-                       Episodes  28
-                       Format    TV
+                      28 eps · TV · Manga · 24 min · Madhouse · #12 rated 2024
                       ────────────────────────────────────────────────────────────────────────────────────
                        An elf mage who once defeated the Demon King now wanders the continent…
-                      ────────────────────────────────────────────────────────────────────────────────────
-                       Episodes
+                      ▸megaplay ?senshi ?allanime · [v]
                       [▸1][●2][●3][●4][●5][●6][ 7][ 8][ 9][10][11][12][13][14][15][16][17][18][19]
                       [20][21][22][23][24][25][26][27][28]
 
@@ -1644,12 +1649,14 @@ engage. At 160-col, `right_w ≈ 96` gives 19 grid columns. At 120-col zoom,
 `right_w ≈ 72` gives 14 columns. This is where the zoom earns its keep over the
 pane's ≈8 columns at 120 cols.
 
-Clearing `DETAIL_TWO_COL_MIN` also blooms the metadata rail (§5.3a), but only
+~~Clearing `DETAIL_TWO_COL_MIN` also blooms the metadata rail (§5.3a), but only
 because this is a **History-origin** zoom, the one surface that sets `two_col =
 true` unconditionally; a Browse-origin zoom at the same 160 cols still renders the
 compact `28 eps · TV` line, plus its own dedicated Provider/Pinned row below it.
 This mock keeps the `Episodes` / `Format` two-row baseline for brevity rather than
-redrawing the full eight-row rail.
+redrawing the full eight-row rail.~~ Metadata is the same compact line regardless
+of origin (History or Browse) or width; `DETAIL_TWO_COL_MIN` gates only the
+cover/content column split shown above. ROD-458.
 
 ### 5.5 Settings
 
@@ -1749,7 +1756,7 @@ Notes:
   canonical resolution (bind-time tie-breaks and fallback walk order). Fallbacks
   for rows with an unknown owner deliberately keep routing to the registry
   primary: a pre-existing binding never silently migrates provider. **Per-show
-  override** is the `v` key on any detail surface (§5.3a rail / §7.5 keybinds): a
+  override** is the `v` key on any detail surface (§5.3a ~~rail~~ / §7.5 keybinds): a
   separate `provider_pins` DB table keyed on canonical id, layered over this
   row's global setting only (effective preference = show pin, else global) and
   never writing back to it. The pin cycles the same construction order as this
@@ -2540,7 +2547,7 @@ tokens reference §1.2 aliases.
 | **Detail · score line** | AniList `averageScore` | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
 | **Detail · genres** | AniList `genres` | ` · Genre · Genre` appended to the score line | omitted; no row, no `·` separator |
 | **Detail · cover art** | AniList `coverImage` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when the URL is null; the block keeps its reserved cell dimensions |
-| **Detail · metadata line/rail** | AniList `episodes` / `format` / `source` / `duration` / `studios` / `rankings`; DB `provider_pins`; DB binding rows + `provider_absences` + live `episodes.for_source` | `detail_meta_fields()` (§5.3a) emits the ordered eight-field list, rendered as the compact `N eps · kind · …` line (single-column surfaces; Rank/Provider/Pinned excluded) or the `Label  Value` rail (two-column surfaces, all eight); the compact form also draws the dedicated Provider/Pinned row beneath the joined line | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when no count is known, never omitted, so neither form is ever empty. Format/Source/Duration/Studios/Rank each omit outright when null; no orphan `·`, no bare rail row. Provider omits its dedicated row outright when the show has no canonical identity, otherwise always renders (even all-`?`), dimming only when every provider is unchecked. Pinned omits its segment when the show carries no pin: absence, not a degrade. The `nextAiringEpisode` countdown renders on the **chips row** (§4.4) instead: a live signal, not a stored snapshot |
+| **Detail · metadata line**~~/rail~~ | AniList `episodes` / `format` / `source` / `duration` / `studios` / `rankings`; DB `provider_pins`; DB binding rows + `provider_absences` + live `episodes.for_source` | `detail_meta_fields()` (§5.3a) emits the ordered eight-field list; the six AniList fields render on the one compact `N eps · kind · …` line at every width and origin (Rank last, sheds first) ~~or the `Label  Value` rail (two-column surfaces, all eight)~~; Provider/Pinned are excluded from that line and instead draw `provider_line`, ~~the compact form's dedicated Provider/Pinned row beneath the joined line~~ a dedicated row atop the episode grid (ROD-458) | Episodes is the floor: `? eps` ~~/ `Episodes  ?` in `[d]`~~ when no count is known, never omitted, so the line is never empty. Format/Source/Duration/Studios/Rank each omit outright when null; no orphan `·`~~, no bare rail row~~. Provider omits its row outright when the show has no canonical identity, otherwise always renders (even all-`?`), dimming only when every provider is unchecked. Pinned omits its segment when the show carries no pin: absence, not a degrade. The `nextAiringEpisode` countdown renders on the **chips row** (§4.4) instead: a live signal, not a stored snapshot |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
 | **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar, not duplicated in row 1 (the richer row-1 right-meta is an open question, §5.4/§11) | count degrades to `N / ? eps` on the bar when `total_episodes` is null |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
@@ -3085,16 +3092,16 @@ that history). Logged here so they can be revisited without archaeology.
 | `r` (not `:reset`) for progress recompute in History (ROD-193) | Single-level undo (`u`) goes stale after any subsequent key; the recovery window is one action, so the recompute deserves a direct key rather than waiting on `:` command mode. `r` is non-adjacent to `c` on Colemak-DH, so it can't be mis-keyed in the same motion. Recompute uses the sorted-index, translation-scoped strategy: `progress` = 1-based ordinal of the last fully-watched row among the `episode_progress` rows present, sorted by episode sort key. Intentionally under-counts gap-watching (only rows that were started are present). `Store::recompute_progress` is the single source of truth for these semantics. | If users want a "reset to 0" shortcut independent of the strategy, note that a show with no fully-watched rows already recomputes to 0; suggest deleting episode_progress rows via a future `:clear progress` command. |
 | Genre glyphs stay `text.dim` (`fg3`), single-space separated (ROD-247) | The glyphs are ambient texture, not a label; `text.dim` is the register for "present but not asking to be read." The real legibility problem was the two glyphs smushing into one shape, not brightness: a single space between them fixed that. `text.muted` (`fg2`) was tried and reverted: brighter made the glyphs compete with the format and episode count for attention, which own that row (`TV · 24ep`, §3.8). The spatial split (count left-anchored, glyphs right-anchored at the cover edge) plus the dim tier keeps each in its lane. | If the glyphs prove invisible in practice, widen the inter-glyph gap or drop to one before re-dimming. |
 | Nord `focus` stays hue-shift, **not** a luminance lift (ROD-184) | Nord violates the §1.1 focus-clears-`fg`-luminance rule: `focus` (nord8 frost, L 0.475) reads dimmer than `fg` (nord4 snow, L 0.727). The alternative was overdriving `focus` to a snow-storm value (nord6, L≈0.83) so the rule stays universal. Rejected: Nord's `fg` already sits the brightest of the four dark palettes, and lifting `focus` past it would push Nord toward a light-theme read, fighting §0's dark-only constraint. The nord8 hue-shift + bold carries focus distinction without adding luminance, faithful to Nord's own palette relationships. So the focus-clears-`fg`-luminance rule stays non-universal (§1.4): Terminal Ghost / Phosphor / TokyoNight honour it; Nord trades it for hue. A deliberate call, not a deferred fix. | If testing shows the Nord focused row is genuinely hard to locate (hue-shift + bold insufficient), revisit the lift, but bound it so Nord's `focus` does not cross into light-theme luminance. |
-| Studios collapse-format caps at 2 named studios, `+N` beyond (ROD-261) | Mirrors the §3.8a genre-glyph cap (≤2, ambient rather than exhaustive) and keeps the rail's 8-col gutter from being blown out by a multi-studio co-production credit list. The full list still lives in the persisted column for any future full-detail surface; this only caps the rail's render. | If a 3-studio credit is the common case rather than the outlier, raise the cap to 3 before reaching for a wrap. |
+| Studios collapse-format caps at 2 named studios, `+N` beyond (ROD-261) | Mirrors the §3.8a genre-glyph cap (≤2, ambient rather than exhaustive) and keeps ~~the rail's 8-col gutter from being blown out by~~ the compact line's width budget safe from a multi-studio co-production credit list. The full list still lives in the persisted column for any future full-detail surface; ~~this only caps the rail's render~~ this only caps the compact line's render (ROD-458). | If a 3-studio credit is the common case rather than the outlier, raise the cap to 3 before reaching for a wrap. |
 | Rank prefers a contextual RATED ranking over POPULAR when both exist, and drops the season name even for a season-scoped rank (ROD-261) | RATED reads closer to Rank's quality-signal intent: raw popularity was rejected as noise (§10.1), and a contextual *rank* needs to read as a different, sharper signal than that rejected field, not a rebrand of it. The season name is dropped from the render even when AniList scoped the ranking to a season, because the header's own season/year chip (§4.4) already carries that context on the same screen; repeating it would waste space Rank's 8-col gutter doesn't have. | If a season-scoped rank without the season name reads ambiguous in testing (e.g. a show that spans two cours), reconsider a compact season glyph. |
 | Airing countdown collapses to one coarsest unit and omits itself once stale, rather than showing a negative/zero value (ROD-261) | A combined `Nd Nh` value doesn't fit the chips row's terse register, and a countdown that has silently lapsed (a stale `nextAiringEpisode` in the window between the real airing time and the next metadata refresh) would read as a bug if shown as `-2h` or `0d`. Omitting it instead degrades to the same "no countdown" state a show without airing data already renders: a known-good degrade (§8.1), not a new one. | If users want confirmation an episode aired without waiting for refresh, consider a distinct "just aired" state instead of silent omission. |
 | Non-JP origin marker is a bare two-letter country code in `text.dim`, trailing last on the chips row, not a flag glyph (ROD-261) | An actual flag emoji is a Supplementary-Plane regional-indicator pair, outside the §2 "glyphs must fall inside the BMP" contract, and wouldn't render deterministically across this app's terminal targets. The dimmest available tier plus last-in-order placement keeps a rare, static fact from competing with the row's live status/season/countdown information; the common JP case shows nothing. | If CN/KR-origin shows are common enough in a user's library that the marker starts carrying real signal rather than being incidental, promote it to `text.muted` or a small dedicated icon. |
 | Italic stays pinned to the native-language title field, not to "whichever row is currently an alt" (ROD-205, §1.3/§8.2) | Generalizing italic to "any non-primary title row" would make the English alt row render italic under the default `romaji` preference, a visual change with no benefit. Keeping italic keyed to the native/Japanese-script field specifically preserves italic's §1.3 meaning (foreign script, not row position) while generalizing correctly for all three preferences: native gets italic whenever it lands in an alt slot and loses the treatment once it becomes primary (every primary line is bold, never italic). | If an English alt row reads too flat next to an italic native row in practice, reconsider as a fresh value judgment. |
-| Rail's Pinned field shows the raw provider name, not `display_name()` (ROD-345) | Matches the Settings `provider` row (§5.5), which renders the raw stored preference string. Pinned is the same persisted identifier, just scoped per-show instead of globally, so consistency with that precedent outranks matching the toast-prose convention (`{provider}` = `display_name()` everywhere a sentence names a provider, §4.10). The split is deliberate: config-surface rows echo the stored identifier; user-facing prose speaks the display name. | If a provider's stored name and display name diverge enough to confuse users in the rail (e.g. a future provider with a cryptic key), reconsider as a rail-specific formatting fix, not by changing the Settings row's convention. |
-| Provider field folds availability and serving into one rail row, ASCII markers (`▸ + - ?`) instead of a new pictographic set (ROD-348/356) | A separate serving row plus a separate availability row would put three provider-ish rows next to each other (Pinned already there) for information that is really one axis per provider (what's known, what's active): one row reads as one fact family. The `◆`/`◈` and `◐`/`◎` glyph pairs have an unresolved dim-legibility question (§11); rather than risk a fourth confusable pair, the tri-state (plus "serving") uses plain ASCII shapes and reuses the already-proven `▸` resume glyph for "serving", a genuinely different glyph family. Shape carries the state rather than color because the Phosphor theme (§1.4) is monochrome, so a color-only distinction would be illegible there. | Even if the dim-legibility question resolves, the ASCII set stands on its own reasons (font-independence, zero substitution risk). |
-| Provider field lists providers in fixed registry (construction) order, not the per-walk preference order (ROD-348) | The preference order is a resolve-order hint, recomputed per preference and per walk; using it here would make the same show's rail read in a different column order across sessions as the user's global or per-show preference changes, breaking "scan the same column, same order, every show." The rail is a status display of what's out there, not a queue of what to try next, so it wants a stable reference order. | If the registry grows past 4-5 providers and scanning a long fixed-order row gets noisy, consider grouping bound-first rather than reordering by preference: preference and "what's out there" are still different questions. |
-| Provider and Pinned surface in the compact form on their own dedicated row, not as segments of the joined `·` meta line (ROD-348/356) | A `rail_only` field never blooms below `DETAIL_TWO_COL_MIN`, which would leave Provider and Pinned invisible on every compact-width detail pane, exactly the width most terminals run at day to day. Folding them into the joined line itself was rejected: routing/session state is a different category of fact from the AniList metadata the joined line otherwise carries, and interleaving muddies both. The fix lives entirely in a bespoke compact-form row drawn beneath the joined line (`draw_provider_line`), outside the generic field-list iteration either renderer uses. | If a third field ever needs the same "own row" treatment, generalize `draw_provider_line` into a small family of bespoke compact rows rather than routing a third concept through it by special case. |
-| Pinned's dedicated-row segment gets a `pin ` prefix; Provider's does not (ROD-348/356) | Pinned's value is a bare raw provider name, ambiguous once it sits next to Provider's own token list on the same unlabeled row (a trailing bare name reads as an unmarked provider token, not the pin). Provider's value already carries its own marker glyphs (`▸ + - ?`), which self-disambiguate without a label. The `pin ` marker is a literal composed inside `draw_provider_line`, not a generic `MetaField` mechanism; `MetaField` stays `{label, value, unit, dim, rail_only}` with no `prefix` field. Folding Pinned into Provider's token list instead (a marker on the pinned token) was rejected: a pin can target a provider independent of its bound/absent/unchecked state, so a folded marker would need to represent combinations the tri-state grammar was not designed for, for a marginal width saving, and it would lose Pinned's independent omit-when-unset behavior. | If a similar disambiguation need comes up for a future bespoke row, prefer a literal composed in that row's own renderer over adding a generic `MetaField.prefix`, unless a third bespoke row needs the exact same decoration. |
+| ~~Rail's~~ Pinned field shows the raw provider name, not `display_name()` (ROD-345) | Matches the Settings `provider` row (§5.5), which renders the raw stored preference string. Pinned is the same persisted identifier, just scoped per-show instead of globally, so consistency with that precedent outranks matching the toast-prose convention (`{provider}` = `display_name()` everywhere a sentence names a provider, §4.10). The split is deliberate: config-surface rows echo the stored identifier; user-facing prose speaks the display name. | If a provider's stored name and display name diverge enough to confuse users ~~in the rail~~ on `provider_line`, reconsider as a ~~rail-specific~~ `provider_line`-specific formatting fix, not by changing the Settings row's convention. |
+| Provider field folds availability and serving into one ~~rail~~ row, ASCII markers (`▸ + - ?`) instead of a new pictographic set (ROD-348/356) | A separate serving row plus a separate availability row would put three provider-ish rows next to each other (Pinned already there) for information that is really one axis per provider (what's known, what's active): one row reads as one fact family. The `◆`/`◈` and `◐`/`◎` glyph pairs have an unresolved dim-legibility question (§11); rather than risk a fourth confusable pair, the tri-state (plus "serving") uses plain ASCII shapes and reuses the already-proven `▸` resume glyph for "serving", a genuinely different glyph family. Shape carries the state rather than color because the Phosphor theme (§1.4) is monochrome, so a color-only distinction would be illegible there. | Even if the dim-legibility question resolves, the ASCII set stands on its own reasons (font-independence, zero substitution risk). |
+| Provider field lists providers in fixed registry (construction) order, not the per-walk preference order (ROD-348) | The preference order is a resolve-order hint, recomputed per preference and per walk; using it here would make the same show's ~~rail~~ line read in a different order across sessions as the user's global or per-show preference changes, breaking "scan the same column, same order, every show." ~~The rail is~~ This field is a status display of what's out there, not a queue of what to try next, so it wants a stable reference order. | If the registry grows past 4-5 providers and scanning a long fixed-order row gets noisy, consider grouping bound-first rather than reordering by preference: preference and "what's out there" are still different questions. |
+| Provider and Pinned surface on their own dedicated row, not as segments of the joined `·` meta line (ROD-348/356) | ~~A `rail_only` field never blooms below `DETAIL_TWO_COL_MIN`, which would leave Provider and Pinned invisible on every compact-width detail pane, exactly the width most terminals run at day to day.~~ Folding them into the joined line itself was rejected: routing/session state is a different category of fact from the AniList metadata the joined line otherwise carries, and interleaving muddies both. ~~The fix lives entirely in a bespoke compact-form row drawn beneath the joined line (`draw_provider_line`), outside the generic field-list iteration either renderer uses.~~ The fix lives entirely in `provider_line`, a dedicated row atop the episode grid, outside the generic field-list iteration `meta_line` uses (ROD-458: this row is now unconditional, not a compact-width special case). | If a third field ever needs the same "own row" treatment, generalize `provider_line` into a small family of bespoke rows rather than routing a third concept through it by special case. |
+| Pinned's dedicated-row segment gets a `pin ` prefix; Provider's does not (ROD-348/356) | Pinned's value is a bare raw provider name, ambiguous once it sits next to Provider's own token list on the same unlabeled row (a trailing bare name reads as an unmarked provider token, not the pin). Provider's value already carries its own marker glyphs (`▸ + - ?`), which self-disambiguate without a label. The `pin ` marker is a literal composed inside ~~`draw_provider_line`~~ `provider_line`, not a generic `MetaField` mechanism; `MetaField` stays `{label, value, unit, dim, rail_only}` with no `prefix` field. Folding Pinned into Provider's token list instead (a marker on the pinned token) was rejected: a pin can target a provider independent of its bound/absent/unchecked state, so a folded marker would need to represent combinations the tri-state grammar was not designed for, for a marginal width saving, and it would lose Pinned's independent omit-when-unset behavior. | If a similar disambiguation need comes up for a future bespoke row, prefer a literal composed in that row's own renderer over adding a generic `MetaField.prefix`, unless a third bespoke row needs the exact same decoration. |
 | `X` is History's one destructive key with **no undo path**, so it gets an armed-confirm layer with a separate confirm key (ROD-220) | Every other History key, including the uppercase `P` ("plan it") and the view switches, is additive or navigational: reversible by another keypress or covered by `u`'s single-level undo (§6.1). Hard-delete cascades the DB row and its episode history; there is nothing for `u` to restore. That is a step change in severity, so it gets its own confirmation layer (§4.2, §6.5) instead of the toast-and-undo pattern the rest of History relies on. Splitting execution onto a separate `y`/`Y` key rather than "press `X` twice" specifically defeats key-repeat: a held or auto-repeating `X` keeps delivering `X` (a no-op once armed, §6.5), never `y`, so a repeat storm cannot self-confirm the delete. | If a second no-undo destructive action is ever added, reuse this pattern (armed state plus distinct confirm key) rather than inventing a fresh one. |
 | Bold, not underline, is the keybind-hint treatment everywhere (ROD-220) | Underline was the original spec for hint keys and was retired: it would be a one-off treatment nothing else uses, while bold-as-promotion (§1.3) already carries the identical role in the confirm prompt, the help lines, and the top-bar strip. One treatment, everywhere. | No revisit expected. |
 | Any non-`y` key cancels the armed confirm; it does not absorb-and-stay-armed (ROD-220) | The forgiving reading: a stray keypress (typo, accidental arrow) drops back to idle rather than trapping the user in a frozen bottom bar they didn't mean to enter, at the cost of a re-press of `X` to retry. `X` itself is the one carve-out (no-op, stays armed, §6.5); that exception exists purely to block key-repeat self-confirm, not to generalize into a broader absorb list. | If testing shows accidental cancels are common, reconsider a narrow allowlist of truly inert keys before reopening "absorb" more broadly. |
@@ -3130,20 +3137,20 @@ each:
 
 | Field | Verdict | Lands | Why |
 |---|---|---|---|
-| `source` | Ship | Rail: Source | Cheap, unambiguous signal; no formatting risk |
-| `duration` | Ship | Rail: Duration | Per-episode runtime is genuinely useful on a watchlist (confirmed must-have) |
-| `studios{nodes{name}}` | Ship | Rail: Studios | Cheap to fetch; needs its own persisted column |
-| `rankings{…}` | Ship, rail-only | Rail: Rank | Verbose, but a contextual rank is a sharper signal than a raw count (contrast the rejected `popularity` row) |
-| `nextAiringEpisode{…}` | Ship | Chips row, 3rd segment | Live and clock-relative: doesn't fit the rail's static-snapshot model (§4.4) |
+| `source` | Ship | ~~Rail~~ compact line: Source | Cheap, unambiguous signal; no formatting risk |
+| `duration` | Ship | ~~Rail~~ compact line: Duration | Per-episode runtime is genuinely useful on a watchlist (confirmed must-have) |
+| `studios{nodes{name}}` | Ship | ~~Rail~~ compact line: Studios | Cheap to fetch; needs its own persisted column |
+| `rankings{…}` | Ship~~, rail-only~~ | ~~Rail~~ compact line: Rank (last, sheds first, ROD-458) | Verbose, but a contextual rank is a sharper signal than a raw count (contrast the rejected `popularity` row) |
+| `nextAiringEpisode{…}` | Ship | Chips row, 3rd segment | Live and clock-relative: doesn't fit ~~the rail's~~ the compact line's static-snapshot model (§4.4) |
 | `countryOfOrigin` | Ship, low-noise | Chips row, trailing marker | Non-JP-only surfacing (donghua/aeni); JP is the default and shows nothing (§4.4) |
 | `popularity` | Skip | - | A bare user count; Rank already conveys standing, better |
 | `tags` | Skip | - | Dozens per show, often spoiler-laden; genres already categorize |
 | `trailer` / `externalLinks` / `hashtag` / `siteUrl` | Skip | - | Not terminal-actionable without a browser handoff |
-| `isAdult` | Skip | - | A future *filter* input, not a rail fact |
+| `isAdult` | Skip | - | A future *filter* input, not a ~~rail~~ metadata-line fact |
 | `relations` | Defer | - | A connection graph needs its own UI |
 
 Every "Ship" row still obeys the §8.1 no-empty rule: a field with no value emits
-nothing; no placeholder, no orphan separator, no bare rail row.
+nothing; no placeholder, no orphan separator~~, no bare rail row~~.
 
 ---
 
@@ -3182,4 +3189,19 @@ any of them as settled by implication.
    `SLOW_BLINK` (§9.4). Some terminals suppress blink, degrading it to a steady
    magenta cursor. Decide during the TUI spike whether that degrade is acceptable
    or the blink needs a manual timer (which §6.4 currently rules out).
+
+## Changelog
+
+**2026-07-20 (ROD-458):** Removed the §5.3a labeled metadata rail and its
+`bloom`/`two_col` gating. The detail metadata is now one compact `·`-joined
+line at every width and origin: Episodes, Format, Source, Duration, Studios,
+Rank, with Rank riding last so it is the first field the line sheds when width
+tightens. Provider and Pinned no longer sit with the show info; they render as
+a dedicated row at the top of the episode grid (`provider_line`), formatted
+`▸{serving} {bindings} · pin {pinned} · [v]`, visible only when the grid is
+engaged. Live functions: `meta_line`, `provider_line`, `alt_rows`
+(`src/tui/view/detail.rs`). Residual references to the removed rail and its
+`bloom`/`two_col`/`rail_only`-bloom plumbing throughout this document are
+struck through in place rather than deleted, with surviving conclusions kept
+or annotated alongside.
 
