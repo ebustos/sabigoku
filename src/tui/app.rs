@@ -1342,6 +1342,13 @@ impl App {
     /// (DESIGN 4.10 up/down rows). Failures and no-ops are silent by design.
     fn on_sync_flushed(&mut self, summary: sync::SyncSummary, now: Instant) {
         self.syncing = false;
+        if summary.pulled.imported > 0 {
+            self.toasts.push(
+                Kind::Info,
+                &format!("+ {} added from AniList", summary.pulled.imported),
+                now,
+            );
+        }
         if summary.pulled.reconciled > 0 {
             self.toasts.push(
                 Kind::Info,
@@ -2275,6 +2282,7 @@ mod tests {
             outcome: sync::SyncOutcome::Completed,
             pulled: crate::store::PullOutcome {
                 reconciled: 2,
+                imported: 4,
                 ..Default::default()
             },
             pushed: 3,
@@ -2283,6 +2291,7 @@ mod tests {
         app.on_sync_flushed(summary, now);
         assert!(!app.syncing, "the inflight flag clears");
         let copies: Vec<String> = app.toasts.iter().map(|t| t.copy.clone()).collect();
+        assert!(copies.iter().any(|c| c == "+ 4 added from AniList"));
         assert!(copies.iter().any(|c| c == "↓ 2 from AniList"));
         assert!(copies.iter().any(|c| c == "↑ 3 to AniList"));
 
