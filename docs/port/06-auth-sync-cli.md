@@ -230,8 +230,11 @@ Surface that failure, do not swallow it (`OPEN`: raise the cap or paginate).
 (zigoku: `history_visible != 0`, store comment "engaged + anilist_id with
 snapshot. Not dirty-filtered"; sabigoku: `library_added_at IS NOT NULL`). Clean
 rows are included: clean rows can still receive remote changes. Identity-only
-rows are invisible to sync, so a pull can neither stamp membership nor park user
-state on a show the user never engaged (02 §3.7).
+rows are invisible to **reconcile**, so a merge can neither stamp membership nor
+park user state on a show the user never engaged (02 §3.7). The O3 auto-import
+(below) is the sole pull path that stamps membership, and only for an unmatched
+WATCHING/REPEATING entry: it promotes an existing identity row rather than
+merging it.
 
 **Pure merge (`reconcile`), the total matrix.** `eff_base` = snapshot status,
 or `planning` when the snapshot is null (first contact). `local_moved` =
@@ -262,8 +265,13 @@ After merge write:
   next run. A real guard, not advisory. The merged pair and the snapshot land in
   **one** CAS-guarded UPDATE; when neither the local pair nor the snapshot
   changed, the row is skipped entirely.
-- Unmatched remote ids: counted and listed; **v1 does not auto-import** new
-  AniList-only shows into the library.
+- Unmatched remote ids: counted and listed. A WATCHING/REPEATING entry with a
+  usable title seed is **auto-imported** as an add-only library row, adopting the
+  remote pair as truth with a matching snapshot so it is born clean (never pushed
+  back). Other statuses, and seedless/titleless entries, stay count-only. This
+  deviates from zigoku's count-only freeze (ROD-467; see the backport ledger).
+  The seed rides the same pull: the `MediaListCollection` query carries
+  `media{title episodes}`, the rest backfills via the TTL enrichment repull.
 
 ### 5.5 Master switch
 
@@ -411,7 +419,7 @@ courtesy backoff/classification for search/discover/enrich 429s. Lean: classify
 |---|---|---|
 | O1 | Config/auth format (ZON vs TOML vs JSON) | TOML or JSON; decide in 08 |
 | O2 | Ship non-TUI query CLI in M1 | Defer |
-| O3 | Auto-import unmatched AniList list entries | No (v1 unmatched count only) |
+| O3 | Auto-import unmatched AniList list entries | **Decided (ROD-467):** yes for the WATCHING/REPEATING slice, add-only; other statuses count-only |
 | O4 | AniList app registration for sabigoku | Blocker before real login ships |
 
 ---
