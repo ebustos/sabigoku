@@ -61,6 +61,13 @@ impl Sleeper for ThreadSleeper {
     }
 }
 
+/// No-wait sleeper for the quit flush (04 §11): teardown bounds the run by its
+/// drain deadline, so spacing/backoff would only waste that budget.
+pub struct NoSleep;
+impl Sleeper for NoSleep {
+    fn sleep(&self, _dur: Duration) {}
+}
+
 /// Terminal reason for a sync run. Store-level failures are `Err`, not a
 /// variant here.
 #[derive(Debug, Clone, PartialEq)]

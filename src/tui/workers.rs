@@ -172,6 +172,29 @@ fn sync_worker(db_path: &std::path::Path, auth: &Auth, enabled: bool, pull_only:
         .unwrap_or_else(|_| SyncSummary::terminal(SyncOutcome::Failed))
 }
 
+/// Quit flush worker (04 §11): push only, no spacing/backoff (`NoSleep`), so it
+/// pushes what it can inside teardown's drain deadline.
+#[must_use]
+pub fn spawn_flush(
+    drain: &Drain,
+    tx: EventTx,
+    db_path: PathBuf,
+    auth: Auth,
+    enabled: bool,
+    now: i64,
+) -> bool {
+    drain.spawn("sync-flush", move || {
+        let summary = match (AniList::new(), Store::open(&db_path)) {
+            (Ok(client), Ok(store)) => {
+                sync::flush_push(&client, &auth, &store, now, enabled, &sync::NoSleep)
+                    .unwrap_or_else(|_| SyncSummary::terminal(SyncOutcome::Failed))
+            }
+            _ => SyncSummary::terminal(SyncOutcome::Failed),
+        };
+        tx.post(Event::SyncFlushed(summary));
+    })
+}
+
 /// One Browse catalogue-search page (04 §4.2): stale results are dropped in
 /// tick by comparing `query` against the live buffer, never by generation.
 #[must_use]

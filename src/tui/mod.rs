@@ -93,6 +93,8 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
     if let Ok(size) = terminal.size() {
         app.tick(Event::Resize(size.width, size.height), Instant::now(), &tx);
     }
+    // Launch pull-refresh (04 §3), pull only so first contact never blind-pushes.
+    app.bootstrap_sync(&tx);
 
     let mut clock = TickClock::new(Instant::now());
     let result = (|| {
@@ -129,6 +131,8 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
     app.discover.drain(Duration::from_secs(1));
     // Wake a blocked connect worker before its drain (06 §4.4).
     app.shutdown_connect();
+    // Quit flush (04 §11): push what's dirty, bounded by the drain below.
+    app.spawn_quit_flush(&tx);
     let sync_drain = app.sync_drain.clone();
     // The encode worker exits when the pool (inside App) drops its queue.
     let encode_drain = app.encode_drain.clone();
