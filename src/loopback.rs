@@ -14,9 +14,12 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::login::{ConnectResult, LOOPBACK_PORT, Verifier, authorize_url, complete_login, param};
 
-/// Per-connection read deadline (06 §4.4): a stalled socket must not wedge
-/// accept. There is deliberately no overall timeout on the wait.
-const READ_DEADLINE: Duration = Duration::from_secs(5);
+/// Per-connection read deadline: a stalled socket must not wedge accept. The
+/// serve loop is single-threaded, so this also bounds how long one silent local
+/// peer can delay the real callback; tightened from the freeze's 5s (06 §4.4)
+/// to shrink that window (ROD-448 review). There is deliberately no overall
+/// timeout on the wait itself (a browser may be slow).
+const READ_DEADLINE: Duration = Duration::from_secs(2);
 
 /// The top-bar wordmark (DESIGN 3.4), above the headline on every callback page.
 const WORDMARK: &str = "錆獄 sabigoku";

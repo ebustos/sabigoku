@@ -83,7 +83,7 @@ fn build_auth(token: String, expires_in: Option<i64>, viewer: &Viewer, now: i64)
         anilist: AniListAuth {
             access_token: token,
             token_type: DEFAULT_TOKEN_TYPE.into(),
-            expires_at: expires_in.map_or(0, |secs| now + secs),
+            expires_at: expires_in.map_or(0, |secs| now.saturating_add(secs)),
             user_id: viewer.id,
             user_name: viewer.name.clone(),
         },
@@ -98,10 +98,20 @@ fn extract_token(raw: &str) -> Option<(String, Option<i64>)> {
 
 /// Value of `key=` in a redirect/query/fragment, up to the next delimiter.
 /// Implicit-grant values (JWT, integer) carry no chars needing percent-decode.
+/// The match is anchored to a param boundary (start or after `&`/`?`/`#`) so a
+/// key that is a suffix of another (`xstate=` vs `state=`) can never be read as
+/// it: a query parser in a security callback must not be a substring search.
 pub(crate) fn param(raw: &str, key: &str) -> Option<String> {
     let needle = format!("{key}=");
-    let start = raw.find(&needle)? + needle.len();
-    let rest = &raw[start..];
+    let mut from = 0;
+    let idx = loop {
+        let hit = from + raw[from..].find(&needle)?;
+        if hit == 0 || matches!(raw.as_bytes()[hit - 1], b'&' | b'?' | b'#') {
+            break hit;
+        }
+        from = hit + 1;
+    };
+    let rest = &raw[idx + needle.len()..];
     let end = rest.find(['&', '#', ' ', '\r', '\n']).unwrap_or(rest.len());
     match &rest[..end] {
         "" => None,
@@ -205,6 +215,18 @@ mod tests {
             ConnectResult::NetworkError
         );
         assert!(!path.exists(), "an unverified token must not be written");
+    }
+
+    #[test]
+    fn param_is_anchored_to_a_boundary() {
+        // A suffix key must not match the longer one before it.
+        assert_eq!(param("xstate=evil&state=real", "state").as_deref(), Some("real"));
+        // First real occurrence wins; boundaries are start / & / ? / #.
+        assert_eq!(param("state=first&state=second", "state").as_deref(), Some("first"));
+        assert_eq!(param("a=1?state=q", "state").as_deref(), Some("q"));
+        assert_eq!(param("#access_token=tok&x=y", "access_token").as_deref(), Some("tok"));
+        // No real (boundary-anchored) occurrence.
+        assert_eq!(param("notstate=nope", "state"), None);
     }
 
     #[test]

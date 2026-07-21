@@ -45,7 +45,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
             area,
             area.height / 2,
             Line::from(Span::styled(
-                "connect: esc to cancel",
+                "connect: esc to stop waiting",
                 Style::new().fg(palette.fg2),
             )),
         );
@@ -143,7 +143,9 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
         frame,
         area,
         at(12 + band_h),
-        key_hint(palette, "esc", "cancel", palette.fg2),
+        // "stop waiting", not "cancel": a callback already landing still
+        // completes; esc only stops the wait (ROD-448 review).
+        key_hint(palette, "esc", "stop waiting", palette.fg2),
     );
 }
 
