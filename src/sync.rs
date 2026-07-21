@@ -76,6 +76,8 @@ pub enum SyncOutcome {
     Unauthorized,
     /// Second 429 during push; run stopped, the rest stay dirty (06 §5.3).
     RateLimited,
+    /// Store or client construction failed; nothing synced (worker bridge).
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,7 +89,7 @@ pub struct SyncSummary {
 }
 
 impl SyncSummary {
-    fn terminal(outcome: SyncOutcome) -> Self {
+    pub(crate) fn terminal(outcome: SyncOutcome) -> Self {
         SyncSummary {
             outcome,
             pulled: PullOutcome::default(),

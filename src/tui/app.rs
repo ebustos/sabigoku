@@ -201,6 +201,11 @@ impl App {
                 failure,
                 token,
             } => self.on_play_finished(anilist_id, position, failure, token, now, tx),
+            // Sync-slice results, wired later in ROD-448: connect modal (chunk 7),
+            // sync rail (chunk 8), update toast (chunk 9).
+            Event::ConnectResult(_) => {}
+            Event::SyncFlushed(_) => {}
+            Event::UpdateAvailable { .. } => {}
         }
     }
 

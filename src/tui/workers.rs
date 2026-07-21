@@ -9,14 +9,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::anilist::AniList;
 use crate::aniskip::{self, SkipMode};
+use crate::auth::Auth;
 use crate::domain::{Quality, Translation};
 use crate::error::Error;
+use crate::login::ConnectResult;
+use crate::loopback::Loopback;
 use crate::player::{self, PlayError, PlayOpts, PlayerEvent, Position};
 use crate::providers::{
     CatalogProvider, DiscoverAxis, ProviderError, ProviderRegistry, SEARCH_PAGE_SIZE, SearchOptions,
 };
 use crate::store::Store;
+use crate::sync::{self, SyncOutcome, SyncSummary, ThreadSleeper};
 use crate::tui::covers::{self, CoverCaches};
 use crate::tui::event::{Event, EventTx, FetchClass, PlayFailure};
 
@@ -116,6 +121,55 @@ pub fn spawn_discover_feed(
         };
         tx.post(event);
     })
+}
+
+/// Loopback OAuth worker (04 §4.6): runs the blocking callback server to
+/// completion, posts the outcome. Skips posting on cancel: the app may already
+/// be torn down (06 §4.4). Builds its own AniList client for the verify.
+#[must_use]
+pub fn spawn_connect(
+    drain: &Drain,
+    tx: EventTx,
+    loopback: Loopback,
+    auth_path: PathBuf,
+    now: i64,
+) -> bool {
+    drain.spawn("connect", move || {
+        let result = match AniList::new() {
+            Ok(client) => loopback.serve(&client, &auth_path, now),
+            Err(_) => ConnectResult::NetworkError,
+        };
+        if result != ConnectResult::Canceled {
+            tx.post(Event::ConnectResult(result));
+        }
+    })
+}
+
+/// Sync worker (04 §4.6): opens its OWN store connection, since the reconcile
+/// CAS guard (06 §5.4) is built for exactly this cross-connection concurrency
+/// with the UI thread. Runs the pull-then-push funnel and posts the summary.
+#[must_use]
+pub fn spawn_sync(
+    drain: &Drain,
+    tx: EventTx,
+    db_path: PathBuf,
+    auth: Auth,
+    enabled: bool,
+    pull_only: bool,
+    now: i64,
+) -> bool {
+    drain.spawn("sync", move || {
+        let summary = sync_worker(&db_path, &auth, enabled, pull_only, now);
+        tx.post(Event::SyncFlushed(summary));
+    })
+}
+
+fn sync_worker(db_path: &std::path::Path, auth: &Auth, enabled: bool, pull_only: bool, now: i64) -> SyncSummary {
+    let (Ok(client), Ok(store)) = (AniList::new(), Store::open(db_path)) else {
+        return SyncSummary::terminal(SyncOutcome::Failed);
+    };
+    sync::run_sync(&client, auth, &store, now, enabled, pull_only, &ThreadSleeper)
+        .unwrap_or_else(|_| SyncSummary::terminal(SyncOutcome::Failed))
 }
 
 /// One Browse catalogue-search page (04 §4.2): stale results are dropped in
@@ -808,6 +862,21 @@ mod tests {
                 token: 9,
             }
         );
+    }
+
+    #[test]
+    fn spawn_sync_bridges_a_summary_to_the_queue() {
+        let (tx, rx) = event::channel();
+        let drain = Drain::default();
+        // Disabled short-circuits before any network, so this needs no socket.
+        let db = std::env::temp_dir().join("sabigoku-spawn-sync-disabled.db");
+        let _ = std::fs::remove_file(&db);
+        assert!(spawn_sync(&drain, tx, db, Auth::default(), false, false, 0));
+        assert!(drain.drain(Duration::from_secs(5)));
+        match rx.try_recv().unwrap() {
+            Event::SyncFlushed(s) => assert_eq!(s.outcome, SyncOutcome::Disabled),
+            other => panic!("expected SyncFlushed, got {other:?}"),
+        }
     }
 
     #[test]
