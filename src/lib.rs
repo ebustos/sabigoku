@@ -8,6 +8,8 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod fetchguard;
+pub mod login;
+pub mod loopback;
 pub mod paths;
 pub mod player;
 pub mod providers;
