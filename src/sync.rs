@@ -321,7 +321,7 @@ mod tests {
     fn pull_only_reconciles_and_never_pushes() {
         let store = Store::open_memory().unwrap();
         dirty_lib(&store, 10); // a dirty row exists, but pull_only must not push it
-        let client = FakeAni::new(Ok(vec![RemoteEntry { anilist_id: 10, status: ListStatus::Watching, progress: 3 }]), vec![]);
+        let client = FakeAni::new(Ok(vec![RemoteEntry { anilist_id: 10, status: ListStatus::Watching, progress: 3, import_seed: None }]), vec![]);
         let out = run_sync(&client, &connected(0), &store, 0, true, true, &RecordingSleeper::new()).unwrap();
         assert_eq!(out.outcome, SyncOutcome::Completed);
         assert_eq!(out.pulled.reconciled, 1);
@@ -416,7 +416,7 @@ mod tests {
     fn flush_push_is_push_only() {
         let store = Store::open_memory().unwrap();
         dirty_lib(&store, 22);
-        let client = FakeAni::new(Ok(vec![RemoteEntry { anilist_id: 99, status: ListStatus::Watching, progress: 1 }]), vec![Ok(1)]);
+        let client = FakeAni::new(Ok(vec![RemoteEntry { anilist_id: 99, status: ListStatus::Watching, progress: 1, import_seed: None }]), vec![Ok(1)]);
         let out = flush_push(&client, &connected(0), &store, 0, true, &RecordingSleeper::new()).unwrap();
         assert_eq!(out.outcome, SyncOutcome::Completed);
         assert_eq!(out.pushed, 1);

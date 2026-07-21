@@ -470,12 +470,16 @@ pub struct Viewer {
     pub name: String,
 }
 
-/// One remote list entry, mapped to the domain (06 §5.4).
+/// One remote list entry, mapped to the domain (06 §5.4). `import_seed` carries
+/// the media title + episodes so an unmatched WATCHING/REPEATING entry can be
+/// auto-imported into the library (06 O3); None when the wire omitted the media
+/// node. Reconcile of a matched row never reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteEntry {
     pub anilist_id: i64,
     pub status: ListStatus,
     pub progress: u32,
+    pub import_seed: Option<Enrichment>,
 }
 
 /// AniList `MediaListStatus` -> domain. REPEATING folds to Watching at ingest so
@@ -508,7 +512,7 @@ fn viewer_body() -> serde_json::Value {
 
 fn list_collection_body(user_id: i64) -> serde_json::Value {
     json!({
-        "query": "query($userId:Int!){MediaListCollection(userId:$userId,type:ANIME){lists{entries{mediaId status progress}}}}",
+        "query": "query($userId:Int!){MediaListCollection(userId:$userId,type:ANIME){lists{entries{mediaId status progress media{title{romaji english native} episodes}}}}}",
         "variables": { "userId": user_id },
     })
 }
@@ -569,6 +573,13 @@ struct ListEntryNode {
     status: Option<String>,
     #[serde(default)]
     progress: u32,
+    media: Option<ListMediaNode>,
+}
+
+#[derive(Deserialize)]
+struct ListMediaNode {
+    title: Option<GqlTitle>,
+    episodes: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -601,6 +612,21 @@ fn classify_viewer(raw: &[u8]) -> Result<Option<Viewer>, CatalogError> {
     }))
 }
 
+/// Sparse enrichment for auto-importing a list-only show (06 O3): title +
+/// episodes only, control-stripped like every render-surface string. The rest
+/// of the fields backfill through the TTL enrichment repull.
+fn list_import_seed(media_id: i64, m: ListMediaNode) -> Enrichment {
+    let title = m.title.unwrap_or_default();
+    Enrichment {
+        anilist_id: media_id,
+        title_romaji: strip_controls_opt(title.romaji).unwrap_or_default(),
+        title_english: strip_controls_opt(title.english),
+        title_native: strip_controls_opt(title.native),
+        total_episodes: m.episodes,
+        ..Enrichment::default()
+    }
+}
+
 /// MediaListCollection body -> flat remote entries. Duplicate ids across custom
 /// lists are possible; collapsing them is the reconcile join's job (06 §5.4).
 fn classify_list(raw: &[u8]) -> Result<Vec<RemoteEntry>, CatalogError> {
@@ -613,10 +639,12 @@ fn classify_list(raw: &[u8]) -> Result<Vec<RemoteEntry>, CatalogError> {
     let mut out = Vec::new();
     for group in collection.lists.unwrap_or_default() {
         for e in group.entries.unwrap_or_default() {
+            let import_seed = e.media.map(|m| list_import_seed(e.media_id, m));
             out.push(RemoteEntry {
                 anilist_id: e.media_id,
                 status: list_status_from_anilist(e.status.as_deref()),
                 progress: e.progress,
+                import_seed,
             });
         }
     }
@@ -1066,11 +1094,30 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                RemoteEntry { anilist_id: 101, status: ListStatus::Watching, progress: 3 },
-                RemoteEntry { anilist_id: 102, status: ListStatus::Watching, progress: 12 },
-                RemoteEntry { anilist_id: 103, status: ListStatus::Completed, progress: 24 },
+                RemoteEntry { anilist_id: 101, status: ListStatus::Watching, progress: 3, import_seed: None },
+                RemoteEntry { anilist_id: 102, status: ListStatus::Watching, progress: 12, import_seed: None },
+                RemoteEntry { anilist_id: 103, status: ListStatus::Completed, progress: 24, import_seed: None },
             ]
         );
+    }
+
+    #[test]
+    fn classify_list_builds_import_seed_from_media() {
+        // A control byte in the title proves the seed is stripped like every
+        // render-surface string (06 O3).
+        let raw = "{\"data\":{\"MediaListCollection\":{\"lists\":[{\"entries\":[
+            {\"mediaId\":101,\"status\":\"CURRENT\",\"progress\":3,\"media\":{\"title\":{\"romaji\":\"Fr\\u0000ieren\",\"english\":\"Frieren\",\"native\":\"\u{846c}\u{9001}\u{306e}\u{30d5}\u{30ea}\u{30fc}\u{30ec}\u{30f3}\"},\"episodes\":28}}
+        ]}]}}}";
+        let seed = classify_list(raw.as_bytes()).unwrap()[0]
+            .import_seed
+            .clone()
+            .expect("media present -> seed built");
+        assert_eq!(seed.anilist_id, 101);
+        assert_eq!(seed.title_romaji, "Frieren");
+        assert_eq!(seed.title_english.as_deref(), Some("Frieren"));
+        assert_eq!(seed.total_episodes, Some(28));
+        // Untouched by the seed builder; backfills via TTL repull.
+        assert_eq!(seed.cover_url, None);
     }
 
     #[test]
@@ -1090,7 +1137,7 @@ mod tests {
         let sparse = br#"{"data":{"MediaListCollection":{"lists":[{"entries":[{"mediaId":9}]}]}}}"#;
         assert_eq!(
             classify_list(sparse).unwrap(),
-            vec![RemoteEntry { anilist_id: 9, status: ListStatus::Planning, progress: 0 }]
+            vec![RemoteEntry { anilist_id: 9, status: ListStatus::Planning, progress: 0, import_seed: None }]
         );
         assert!(classify_list(br#"{"data":null}"#).is_err());
     }

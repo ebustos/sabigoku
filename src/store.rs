@@ -2791,7 +2791,7 @@ mod tests {
     use crate::anilist::RemoteEntry;
 
     fn remote(id: i64, status: ListStatus, progress: u32) -> RemoteEntry {
-        RemoteEntry { anilist_id: id, status, progress }
+        RemoteEntry { anilist_id: id, status, progress, import_seed: None }
     }
 
     /// Library row at a precise pair + snapshot, bypassing the auto-status snaps.
