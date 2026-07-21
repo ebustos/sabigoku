@@ -1,6 +1,7 @@
-//! AniList connect modal (DESIGN 5.5a). Captured overlay drawn last on a
-//! `palette.elevated` fill: title, instruction, fallback caption, URL band,
-//! spinner status, a 20s paste-hint slot, then the key hints.
+//! AniList connect modal (DESIGN 5.5a). Captured overlay drawn last as a
+//! compact centered `palette.elevated` float over Settings, never a full-pane
+//! fill: title, instruction, fallback caption, URL band, spinner status, a 20s
+//! paste-hint slot, then the key hints.
 
 use std::time::Duration;
 
@@ -13,11 +14,16 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use crate::tui::render::draw_centered;
 use crate::tui::theme::Palette;
 
-/// Below this the panel reads as clutter; draw one bare line instead (DESIGN 5.5a).
+/// Preferred float size (DESIGN 5.5a), capped to the pane with a 2-col / 1-row
+/// margin. Fixed like zigoku's box so the panel size is stable across URL wrap.
+const BOX_W: u16 = 68;
+const BOX_H: u16 = 19;
+
+/// Below this the float reads as clutter; draw one bare line instead (DESIGN 5.5a).
 const MIN_COLS: u16 = 28;
 const MIN_ROWS: u16 = 10;
 /// The paste-hint fallback appears once the wait crosses this (DESIGN 5.5a).
-const PASTE_HINT_SECS: u64 = 20;
+const PASTE_HINT_SECS: u64 = 10;
 /// Spinner escalates focus -> hot past this (§4.8 slow-path convention).
 const ESCALATE_SECS: u64 = 3;
 
@@ -34,16 +40,22 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Clear the cells first: a bare Block only restyles glyphs, so Settings
-    // would bleed through the fill (DESIGN 5.5a).
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::new().style(Style::new().bg(palette.elevated)), area);
-
-    if area.width < MIN_COLS || area.height < MIN_ROWS {
+    // Compact centered float, capped to the pane with a 2-col / 1-row margin.
+    // Never a full-pane fill: Settings stays visible around the box, and the
+    // box's bg_elevated is the only overlay signal (DESIGN 5.5a, borderless).
+    let bw = BOX_W.min(area.width.saturating_sub(4));
+    let bh = BOX_H.min(area.height.saturating_sub(2));
+    if bw < MIN_COLS || bh < MIN_ROWS {
+        // Too cramped for the float: a bare one-line hint on its own elevated
+        // strip so a tiny-terminal resize mid-connect never draws nothing.
+        let row = area.height / 2;
+        let strip = Rect::new(area.x, area.y + row, area.width, 1);
+        frame.render_widget(Clear, strip);
+        frame.render_widget(Block::new().style(Style::new().bg(palette.elevated)), strip);
         draw_centered(
             frame,
             area,
-            area.height / 2,
+            row,
             Line::from(Span::styled(
                 "connect: esc to stop waiting",
                 Style::new().fg(palette.fg2),
@@ -51,22 +63,33 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
         );
         return;
     }
+    let modal = Rect::new(
+        area.x + area.width.saturating_sub(bw) / 2,
+        area.y + area.height.saturating_sub(bh) / 2,
+        bw,
+        bh,
+    );
+
+    // Clear the cells first: a bare Block only restyles glyphs, so Settings
+    // would bleed through the fill (DESIGN 5.5a).
+    frame.render_widget(Clear, modal);
+    frame.render_widget(Block::new().style(Style::new().bg(palette.elevated)), modal);
 
     let secs = view.elapsed.as_secs();
-    let band_w = area.width.saturating_sub(6).min(72);
+    let band_w = modal.width.saturating_sub(6).min(72);
     let inner_w = band_w.saturating_sub(4).max(8) as usize;
     let wrapped = wrap(view.url, inner_w);
     let band_h = wrapped.len() as u16;
 
-    // Fixed row plan (offsets from the block top); the paste slot is reserved
+    // Fixed row plan (offsets from the modal top); the paste slot is reserved
     // whether or not the hint shows, so the key hints never jump at 20s.
     let total = 13 + band_h;
-    let top = area.height.saturating_sub(total) / 2;
+    let top = modal.height.saturating_sub(total) / 2;
     let at = |offset: u16| top + offset;
 
     draw_centered(
         frame,
-        area,
+        modal,
         at(0),
         Line::from(Span::styled(
             "Connect AniList",
@@ -75,7 +98,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
     );
     draw_centered(
         frame,
-        area,
+        modal,
         at(2),
         Line::from(Span::styled(
             "approve access in your browser to continue",
@@ -84,14 +107,14 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
     );
     draw_centered(
         frame,
-        area,
+        modal,
         at(4),
         Line::from(Span::styled(
             "browser didn't open? use this link:",
             Style::new().fg(palette.fg2).add_modifier(Modifier::ITALIC),
         )),
     );
-    draw_band(frame, area, at(5), band_w, &wrapped, palette);
+    draw_band(frame, modal, at(5), band_w, &wrapped, palette);
 
     let spin = SPINNER[(view.elapsed.as_millis() / 100) as usize % SPINNER.len()];
     let spin_color = if secs < ESCALATE_SECS {
@@ -101,7 +124,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
     };
     draw_centered(
         frame,
-        area,
+        modal,
         at(6 + band_h),
         Line::from(vec![
             Span::styled(format!("{spin} "), Style::new().fg(spin_color)),
@@ -115,7 +138,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
     if secs >= PASTE_HINT_SECS {
         draw_centered(
             frame,
-            area,
+            modal,
             at(8 + band_h),
             Line::from(vec![
                 Span::styled("no callback? run  ", Style::new().fg(palette.warn)),
@@ -135,13 +158,13 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
     };
     draw_centered(
         frame,
-        area,
+        modal,
         at(11 + band_h),
         key_hint(palette, "c", copy_action, copy_color),
     );
     draw_centered(
         frame,
-        area,
+        modal,
         at(12 + band_h),
         // "stop waiting", not "cancel": a callback already landing still
         // completes; esc only stops the wait (ROD-448 review).
