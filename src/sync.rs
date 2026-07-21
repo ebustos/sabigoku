@@ -142,7 +142,7 @@ pub fn run_sync<A: AniListSync, S: Sleeper>(
         Ok(r) => r,
         Err(_) => return Ok(SyncSummary::terminal(SyncOutcome::PullFailed)),
     };
-    let pulled = store.reconcile_pull(&remote)?;
+    let pulled = store.reconcile_pull(&remote, now)?;
     let mut summary = SyncSummary {
         outcome: SyncOutcome::Completed,
         pulled,
