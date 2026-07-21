@@ -1818,7 +1818,7 @@ real render, not by anything drawn.
 ```
 
 The bottom row (`no callback? run sabigoku login --paste in a terminal`) only
-appears once the wait crosses 20s; shown here for completeness. Top-to-bottom this
+appears once the wait crosses 10s; shown here for completeness. Top-to-bottom this
 is exactly the modal's row order: title → instruction → fallback caption → URL band
 → status → paste hint (own padded slot, present or not) → `c copy` / `esc cancel`,
 plus a blank pad row above the title and a couple below the last hint.
@@ -1842,9 +1842,9 @@ Notes:
   `palette.focus` while fresh, escalating to `palette.hot` past a few seconds; the
   same slow-path convention the bottom bar and cover block use (§4.8),
   reimplemented locally against the modal's own clock rather than the shared one.
-- **Paste-hint fallback (20s).** The loopback only completes when the browser can
+- **Paste-hint fallback (10s).** The loopback only completes when the browser can
   reach *this host's* `127.0.0.1:PORT`; a remote/SSH session's browser can't, and
-  would otherwise sit on "waiting" forever with no way out but `esc`. Past 20s
+  would otherwise sit on "waiting" forever with no way out but `esc`. Past 10s
   elapsed, a centred line points at the terminal fallback: `no callback? run
   sabigoku login --paste in a terminal`. It renders in `palette.warn` (amber), an
   attention register distinct from every other line in the modal (not `fg2`,
@@ -1853,7 +1853,7 @@ Notes:
   and the two would compete for "the urgent thing here"). It gets its own padded
   slot, a blank row above and below, reserved whether or not the hint is showing,
   so the key hints below don't jump into a new position the instant it appears at
-  20s.
+  10s.
 - **Key hints.** Two centred `<key>  <action>` lines (the idiom the Browse/History
   absent states use), not one flat dim line; the key is `palette.focus` + bold so
   it actually reads as a key. Both hints' action text is `palette.fg2`,
