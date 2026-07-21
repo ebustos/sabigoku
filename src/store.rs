@@ -189,6 +189,10 @@ CREATE TABLE app_meta (
 /// heal on view instead of waiting out the full TTL.
 pub const ENRICHMENT_FIELDSET_VERSION: u32 = 1;
 
+/// Ceiling on rows one pull may auto-import (06 O3). A CURRENT list this large
+/// is not real use; the cap bounds a hostile/MITM response's blast radius.
+const IMPORT_CAP: usize = 500;
+
 /// The enrichment column set, in the one order every reader and writer uses.
 /// `enrichment_from_row` reads these by index; keep the three in lockstep.
 const ENRICH_COLS: &str = "anilist_id, mal_id, title_romaji, title_english, title_native, \
@@ -301,20 +305,7 @@ impl Store {
     /// COALESCE: on NOT NULL columns that always takes the excluded value and
     /// reintroduces the clobber bug (02 §5).
     pub fn add_to_library(&self, e: &Enrichment, now: i64) -> Result<(), Error> {
-        let bind = EnrichBind::new(e);
-        let mut params = enrich_params(e, &bind);
-        params.push((":now", &now));
-        let sql = format!(
-            "INSERT INTO show ({ENRICH_COLS}, library_added_at)
-             VALUES ({ENRICH_VALS}, :now)
-             ON CONFLICT(anilist_id) DO UPDATE SET
-                {merge},
-                total_episodes = COALESCE(excluded.total_episodes, show.total_episodes),
-                library_added_at = COALESCE(show.library_added_at, excluded.library_added_at)",
-            merge = enrichment_merge_set("excluded.", "show.")
-        );
-        self.conn.execute(&sql, params.as_slice())?;
-        Ok(())
+        add_to_library_on(&self.conn, e, now)
     }
 
     /// Enrichment-only patch, UPDATE-only: enrichment never mints a show row
@@ -622,8 +613,12 @@ fn status_row(conn: &Connection, anilist_id: i64) -> Result<Option<StatusRow>, E
 
 /// An import seed is only worth minting if it renders as something: a blank
 /// canonical title with no english/native would land a nameless library row.
+/// Checks non-empty content, not just Some: a control-only title strips to
+/// Some("") upstream, which would defeat a bare is_some (ROD-467 chaos pass).
 fn seed_has_title(e: &Enrichment) -> bool {
-    !e.title_romaji.is_empty() || e.title_english.is_some() || e.title_native.is_some()
+    !e.title_romaji.is_empty()
+        || e.title_english.as_deref().is_some_and(|s| !s.is_empty())
+        || e.title_native.as_deref().is_some_and(|s| !s.is_empty())
 }
 
 /// The enrichment merge SET fragment, shared by every writer so the shape
@@ -673,6 +668,26 @@ fn enrichment_merge_set(new: &str, old: &str) -> String {
         END"
     ));
     set
+}
+
+/// The watchlist-add INSERT on any connection, so an import can run it inside a
+/// transaction with its status stamp (ROD-467). See [`Store::add_to_library`]
+/// for the merge contract.
+fn add_to_library_on(conn: &Connection, e: &Enrichment, now: i64) -> Result<(), Error> {
+    let bind = EnrichBind::new(e);
+    let mut params = enrich_params(e, &bind);
+    params.push((":now", &now));
+    let sql = format!(
+        "INSERT INTO show ({ENRICH_COLS}, library_added_at)
+         VALUES ({ENRICH_VALS}, :now)
+         ON CONFLICT(anilist_id) DO UPDATE SET
+            {merge},
+            total_episodes = COALESCE(excluded.total_episodes, show.total_episodes),
+            library_added_at = COALESCE(show.library_added_at, excluded.library_added_at)",
+        merge = enrichment_merge_set("excluded.", "show.")
+    );
+    conn.execute(&sql, params.as_slice())?;
+    Ok(())
 }
 
 /// Owned SQL forms of the encoded fields; must outlive the bind slice.
@@ -1449,6 +1464,14 @@ impl Store {
             }
         }
         imports.sort_by_key(|r| r.seed.anilist_id);
+        // Bound how many rows one pull can mint: a hostile or MITM'd list can
+        // hold ~14k entries under the 2MB response cap. Overflow is counted as
+        // unmatched, not imported (ROD-467 chaos pass).
+        if imports.len() > IMPORT_CAP {
+            for r in imports.drain(IMPORT_CAP..) {
+                unmatched.push(r.seed.anilist_id);
+            }
+        }
         unmatched.sort_unstable();
         Ok((plan, imports, unmatched))
     }
@@ -1468,25 +1491,40 @@ impl Store {
             ..PullOutcome::default()
         };
         // Mint each WATCHING/REPEATING seed (O3), then adopt the remote pair as
-        // truth with a matching snapshot. add_to_library's merge is COALESCE-only
-        // so a sparse seed promotes an existing identity row (library_added_at
-        // NULL) without wiping its enrichment; stamping synced_* keeps the fresh
-        // row from looking dirty and pushing PLANNING back over the server.
+        // truth with a matching snapshot. Both statements run under ONE
+        // BEGIN IMMEDIATE so no other connection sees the transient
+        // Planning/0/unsynced mint (which list_dirty_for_sync would push back as
+        // PLANNING, clobbering the server). add_to_library's merge is
+        // COALESCE-only so a sparse seed promotes an existing identity row
+        // without wiping its enrichment. The stamp is CAS-guarded on that exact
+        // freshly-minted state: a concurrent add-and-edit landing between the
+        // plan read and here fails the guard, so we roll back the mint and count
+        // contended instead of destroying the local edit.
         for r in imports {
-            self.add_to_library(&r.seed, now)?;
-            self.conn.execute(
+            let tx = immediate_tx(&self.conn)?;
+            add_to_library_on(&tx, &r.seed, now)?;
+            let changed = tx.execute(
                 "UPDATE show SET
                     list_status = :status,
                     progress = :progress,
                     synced_status = :status,
                     synced_progress = :progress
-                 WHERE anilist_id = :id",
+                 WHERE anilist_id = :id
+                   AND list_status = :minted
+                   AND progress = 0
+                   AND synced_status IS NULL",
                 named_params! {
                     ":status": r.status.as_str(),
                     ":progress": r.progress,
                     ":id": r.seed.anilist_id,
+                    ":minted": ListStatus::Planning.as_str(),
                 },
             )?;
+            if changed == 0 {
+                out.contended += 1;
+                continue; // drop(tx) rolls the mint back
+            }
+            tx.commit()?;
             out.imported += 1;
         }
         for p in plan {
@@ -3055,6 +3093,71 @@ mod tests {
         assert_eq!(show.library_added_at, Some(50));
         // Sparse seed did not clobber the richer existing cover.
         assert_eq!(show.enrichment.cover_url.as_deref(), Some("https://img/cover.jpg"));
+    }
+
+    #[test]
+    fn import_leaves_a_concurrently_added_row_for_next_run() {
+        // The import path's CAS guard, mirror of the matched-path race test: an
+        // add-and-edit landing between the plan read and apply must survive, not
+        // be clobbered by the import stamp.
+        let path = tmp_db("import-cas.db");
+        let store = Store::open(&path).unwrap();
+        let (plan, imports, unmatched) = store
+            .reconcile_plan(&[remote_seed(800, ListStatus::Watching, 5, "Frieren")])
+            .unwrap();
+        assert_eq!(imports.len(), 1, "the seed plans an import");
+
+        // A second connection adds the show and sets a real status before apply.
+        let other = Store::open(&path).unwrap();
+        let e = Enrichment {
+            anilist_id: 800,
+            title_romaji: "Frieren".into(),
+            ..Enrichment::default()
+        };
+        other.add_to_library(&e, 10).unwrap();
+        other.restore_list_status(800, ListStatus::Completed, 20, 10).unwrap();
+
+        let out = store.apply_reconcile(&plan, &imports, unmatched, 0).unwrap();
+        assert_eq!(out.contended, 1);
+        assert_eq!(out.imported, 0);
+        // The concurrent edit survives; the mint rolled back.
+        assert_eq!(state(&store, 800).0, ListStatus::Completed);
+        assert_eq!(state(&store, 800).1, 20);
+    }
+
+    #[test]
+    fn pull_rejects_a_control_only_title_seed() {
+        // A lone control char strips to Some("") upstream; the guard must read
+        // that as no title, not a present one (chaos pass).
+        let store = Store::open_memory().unwrap();
+        let entry = RemoteEntry {
+            anilist_id: 706,
+            status: ListStatus::Watching,
+            progress: 1,
+            import_seed: Some(Enrichment {
+                anilist_id: 706,
+                title_romaji: String::new(),
+                title_english: Some(String::new()),
+                ..Enrichment::default()
+            }),
+        };
+        let out = store.reconcile_pull(&[entry], 50).unwrap();
+        assert_eq!(out.imported, 0);
+        assert_eq!(out.unmatched, vec![706]);
+        assert!(store.get_show(706).unwrap().is_none());
+    }
+
+    #[test]
+    fn pull_caps_import_count_and_counts_overflow_as_unmatched() {
+        let store = Store::open_memory().unwrap();
+        let entries: Vec<RemoteEntry> = (0..IMPORT_CAP as i64 + 10)
+            .map(|i| remote_seed(1000 + i, ListStatus::Watching, 1, "Show"))
+            .collect();
+        let out = store.reconcile_pull(&entries, 50).unwrap();
+        assert_eq!(out.imported as usize, IMPORT_CAP);
+        assert_eq!(out.unmatched.len(), 10);
+        // Kept slice is the lowest ids; overflow is the highest, count-only.
+        assert!(out.unmatched.iter().all(|&id| id >= 1000 + IMPORT_CAP as i64));
     }
 
     #[test]
