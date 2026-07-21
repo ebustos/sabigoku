@@ -7,6 +7,7 @@
 //! Independent store (02 L3): this file never opens, migrates, or imports a
 //! zigoku DB. Its ladder starts at 1 for the 02 §3.3 shape.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -867,6 +868,16 @@ pub struct SyncRow {
     pub progress: u32,
 }
 
+/// Tally from one pull reconcile (06 §5.4). `unmatched`: remote ids with no
+/// library row, listed but not imported (v1).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PullOutcome {
+    pub reconciled: u32,
+    pub conflicts: u32,
+    pub contended: u32,
+    pub unmatched: Vec<i64>,
+}
+
 impl Store {
     /// Bind a provider offering to a show. Mints the identity row when absent
     /// (binding mint is on the 02 §3.7 list; no membership). Re-bind of a
@@ -1328,6 +1339,134 @@ impl Store {
         Ok(())
     }
 
+    /// Pull reconcile (06 §5.4): merge the remote list into matching library
+    /// rows by `anilist_id`, clean rows included. Read-then-write per row (no
+    /// wrapping transaction) so the CAS guard can catch a concurrent local edit.
+    pub fn reconcile_pull(
+        &self,
+        remote: &[crate::anilist::RemoteEntry],
+    ) -> Result<PullOutcome, Error> {
+        let (plan, unmatched) = self.reconcile_plan(remote)?;
+        self.apply_reconcile(&plan, unmatched)
+    }
+
+    /// Read candidates + collapsed remote list into the rows needing a write.
+    /// The concurrent-edit window is between this read and [`apply_reconcile`].
+    fn reconcile_plan(
+        &self,
+        remote: &[crate::anilist::RemoteEntry],
+    ) -> Result<(Vec<PlanRow>, Vec<i64>), Error> {
+        // Collapse the flat remote list (duplicate ids across custom lists,
+        // 06 §5.4) to one pair per id, keeping the highest progress.
+        let mut remote_map: HashMap<i64, (ListStatus, u32)> = HashMap::new();
+        for e in remote {
+            remote_map
+                .entry(e.anilist_id)
+                .and_modify(|cur| {
+                    if e.progress > cur.1 {
+                        *cur = (e.status, e.progress);
+                    }
+                })
+                .or_insert((e.status, e.progress));
+        }
+
+        struct Candidate {
+            id: i64,
+            local: (ListStatus, u32),
+            base: Option<(ListStatus, u32)>,
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT anilist_id, list_status, progress, synced_status, synced_progress
+             FROM show WHERE library_added_at IS NOT NULL",
+        )?;
+        let candidates = stmt
+            .query_map([], |row| {
+                let status: String = row.get(1)?;
+                let snap_status: Option<String> = row.get(3)?;
+                let snap_progress: Option<u32> = row.get(4)?;
+                let base = match (snap_status, snap_progress) {
+                    (Some(s), Some(p)) => Some((ListStatus::parse(&s), p)),
+                    _ => None,
+                };
+                Ok(Candidate {
+                    id: row.get(0)?,
+                    local: (ListStatus::parse(&status), row.get(2)?),
+                    base,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let matched: HashSet<i64> = candidates.iter().map(|c| c.id).collect();
+        let mut plan = Vec::new();
+        for c in &candidates {
+            let Some(&remote_pair) = remote_map.get(&c.id) else {
+                continue; // library row absent from the remote list; nothing to merge
+            };
+            let r = reconcile(c.base, c.local, remote_pair);
+            let merged = (r.status, r.progress);
+            let snapshot = (r.snapshot_status, r.snapshot_progress);
+            // Skip entirely when neither the local pair nor the snapshot moves.
+            if merged == c.local && Some(snapshot) == c.base {
+                continue;
+            }
+            plan.push(PlanRow {
+                id: c.id,
+                guard: c.local,
+                merged,
+                snapshot,
+                conflict: r.conflict,
+            });
+        }
+
+        let mut unmatched: Vec<i64> = remote_map
+            .keys()
+            .copied()
+            .filter(|id| !matched.contains(id))
+            .collect();
+        unmatched.sort_unstable();
+        Ok((plan, unmatched))
+    }
+
+    /// Apply each planned write, merged pair and snapshot in one guarded UPDATE.
+    /// Zero rows changed = a concurrent edit moved the pair past the guard:
+    /// count contended, leave the row (06 §5.4).
+    fn apply_reconcile(&self, plan: &[PlanRow], unmatched: Vec<i64>) -> Result<PullOutcome, Error> {
+        let mut out = PullOutcome {
+            unmatched,
+            ..PullOutcome::default()
+        };
+        for p in plan {
+            let changed = self.conn.execute(
+                "UPDATE show SET
+                    list_status = :status,
+                    progress = :progress,
+                    synced_status = :snap_status,
+                    synced_progress = :snap_progress
+                 WHERE anilist_id = :id
+                   AND list_status = :guard_status
+                   AND progress = :guard_progress",
+                named_params! {
+                    ":status": p.merged.0.as_str(),
+                    ":progress": p.merged.1,
+                    ":snap_status": p.snapshot.0.as_str(),
+                    ":snap_progress": p.snapshot.1,
+                    ":id": p.id,
+                    ":guard_status": p.guard.0.as_str(),
+                    ":guard_progress": p.guard.1,
+                },
+            )?;
+            if changed == 0 {
+                out.contended += 1;
+                continue;
+            }
+            out.reconciled += 1;
+            if p.conflict {
+                out.conflicts += 1;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn meta_get(&self, key: &str) -> Result<Option<String>, Error> {
         self.conn
             .query_row("SELECT value FROM app_meta WHERE key = ?1", [key], |row| {
@@ -1344,6 +1483,56 @@ impl Store {
             (key, value),
         )?;
         Ok(())
+    }
+}
+
+/// One planned reconcile write. `guard` is the pre-merge local pair the CAS
+/// UPDATE is conditioned on.
+struct PlanRow {
+    id: i64,
+    guard: (ListStatus, u32),
+    merged: (ListStatus, u32),
+    snapshot: (ListStatus, u32),
+    conflict: bool,
+}
+
+/// Pure merge result for one row (06 §5.4). Snapshot is the raw remote pair,
+/// not the merged one: that keeps a kept-local conflict dirty for the push.
+struct Reconciled {
+    status: ListStatus,
+    progress: u32,
+    snapshot_status: ListStatus,
+    snapshot_progress: u32,
+    conflict: bool,
+}
+
+/// The reconcile matrix (06 §5.4). `base` is the snapshot, `None` on first
+/// contact (treated as Planning). Progress is `max(local, remote)`; the
+/// snapshot re-baselines to the raw remote pair when remote differs from base.
+fn reconcile(
+    base: Option<(ListStatus, u32)>,
+    local: (ListStatus, u32),
+    remote: (ListStatus, u32),
+) -> Reconciled {
+    let eff_base = base.map_or(ListStatus::Planning, |(s, _)| s);
+    let local_moved = local.0 != eff_base;
+    let remote_moved = remote.0 != eff_base;
+    let (status, conflict) = match (local_moved, remote_moved) {
+        (false, false) => (eff_base, false),
+        (false, true) => (remote.0, false),             // adopt remote
+        (true, false) => (local.0, false),              // keep local
+        (true, true) => (local.0, local.0 != remote.0), // keep local; conflict if divergent
+    };
+    let snapshot = match base {
+        Some(b) if b == remote => b,
+        _ => remote,
+    };
+    Reconciled {
+        status,
+        progress: local.1.max(remote.1),
+        snapshot_status: snapshot.0,
+        snapshot_progress: snapshot.1,
+        conflict,
     }
 }
 
@@ -2595,6 +2784,158 @@ mod tests {
             EP_CACHE_TTL_DEFAULT_SECS
         );
         assert_eq!(episode_cache_ttl_secs(None), EP_CACHE_TTL_DEFAULT_SECS);
+    }
+
+    // ---- Pull reconcile (06 §5.4) ----
+
+    use crate::anilist::RemoteEntry;
+
+    fn remote(id: i64, status: ListStatus, progress: u32) -> RemoteEntry {
+        RemoteEntry { anilist_id: id, status, progress }
+    }
+
+    /// Library row at a precise pair + snapshot, bypassing the auto-status snaps.
+    fn lib_row(
+        store: &Store,
+        id: i64,
+        status: ListStatus,
+        progress: u32,
+        snapshot: Option<(ListStatus, u32)>,
+    ) {
+        store.add_to_library(&sample(id), 100).unwrap();
+        store.restore_list_status(id, status, progress, 100).unwrap();
+        if let Some((s, p)) = snapshot {
+            store.mark_synced(id, s, p).unwrap();
+        }
+    }
+
+    fn state(store: &Store, id: i64) -> (ListStatus, u32, Option<ListStatus>, Option<u32>) {
+        let s = store.get_show(id).unwrap().unwrap();
+        (s.list_status, s.progress, s.synced_status, s.synced_progress)
+    }
+
+    #[test]
+    fn reconcile_matrix_covers_every_cell() {
+        // no/no: unchanged status, progress still maxes.
+        let r = reconcile(Some((ListStatus::Watching, 5)), (ListStatus::Watching, 5), (ListStatus::Watching, 9));
+        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Watching, 9, false));
+        // progress-only remote bump rebaselines the snapshot too.
+        assert_eq!((r.snapshot_status, r.snapshot_progress), (ListStatus::Watching, 9));
+
+        // no/yes: adopt remote.
+        let r = reconcile(Some((ListStatus::Planning, 0)), (ListStatus::Planning, 0), (ListStatus::Watching, 5));
+        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Watching, 5, false));
+
+        // yes/no: keep local; snapshot stays (base == remote).
+        let r = reconcile(Some((ListStatus::Planning, 2)), (ListStatus::Watching, 4), (ListStatus::Planning, 2));
+        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Watching, 4, false));
+        assert_eq!((r.snapshot_status, r.snapshot_progress), (ListStatus::Planning, 2));
+
+        // yes/yes same target: converged, no conflict.
+        let r = reconcile(Some((ListStatus::Planning, 0)), (ListStatus::Completed, 12), (ListStatus::Completed, 10));
+        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Completed, 12, false));
+
+        // yes/yes different: keep local, conflict, snapshot is raw remote.
+        let r = reconcile(Some((ListStatus::Planning, 0)), (ListStatus::Dropped, 3), (ListStatus::Watching, 8));
+        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Dropped, 8, true));
+        assert_eq!((r.snapshot_status, r.snapshot_progress), (ListStatus::Watching, 8));
+    }
+
+    #[test]
+    fn reconcile_first_contact_treats_base_as_planning() {
+        // base null: both sides "moved" from Planning; same target keeps local.
+        let r = reconcile(None, (ListStatus::Watching, 4), (ListStatus::Watching, 2));
+        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Watching, 4, false));
+        // Snapshot re-baselines to the raw remote pair on first contact.
+        assert_eq!((r.snapshot_status, r.snapshot_progress), (ListStatus::Watching, 2));
+    }
+
+    #[test]
+    fn pull_adopts_remote_on_a_clean_row() {
+        let store = Store::open_memory().unwrap();
+        lib_row(&store, 1, ListStatus::Planning, 0, Some((ListStatus::Planning, 0)));
+        let out = store.reconcile_pull(&[remote(1, ListStatus::Watching, 5)]).unwrap();
+        assert_eq!(out, PullOutcome { reconciled: 1, ..Default::default() });
+        assert_eq!(
+            state(&store, 1),
+            (ListStatus::Watching, 5, Some(ListStatus::Watching), Some(5))
+        );
+    }
+
+    #[test]
+    fn pull_conflict_keeps_local_and_stays_dirty() {
+        let store = Store::open_memory().unwrap();
+        lib_row(&store, 2, ListStatus::Dropped, 3, Some((ListStatus::Planning, 0)));
+        let out = store.reconcile_pull(&[remote(2, ListStatus::Watching, 8)]).unwrap();
+        assert_eq!(out.reconciled, 1);
+        assert_eq!(out.conflicts, 1);
+        // Local kept, progress maxed, snapshot = raw remote (server truth).
+        assert_eq!(
+            state(&store, 2),
+            (ListStatus::Dropped, 8, Some(ListStatus::Watching), Some(8))
+        );
+        // synced_status (Watching) != list_status (Dropped) -> still on the push list.
+        let dirty = store.list_dirty_for_sync().unwrap();
+        assert!(dirty.iter().any(|r| r.anilist_id == 2));
+    }
+
+    #[test]
+    fn pull_skips_a_fully_converged_row() {
+        let store = Store::open_memory().unwrap();
+        lib_row(&store, 3, ListStatus::Watching, 5, Some((ListStatus::Watching, 5)));
+        let out = store.reconcile_pull(&[remote(3, ListStatus::Watching, 5)]).unwrap();
+        assert_eq!(out, PullOutcome::default());
+        assert_eq!(
+            state(&store, 3),
+            (ListStatus::Watching, 5, Some(ListStatus::Watching), Some(5))
+        );
+    }
+
+    #[test]
+    fn pull_reports_unmatched_remote_ids_without_importing() {
+        let store = Store::open_memory().unwrap();
+        lib_row(&store, 4, ListStatus::Planning, 0, None);
+        let out = store
+            .reconcile_pull(&[remote(4, ListStatus::Planning, 0), remote(999, ListStatus::Watching, 3)])
+            .unwrap();
+        assert_eq!(out.unmatched, vec![999]);
+        // The unmatched id was not minted into the library.
+        assert!(store.get_show(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn pull_collapses_duplicate_remote_ids_keeping_max_progress() {
+        let store = Store::open_memory().unwrap();
+        lib_row(&store, 5, ListStatus::Watching, 0, Some((ListStatus::Watching, 0)));
+        // Same id twice (custom-list duplication); the higher progress wins.
+        let out = store
+            .reconcile_pull(&[remote(5, ListStatus::Watching, 2), remote(5, ListStatus::Watching, 7)])
+            .unwrap();
+        assert_eq!(out.reconciled, 1);
+        assert_eq!(state(&store, 5).1, 7);
+    }
+
+    #[test]
+    fn pull_leaves_a_concurrently_edited_row_for_next_run() {
+        // The CAS guard: a local edit landing between the candidate read (plan)
+        // and the write (apply) fails the guard, so the row is left untouched.
+        let path = tmp_db("reconcile-cas.db");
+        let store = Store::open(&path).unwrap();
+        lib_row(&store, 6, ListStatus::Planning, 0, Some((ListStatus::Planning, 0)));
+
+        let (plan, unmatched) = store.reconcile_plan(&[remote(6, ListStatus::Watching, 5)]).unwrap();
+        assert_eq!(plan.len(), 1, "the remote change should plan a write");
+
+        // A concurrent edit lands through a second connection before apply.
+        let other = Store::open(&path).unwrap();
+        other.restore_list_status(6, ListStatus::Dropped, 9, 200).unwrap();
+
+        let out = store.apply_reconcile(&plan, unmatched).unwrap();
+        assert_eq!(out.contended, 1);
+        assert_eq!(out.reconciled, 0);
+        // The concurrent edit survives; the stale merge did not overwrite it.
+        assert_eq!(state(&store, 6).0, ListStatus::Dropped);
+        assert_eq!(state(&store, 6).1, 9);
     }
 
     #[test]
