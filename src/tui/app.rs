@@ -1620,7 +1620,7 @@ impl App {
         if let Some(session) = &self.connect {
             let view = ConnectView {
                 url: &session.url,
-                elapsed_secs: now.saturating_duration_since(session.started).as_secs(),
+                elapsed: now.saturating_duration_since(session.started),
                 copied: session.copied,
             };
             connect::draw(frame, rows.content, self.palette, &view);

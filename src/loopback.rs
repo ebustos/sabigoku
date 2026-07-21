@@ -18,10 +18,27 @@ use crate::login::{ConnectResult, LOOPBACK_PORT, Verifier, authorize_url, comple
 /// accept. There is deliberately no overall timeout on the wait.
 const READ_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The browser keeps the token in `location.hash`, invisible to the server on
-/// the first GET; this relay copies it into a /callback query. Byte-critical
-/// (06 §4.4): do not reformat or rewrap the script.
-const RELAY_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>sabigoku</title></head><body><script>location.replace(\"/callback?\" + location.hash.substring(1));</script>Signing in...</body></html>";
+/// The top-bar wordmark (DESIGN 3.4), above the headline on every callback page.
+const WORDMARK: &str = "錆獄 sabigoku";
+
+/// Shared `<style>` for all three callback pages (DESIGN 5.5a): theme-aware via
+/// `prefers-color-scheme`, dark reusing §1.1's terminal_ghost hex. One constant
+/// so a contrast fix can't drift between pages. Self-contained: no external
+/// fonts/images (served off a bare loopback listener).
+const PAGE_STYLE: &str = "<style>:root{--bg:#fff;--card:#f4f6f4;--hair:#d7ddd7;--fg:#0b3d1e;--muted:#5a6b5f;--accent:#0b7a3b}@media(prefers-color-scheme:dark){:root{--bg:#020d06;--card:#0b1f18;--hair:#1a4030;--fg:#39ff6a;--muted:#2a6040;--accent:#20ffdd}}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--fg);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.card{background:var(--card);border:1px solid var(--hair);border-radius:10px;padding:32px 40px;text-align:center;max-width:360px}.mark{color:var(--muted);font-size:13px;letter-spacing:.08em;margin-bottom:18px}.headline{font-size:18px;margin:0 0 8px}.sub{color:var(--muted);font-size:14px;margin:0}.cursor{color:var(--accent);animation:blink 1s steps(1,end) infinite}@keyframes blink{50%{opacity:0}}</style>";
+
+/// First landing: the token is in `location.hash`, invisible to the server, so
+/// this relay copies it into a /callback query. No address-bar scrub here (its
+/// only job is the redirect). Byte-critical (06 §4.4): do not reformat or
+/// rewrap the `location.replace` line.
+fn relay_page() -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>sabigoku</title>{PAGE_STYLE}</head>\
+         <body><div class=\"card\"><div class=\"mark\">{WORDMARK}</div>\
+         <p class=\"headline\">finishing sign-in <span class=\"cursor\">▌</span></p></div>\
+         <script>location.replace(\"/callback?\" + location.hash.substring(1));</script></body></html>"
+    )
+}
 
 pub struct Loopback {
     listener: TcpListener,
@@ -115,7 +132,7 @@ impl Loopback {
             let _ = write_html(&mut stream, &result_page(&result));
             Some(result)
         } else {
-            let _ = write_html(&mut stream, RELAY_HTML);
+            let _ = write_html(&mut stream, &relay_page());
             None
         }
     }
@@ -147,27 +164,26 @@ fn write_html(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
     stream.write_all(resp.as_bytes())
 }
 
-/// Result page; scrubs the token from the address bar in `<head>` before
-/// anything renders (06 §4.4).
+/// The success or failure page. The browser only ever shows the generic
+/// outcome; the specific reason (rejected, no token, save failed) surfaces in
+/// the terminal, not the tab.
 fn result_page(result: &ConnectResult) -> String {
-    let msg = match result {
-        ConnectResult::Ok { user_name } => {
-            format!("Signed in as {}. You can close this tab.", html_escape(user_name))
-        }
-        ConnectResult::NoToken => "No token in the redirect. Try again.".into(),
-        ConnectResult::Rejected => "AniList rejected the token. Try again.".into(),
-        ConnectResult::NetworkError => "Could not reach AniList. Try again.".into(),
-        ConnectResult::SaveFailed => "Signed in, but saving the token failed.".into(),
-        ConnectResult::BadState => "Login state mismatch. Try again.".into(),
-        ConnectResult::Canceled => "Login canceled.".into(),
-    };
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><script>history.replaceState(null,'','/')</script><title>sabigoku</title></head><body>{msg}</body></html>"
-    )
+    match result {
+        ConnectResult::Ok { .. } => scrubbed_page("✓ signed in to AniList", "you can close this tab"),
+        _ => scrubbed_page("sign-in didn't complete", "check your terminal"),
+    }
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+/// A done/fail page: the address-bar scrub (06 §4.4) is the first thing in
+/// `<head>`, before the style or body parse, so the token clears as early as
+/// the page can manage.
+fn scrubbed_page(headline: &str, sub: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <script>history.replaceState(null,'','/')</script><title>sabigoku</title>{PAGE_STYLE}</head>\
+         <body><div class=\"card\"><div class=\"mark\">{WORDMARK}</div>\
+         <p class=\"headline\">{headline}</p><p class=\"sub\">{sub}</p></div></body></html>"
+    )
 }
 
 /// 128-bit CSRF nonce from the OS CSPRNG. Reading `/dev/urandom` keeps this
@@ -246,8 +262,9 @@ mod tests {
             )
             .unwrap();
             let done = read_response(c2);
-            assert!(done.contains("Signed in as rod"));
+            assert!(done.contains("signed in to AniList"));
             assert!(done.contains("history.replaceState"), "address bar not scrubbed");
+            assert!(done.contains(WORDMARK), "wordmark missing");
 
             h.join().unwrap()
         });
@@ -277,6 +294,24 @@ mod tests {
 
         assert_eq!(result, ConnectResult::BadState);
         assert!(!path.exists(), "a forged state must never verify or persist");
+    }
+
+    #[test]
+    fn relay_redirects_without_scrub_results_scrub_first() {
+        let relay = relay_page();
+        assert!(relay.contains("location.hash.substring(1)"), "relay redirect line");
+        assert!(
+            !relay.contains("history.replaceState"),
+            "relay navigates away; it must not carry the scrub"
+        );
+        let fail = result_page(&ConnectResult::Rejected);
+        assert!(fail.contains("sign-in didn't complete"));
+        assert!(
+            fail.starts_with(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><script>history.replaceState"
+            ),
+            "the scrub must be the first thing in <head>"
+        );
     }
 
     #[test]
