@@ -240,8 +240,6 @@ impl App {
             } => self.on_play_finished(anilist_id, position, failure, token, now, tx),
             Event::ConnectResult(result) => self.on_connect_result(result, now, tx),
             Event::SyncFlushed(summary) => self.on_sync_flushed(summary, now),
-            // Wired later in ROD-448: update toast (chunk 9).
-            Event::UpdateAvailable { .. } => {}
         }
     }
 

@@ -166,10 +166,6 @@ pub enum Event {
     /// A sync run finished (04 §4.6); the toast rows read off the summary
     /// (DESIGN 4.10 up/down).
     SyncFlushed(SyncSummary),
-    /// A strictly newer release exists (04 §4.6 / 06 §6.1); payload is the tag.
-    UpdateAvailable {
-        version: String,
-    },
 }
 
 pub type EventRx = mpsc::Receiver<Event>;
@@ -243,25 +239,16 @@ mod tests {
     }
 
     #[test]
-    fn sync_slice_events_round_trip_the_queue() {
+    fn connect_result_round_trips_the_queue() {
         let (tx, rx) = channel();
         tx.post(Event::ConnectResult(ConnectResult::Ok {
             user_name: "rod".into(),
         }));
-        tx.post(Event::UpdateAvailable {
-            version: "1.2.3".into(),
-        });
         assert_eq!(
             rx.recv().unwrap(),
             Event::ConnectResult(ConnectResult::Ok {
                 user_name: "rod".into()
             })
-        );
-        assert_eq!(
-            rx.recv().unwrap(),
-            Event::UpdateAvailable {
-                version: "1.2.3".into()
-            }
         );
     }
 }
