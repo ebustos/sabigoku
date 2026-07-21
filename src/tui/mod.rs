@@ -127,9 +127,13 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
     app.browse.drain(Duration::from_secs(1));
     app.detail.drain(Duration::from_secs(1));
     app.discover.drain(Duration::from_secs(1));
+    // Wake a blocked connect worker before its drain (06 §4.4).
+    app.shutdown_connect();
+    let sync_drain = app.sync_drain.clone();
     // The encode worker exits when the pool (inside App) drops its queue.
     let encode_drain = app.encode_drain.clone();
     drop(app);
+    sync_drain.drain(Duration::from_secs(1));
     encode_drain.drain(Duration::from_secs(1));
     ratatui::restore();
     result
