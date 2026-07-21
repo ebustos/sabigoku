@@ -3,10 +3,13 @@
 
 pub mod anilist;
 pub mod aniskip;
+pub mod auth;
 pub mod config;
 pub mod domain;
 pub mod error;
 pub mod fetchguard;
+pub mod login;
+pub mod loopback;
 pub mod paths;
 pub mod player;
 pub mod providers;
@@ -14,6 +17,7 @@ pub mod proxy;
 pub mod resolve;
 pub mod resolver;
 pub mod store;
+pub mod sync;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod tui;

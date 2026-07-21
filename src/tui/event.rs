@@ -9,8 +9,10 @@ use image::DynamicImage;
 use ratatui::crossterm::event::{self as ct, KeyEvent};
 
 use crate::domain::Enrichment;
+use crate::login::ConnectResult;
 use crate::player::Position;
 use crate::providers::{DiscoverAxis, ProviderError, SearchHit};
+use crate::sync::SyncSummary;
 
 use super::workers::{CancelFlag, Drain};
 
@@ -158,6 +160,12 @@ pub enum Event {
         failure: Option<PlayFailure>,
         token: u64,
     },
+    /// Loopback login outcome (04 §4.6). The worker skips posting on cancel, so
+    /// `Canceled` never rides this queue.
+    ConnectResult(ConnectResult),
+    /// A sync run finished (04 §4.6); the toast rows read off the summary
+    /// (DESIGN 4.10 up/down).
+    SyncFlushed(SyncSummary),
 }
 
 pub type EventRx = mpsc::Receiver<Event>;
@@ -228,5 +236,19 @@ mod tests {
         tx.post(Event::Resize(80, 24));
         assert_eq!(rx.recv().unwrap(), Event::Tick);
         assert_eq!(rx.recv().unwrap(), Event::Resize(80, 24));
+    }
+
+    #[test]
+    fn connect_result_round_trips_the_queue() {
+        let (tx, rx) = channel();
+        tx.post(Event::ConnectResult(ConnectResult::Ok {
+            user_name: "rod".into(),
+        }));
+        assert_eq!(
+            rx.recv().unwrap(),
+            Event::ConnectResult(ConnectResult::Ok {
+                user_name: "rod".into()
+            })
+        );
     }
 }

@@ -29,6 +29,7 @@ use crate::providers::{CatalogProvider, DiscoverAxis, ProviderRegistry};
 use crate::store::Store;
 
 use super::chrome::{self, BottomBar, HelpLine, Tab, TopBar};
+use super::clock::Debounce;
 use super::covers::CoverCaches;
 use super::covers::render::ProtocolPool;
 use super::episodes::{EpisodeDeps, Feedback};
@@ -39,15 +40,22 @@ use super::render;
 use super::theme::{self, Palette};
 use super::toast::{Kind, Toasts};
 use super::view::browse::{self, BrowseState};
+use super::view::connect::{self, ConnectView};
 use super::view::detail::{self, DetailState};
 use super::view::discover::{self, DiscoverState};
 use super::view::history::{self, HistoryState};
 use super::view::settings::{self, SettingsState};
 use super::view::{InputMode, Origin, Pane, View, ViewEnv};
-use super::workers::Drain;
+use super::workers::{self, Drain};
+use crate::auth::Auth;
+use crate::login::ConnectResult;
+use crate::loopback::{Canceler, Loopback};
+use crate::sync;
 
 /// Unknown-command bottom-bar flash (DESIGN 3.5).
 const COMMAND_FLASH: Duration = Duration::from_millis(800);
+/// Action-flush debounce window (clock.rs "sync flush 3000ms", ROD-291).
+const SYNC_FLUSH_PERIOD: Duration = Duration::from_millis(3000);
 
 pub struct App {
     pub(super) quit: bool,
@@ -87,8 +95,30 @@ pub struct App {
     covers_dir: PathBuf,
     play_dirs: PlayDirs,
     config_file: PathBuf,
+    db_file: PathBuf,
+    /// Loaded at startup, reloaded after a connect completes (05 reloadAuth).
+    auth: Auth,
+    auth_file: PathBuf,
+    /// Open connect modal; captures every key while present (DESIGN 5.5a).
+    connect: Option<ConnectSession>,
+    /// Action-flush debounce (ROD-291): armed on a status/play edit, fires the
+    /// pull-then-push sync.
+    sync_debounce: Debounce,
+    /// A sync worker is inflight; gates overlap and the quit flush (04 §11).
+    syncing: bool,
+    /// Connect and sync workers share one drain, joined at teardown.
+    pub(super) sync_drain: Drain,
     pub(super) pool: ProtocolPool,
     pub(super) encode_drain: Drain,
+}
+
+/// Live state of an open connect modal. `canceler` wakes the blocked loopback
+/// worker on esc/teardown; `started` clocks the spinner and the 20s paste hint.
+struct ConnectSession {
+    url: String,
+    canceler: Canceler,
+    started: Instant,
+    copied: bool,
 }
 
 /// Persistent-toast topic for the catalog brain (DESIGN 8.5).
@@ -140,6 +170,13 @@ impl App {
                 cache: paths.cache.clone(),
             },
             config_file: paths.config_file(),
+            db_file: paths.db_file(),
+            auth: Auth::load(&paths.auth_file()),
+            auth_file: paths.auth_file(),
+            connect: None,
+            sync_debounce: Debounce::default(),
+            syncing: false,
+            sync_drain: Drain::default(),
             pool,
             encode_drain,
         };
@@ -201,6 +238,8 @@ impl App {
                 failure,
                 token,
             } => self.on_play_finished(anilist_id, position, failure, token, now, tx),
+            Event::ConnectResult(result) => self.on_connect_result(result, now, tx),
+            Event::SyncFlushed(summary) => self.on_sync_flushed(summary, now),
         }
     }
 
@@ -211,6 +250,12 @@ impl App {
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl_c {
             self.quit = true;
+            return;
+        }
+        // The connect modal captures every key but Ctrl-C (DESIGN 5.5a).
+        if self.connect.is_some() {
+            self.on_connect_key(key, now);
+            self.dirty = true;
             return;
         }
         // An armed delete freezes everything below it, F-keys and `q`
@@ -548,7 +593,10 @@ impl App {
             return;
         };
         match self.store.add_to_library(entry, unix_now()) {
-            Ok(()) => self.toasts.push(Kind::Success, "added to watchlist", now),
+            Ok(()) => {
+                self.arm_sync(now);
+                self.toasts.push(Kind::Success, "added to watchlist", now);
+            }
             Err(_) => self
                 .toasts
                 .push(Kind::Error, "couldn't add to watchlist", now),
@@ -572,6 +620,7 @@ impl App {
             return;
         }
         self.undo = Some(before);
+        self.arm_sync(now);
         self.reload_history(now);
     }
 
@@ -590,6 +639,7 @@ impl App {
             .is_ok()
         {
             self.toasts.push(Kind::Info, "undone", now);
+            self.arm_sync(now);
         }
         self.reload_history(now);
     }
@@ -613,6 +663,7 @@ impl App {
                 if high_water == 0 {
                     self.history.clear_resume_marker(aid);
                 }
+                self.arm_sync(now);
                 self.toasts.push(Kind::Success, "progress reset", now);
             }
             Err(_) => self
@@ -875,6 +926,9 @@ impl App {
         if self.view == View::Discover {
             self.tick_discover(now, tx);
         }
+        if self.sync_debounce.fire(now) {
+            self.flush_sync(now, tx, false);
+        }
         self.dirty = true;
     }
 
@@ -1126,10 +1180,12 @@ impl App {
     fn draw_settings(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         let names: Vec<&str> = self.registry.iter().map(|p| p.name()).collect();
         let covers_dir = settings::tilde_path(&self.covers_dir);
+        let account = self.account_line();
         let env = settings::SettingsEnv {
             config: &self.config,
             providers: &names,
             covers_dir: &covers_dir,
+            account: &account,
         };
         settings::draw(frame, area, self.palette, &self.settings, &env);
     }
@@ -1148,8 +1204,191 @@ impl App {
                 self.on_settings_config_changed(&translation_before, now, tx);
                 true
             }
-            // Inert until the connect modal lands (ROD-448).
-            settings::KeyOutcome::ConnectRequested => true,
+            settings::KeyOutcome::ConnectRequested => {
+                self.open_connect(now, tx);
+                true
+            }
+        }
+    }
+
+    /// Raise the connect modal (DESIGN 5.5a): bind the loopback synchronously so
+    /// a bind failure is a toast, not a half-open modal; open the browser; then
+    /// run the accept loop off the render path.
+    fn open_connect(&mut self, now: Instant, tx: &EventTx) {
+        let loopback = match Loopback::start() {
+            Ok(lp) => lp,
+            Err(_) => {
+                self.toasts
+                    .push(Kind::Error, "could not start login server", now);
+                return;
+            }
+        };
+        let url = loopback.authorize_url();
+        open_browser(&url);
+        let canceler = loopback.canceler();
+        let started = workers::spawn_connect(
+            &self.sync_drain,
+            tx.clone(),
+            loopback,
+            self.auth_file.clone(),
+            unix_now(),
+        );
+        if !started {
+            // The OS refused the thread; nothing will drive the modal.
+            canceler.cancel();
+            self.toasts
+                .push(Kind::Error, "could not start login worker", now);
+            return;
+        }
+        self.connect = Some(ConnectSession {
+            url,
+            canceler,
+            started: now,
+            copied: false,
+        });
+    }
+
+    /// Captured connect-modal keys (DESIGN 5.5a): only `c` (copy) and `esc`
+    /// (cancel) act; everything else is swallowed.
+    fn on_connect_key(&mut self, key: KeyEvent, _now: Instant) {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(session) = self.connect.take() {
+                    // Wake the blocked accept; the worker skips posting on cancel.
+                    session.canceler.cancel();
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(session) = &mut self.connect {
+                    copy_to_clipboard(&session.url);
+                    session.copied = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A connect worker finished (04 §4.6): close the modal, reload auth so the
+    /// account row and the sync gate see the new token, and toast the outcome.
+    fn on_connect_result(&mut self, result: ConnectResult, now: Instant, tx: &EventTx) {
+        self.connect = None;
+        self.auth = Auth::load(&self.auth_file);
+        let (kind, copy) = match result {
+            ConnectResult::Ok { user_name } => {
+                // Post-connect bootstrap (ROD-292): pull then push (06 §5.2).
+                self.flush_sync(now, tx, false);
+                (Kind::Success, format!("signed in as {user_name}"))
+            }
+            ConnectResult::NoToken => (Kind::Error, "no token received".into()),
+            ConnectResult::Rejected => (Kind::Error, "AniList rejected the token".into()),
+            ConnectResult::NetworkError => (Kind::Error, "could not reach AniList".into()),
+            ConnectResult::SaveFailed => (Kind::Error, "signed in, but saving the token failed".into()),
+            ConnectResult::BadState => (Kind::Error, "login state mismatch".into()),
+            // Never posted by the worker; nothing to report.
+            ConnectResult::Canceled => return,
+        };
+        self.toasts.push(kind, &copy, now);
+    }
+
+    /// A live, unexpired token (DESIGN 5.5 `anilist_connected`).
+    fn anilist_connected(&self) -> bool {
+        let a = &self.auth.anilist;
+        a.bearer().is_some() && !a.is_expired(unix_now())
+    }
+
+    /// The master switch ANDed with the connection (DESIGN 5.5 `sync_enabled`):
+    /// the gate on whether to spawn any sync at all.
+    fn sync_enabled(&self) -> bool {
+        self.config.anilist_sync_enabled && self.anilist_connected()
+    }
+
+    /// Arm the action-flush debounce after a status/play edit (ROD-291). A no-op
+    /// when sync is off or disconnected.
+    fn arm_sync(&mut self, now: Instant) {
+        if self.sync_enabled() {
+            self.sync_debounce.arm(now, SYNC_FLUSH_PERIOD);
+        }
+    }
+
+    /// Spawn a sync run, unless one is already inflight (re-arm to retry) or the
+    /// gate is closed. `pull_only` is the launch-refresh path (06 §5.2).
+    fn flush_sync(&mut self, now: Instant, tx: &EventTx, pull_only: bool) {
+        if !self.sync_enabled() {
+            return;
+        }
+        if self.syncing {
+            // A run is going; retry after another period rather than overlap.
+            self.sync_debounce.arm(now, SYNC_FLUSH_PERIOD);
+            return;
+        }
+        let started = workers::spawn_sync(
+            &self.sync_drain,
+            tx.clone(),
+            self.db_file.clone(),
+            self.auth.clone(),
+            self.config.anilist_sync_enabled,
+            pull_only,
+            unix_now(),
+        );
+        self.syncing = started;
+    }
+
+    /// Launch pull-refresh (04 §3): pull only, so first contact never blind-pushes.
+    pub(super) fn bootstrap_sync(&mut self, tx: &EventTx) {
+        self.flush_sync(Instant::now(), tx, true);
+    }
+
+    /// A sync run finished: clear the inflight flag and toast what moved
+    /// (DESIGN 4.10 up/down rows). Failures and no-ops are silent by design.
+    fn on_sync_flushed(&mut self, summary: sync::SyncSummary, now: Instant) {
+        self.syncing = false;
+        if summary.pulled.reconciled > 0 {
+            self.toasts.push(
+                Kind::Info,
+                &format!("↓ {} from AniList", summary.pulled.reconciled),
+                now,
+            );
+        }
+        if summary.pushed > 0 {
+            self.toasts
+                .push(Kind::Info, &format!("↑ {} to AniList", summary.pushed), now);
+        }
+    }
+
+    /// Quit flush (04 §11): push only, skipped while a pull may be inflight.
+    /// Best-effort; teardown's drain deadline bounds it.
+    pub(super) fn spawn_quit_flush(&self, tx: &EventTx) {
+        if self.syncing || !self.sync_enabled() {
+            return;
+        }
+        let _ = workers::spawn_flush(
+            &self.sync_drain,
+            tx.clone(),
+            self.db_file.clone(),
+            self.auth.clone(),
+            self.config.anilist_sync_enabled,
+            unix_now(),
+        );
+    }
+
+    /// The account row's live text (DESIGN 5.5): the user name once connected,
+    /// the reconnect prompt when a token exists but is expired, else not
+    /// connected.
+    fn account_line(&self) -> String {
+        let a = &self.auth.anilist;
+        match a.bearer() {
+            None => "not connected".into(),
+            Some(_) if a.is_expired(unix_now()) => "reconnect · token expired".into(),
+            Some(_) if a.user_name.is_empty() => "connected".into(),
+            Some(_) => a.user_name.clone(),
+        }
+    }
+
+    /// Cancel a pending connect at teardown so the blocked loopback worker can
+    /// exit before its drain.
+    pub(super) fn shutdown_connect(&self) {
+        if let Some(session) = &self.connect {
+            session.canceler.cancel();
         }
     }
 
@@ -1348,6 +1587,7 @@ impl App {
                     &deps,
                 );
             }
+            self.arm_sync(now);
             self.reload_history(now);
         }
         if let Some(ask) = out.hop {
@@ -1481,6 +1721,14 @@ impl App {
             View::Settings => self.draw_settings(frame, rows.content),
         }
         chrome::draw_bottom_bar(frame, rows.bottom, self.palette, &self.bottom_bar(now));
+        if let Some(session) = &self.connect {
+            let view = ConnectView {
+                url: &session.url,
+                elapsed: now.saturating_duration_since(session.started),
+                copied: session.copied,
+            };
+            connect::draw(frame, rows.content, self.palette, &view);
+        }
         self.toasts.draw(frame, area, self.palette);
     }
 
@@ -1735,6 +1983,33 @@ fn unix_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Open a URL in the user's browser, best-effort: a failure just means the user
+/// falls back to the copy-link key. Detached so it never blocks the render path.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    const OPEN_CMD: &str = "open";
+    #[cfg(not(target_os = "macos"))]
+    const OPEN_CMD: &str = "xdg-open";
+    let _ = std::process::Command::new(OPEN_CMD)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Copy `text` to the system clipboard via OSC 52. Terminal-mediated (works
+/// over SSH); a terminal that ignores the sequence just leaves the clipboard
+/// untouched. The sequence is out-of-band, so it does not disturb the frame.
+fn copy_to_clipboard(text: &str) {
+    use base64::Engine;
+    use std::io::Write;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+    let _ = out.flush();
+}
+
 /// Free function so the deps borrow individual App fields and stay disjoint
 /// from `&mut self.detail`.
 fn episode_deps<'a>(
@@ -1948,6 +2223,88 @@ mod tests {
         let (mut app, tx, now) = harness(name);
         app.tick(Event::Resize(w, h), now, &tx);
         (app, tx, now)
+    }
+
+    #[test]
+    fn account_line_reflects_auth_state() {
+        let (mut app, _tx, _now) = harness("account-line");
+        assert_eq!(app.account_line(), "not connected");
+
+        app.auth.anilist.access_token = "abcdefghijklmnopqrstuvwxyz".into();
+        app.auth.anilist.user_name = "rod".into();
+        app.auth.anilist.expires_at = 0; // undated stays live
+        assert_eq!(app.account_line(), "rod");
+
+        // A token with no name still reads as connected, not "not connected".
+        app.auth.anilist.user_name = String::new();
+        assert_eq!(app.account_line(), "connected");
+
+        // Dated in the past is the reconnect state.
+        app.auth.anilist.expires_at = 1;
+        assert_eq!(app.account_line(), "reconnect · token expired");
+    }
+
+    fn connect(app: &mut App) {
+        app.auth.anilist.access_token = "abcdefghijklmnopqrstuvwxyz".into();
+        app.auth.anilist.user_id = 7;
+        app.auth.anilist.expires_at = 0;
+    }
+
+    #[test]
+    fn arm_sync_respects_the_connection_and_switch() {
+        let (mut app, _tx, now) = harness("arm-sync");
+        // Disconnected: arming is a no-op.
+        app.arm_sync(now);
+        assert!(!app.sync_debounce.is_armed());
+        // Connected + switch on: arms.
+        connect(&mut app);
+        app.arm_sync(now);
+        assert!(app.sync_debounce.is_armed());
+        // Switch off: no arm.
+        app.sync_debounce.disarm();
+        app.config.anilist_sync_enabled = false;
+        app.arm_sync(now);
+        assert!(!app.sync_debounce.is_armed());
+    }
+
+    #[test]
+    fn sync_flushed_toasts_up_and_down_counts() {
+        let (mut app, _tx, now) = harness("sync-flushed");
+        app.syncing = true;
+        let summary = sync::SyncSummary {
+            outcome: sync::SyncOutcome::Completed,
+            pulled: crate::store::PullOutcome {
+                reconciled: 2,
+                ..Default::default()
+            },
+            pushed: 3,
+            push_failed: 0,
+        };
+        app.on_sync_flushed(summary, now);
+        assert!(!app.syncing, "the inflight flag clears");
+        let copies: Vec<String> = app.toasts.iter().map(|t| t.copy.clone()).collect();
+        assert!(copies.iter().any(|c| c == "↓ 2 from AniList"));
+        assert!(copies.iter().any(|c| c == "↑ 3 to AniList"));
+
+        // A no-op run is silent.
+        let (mut app, _tx, now) = harness("sync-flushed-noop");
+        app.on_sync_flushed(sync::SyncSummary::terminal(sync::SyncOutcome::Completed), now);
+        assert_eq!(app.toasts.iter().count(), 0);
+    }
+
+    #[test]
+    fn connect_result_closes_the_modal_and_toasts() {
+        let (mut app, tx, now) = harness("connect-result");
+        // No modal open; the handler still reloads auth and toasts the outcome.
+        app.on_connect_result(
+            ConnectResult::Ok {
+                user_name: "rod".into(),
+            },
+            now,
+            &tx,
+        );
+        assert!(app.connect.is_none());
+        assert_eq!(app.toasts.iter().count(), 1);
     }
 
     /// Settle every worker family, applying one event per drain pass so a

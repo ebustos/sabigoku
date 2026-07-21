@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::domain::{Date, Enrichment, Season, current_cour};
+use crate::domain::{Date, Enrichment, ListStatus, Season, current_cour};
 use crate::providers::{
     CatalogError, CatalogPage, CatalogProvider, DISCOVER_PAGE_SIZE, DiscoverAxis, SEARCH_PAGE_SIZE,
 };
@@ -460,6 +460,182 @@ fn classify_by_id(raw: &[u8]) -> Result<Option<Enrichment>, CatalogError> {
     Ok(data.media.map(media_to_enrichment))
 }
 
+// ---- Auth + sync surface (06 §4.2 Viewer, §5.4 pull, §5.3 push) ----
+
+/// AniList account identity from the `Viewer` query (06 §4.2). The pull needs
+/// `id > 0`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Viewer {
+    pub id: i64,
+    pub name: String,
+}
+
+/// One remote list entry, mapped to the domain (06 §5.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteEntry {
+    pub anilist_id: i64,
+    pub status: ListStatus,
+    pub progress: u32,
+}
+
+/// AniList `MediaListStatus` -> domain. REPEATING folds to Watching at ingest so
+/// the merge never sees it; unknown/absent -> Planning (06 §5.4).
+fn list_status_from_anilist(s: Option<&str>) -> ListStatus {
+    match s {
+        Some("CURRENT" | "REPEATING") => ListStatus::Watching,
+        Some("PLANNING") => ListStatus::Planning,
+        Some("PAUSED") => ListStatus::Paused,
+        Some("COMPLETED") => ListStatus::Completed,
+        Some("DROPPED") => ListStatus::Dropped,
+        _ => ListStatus::Planning,
+    }
+}
+
+/// Domain -> AniList `MediaListStatus` for the push mutation (06 §5.3).
+fn list_status_to_anilist(s: ListStatus) -> &'static str {
+    match s {
+        ListStatus::Watching => "CURRENT",
+        ListStatus::Planning => "PLANNING",
+        ListStatus::Paused => "PAUSED",
+        ListStatus::Completed => "COMPLETED",
+        ListStatus::Dropped => "DROPPED",
+    }
+}
+
+fn viewer_body() -> serde_json::Value {
+    json!({ "query": "query{Viewer{id name}}" })
+}
+
+fn list_collection_body(user_id: i64) -> serde_json::Value {
+    json!({
+        "query": "query($userId:Int!){MediaListCollection(userId:$userId,type:ANIME){lists{entries{mediaId status progress}}}}",
+        "variables": { "userId": user_id },
+    })
+}
+
+fn save_entry_body(media_id: i64, status: ListStatus, progress: u32) -> serde_json::Value {
+    json!({
+        "query": "mutation($mediaId:Int!,$status:MediaListStatus!,$progress:Int!){SaveMediaListEntry(mediaId:$mediaId,status:$status,progress:$progress){id}}",
+        "variables": {
+            "mediaId": media_id,
+            "status": list_status_to_anilist(status),
+            "progress": progress,
+        },
+    })
+}
+
+#[derive(Deserialize)]
+struct ViewerResp {
+    data: Option<ViewerData>,
+}
+
+#[derive(Deserialize)]
+struct ViewerData {
+    #[serde(rename = "Viewer")]
+    viewer: Option<ViewerNode>,
+}
+
+#[derive(Deserialize)]
+struct ViewerNode {
+    id: i64,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListCollectionResp {
+    data: Option<ListCollectionData>,
+}
+
+#[derive(Deserialize)]
+struct ListCollectionData {
+    #[serde(rename = "MediaListCollection")]
+    collection: Option<ListCollection>,
+}
+
+#[derive(Deserialize, Default)]
+struct ListCollection {
+    lists: Option<Vec<ListGroup>>,
+}
+
+#[derive(Deserialize, Default)]
+struct ListGroup {
+    entries: Option<Vec<ListEntryNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListEntryNode {
+    media_id: i64,
+    status: Option<String>,
+    #[serde(default)]
+    progress: u32,
+}
+
+#[derive(Deserialize)]
+struct SaveResp {
+    data: Option<SaveData>,
+}
+
+#[derive(Deserialize)]
+struct SaveData {
+    #[serde(rename = "SaveMediaListEntry")]
+    entry: Option<SaveNode>,
+}
+
+#[derive(Deserialize)]
+struct SaveNode {
+    id: Option<i64>,
+}
+
+/// Viewer body -> three-state (06 §4.2): `data:null`/garbage = no answer (Err),
+/// `Viewer:null` = confirmed rejection (Ok(None)). Persist only on Ok(Some).
+fn classify_viewer(raw: &[u8]) -> Result<Option<Viewer>, CatalogError> {
+    let resp: ViewerResp =
+        serde_json::from_slice(raw).map_err(|e| CatalogError::Decode(e.to_string()))?;
+    let data = resp
+        .data
+        .ok_or_else(|| CatalogError::Decode("data is null".into()))?;
+    Ok(data.viewer.map(|v| Viewer {
+        id: v.id,
+        name: strip_controls(v.name.unwrap_or_default()),
+    }))
+}
+
+/// MediaListCollection body -> flat remote entries. Duplicate ids across custom
+/// lists are possible; collapsing them is the reconcile join's job (06 §5.4).
+fn classify_list(raw: &[u8]) -> Result<Vec<RemoteEntry>, CatalogError> {
+    let resp: ListCollectionResp =
+        serde_json::from_slice(raw).map_err(|e| CatalogError::Decode(e.to_string()))?;
+    let data = resp
+        .data
+        .ok_or_else(|| CatalogError::Decode("data is null".into()))?;
+    let collection = data.collection.unwrap_or_default();
+    let mut out = Vec::new();
+    for group in collection.lists.unwrap_or_default() {
+        for e in group.entries.unwrap_or_default() {
+            out.push(RemoteEntry {
+                anilist_id: e.media_id,
+                status: list_status_from_anilist(e.status.as_deref()),
+                progress: e.progress,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Save body -> the server row id. A 200 without a non-null id is a failure, not
+/// a silent success: advancing the snapshot on a phantom save loses the row (06 §5.3).
+fn classify_save(raw: &[u8]) -> Result<i64, CatalogError> {
+    let resp: SaveResp =
+        serde_json::from_slice(raw).map_err(|e| CatalogError::Decode(e.to_string()))?;
+    let data = resp
+        .data
+        .ok_or_else(|| CatalogError::Decode("data is null".into()))?;
+    data.entry
+        .and_then(|e| e.id)
+        .ok_or_else(|| CatalogError::Decode("SaveMediaListEntry.id missing".into()))
+}
+
 pub struct AniList {
     http: reqwest::blocking::Client,
     endpoint: String,
@@ -483,13 +659,29 @@ impl AniList {
     }
 
     fn post(&self, body: serde_json::Value) -> Result<Vec<u8>, CatalogError> {
-        let resp = self
+        self.send(body, None)
+    }
+
+    /// Bearer variant of [`post`] for the auth/sync calls (06 §4.2/§5). A 401
+    /// surfaces as `Http { status: 401 }`; the stop-on-401 policy lives in sync.
+    fn post_auth(&self, token: &str, body: serde_json::Value) -> Result<Vec<u8>, CatalogError> {
+        self.send(body, Some(token))
+    }
+
+    fn send(
+        &self,
+        body: serde_json::Value,
+        token: Option<&str>,
+    ) -> Result<Vec<u8>, CatalogError> {
+        let mut req = self
             .http
             .post(&self.endpoint)
             .header("Accept", "application/json")
-            .json(&body)
-            .send()
-            .map_err(|_| CatalogError::Network)?;
+            .json(&body);
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|_| CatalogError::Network)?;
         let status = resp.status().as_u16();
         if status == 429 {
             return Err(CatalogError::RateLimited);
@@ -507,6 +699,30 @@ impl AniList {
             ));
         }
         Ok(buf)
+    }
+
+    /// Verify a token and read the account identity (06 §4.2). Ok(None) =
+    /// rejected, Err = no-answer; persist only on Ok(Some).
+    pub fn viewer(&self, token: &str) -> Result<Option<Viewer>, CatalogError> {
+        classify_viewer(&self.post_auth(token, viewer_body())?)
+    }
+
+    /// The full remote list in one unpaginated POST (06 §5.4); a huge list fails
+    /// the whole pull (2 MiB cap) rather than truncating.
+    pub fn pull_list(&self, token: &str, user_id: i64) -> Result<Vec<RemoteEntry>, CatalogError> {
+        classify_list(&self.post_auth(token, list_collection_body(user_id))?)
+    }
+
+    /// Push one row (06 §5.3); returns the server row id (never null, see
+    /// [`classify_save`]).
+    pub fn push_entry(
+        &self,
+        token: &str,
+        media_id: i64,
+        status: ListStatus,
+        progress: u32,
+    ) -> Result<i64, CatalogError> {
+        classify_save(&self.post_auth(token, save_entry_body(media_id, status, progress))?)
     }
 }
 
@@ -789,11 +1005,151 @@ mod tests {
         assert_eq!(normalize_title("  !!  "), "");
     }
 
-    use crate::testutil::{response_with_body, serve_once};
+    use crate::testutil::{response_with_body, serve_once, serve_once_capture};
 
     fn post_against(response: Vec<u8>) -> Result<Vec<u8>, CatalogError> {
         let client = AniList::with_endpoint(serve_once(response)).unwrap();
         client.post(json!({"query": "{}"}))
+    }
+
+    #[test]
+    fn list_status_maps_both_directions_and_folds_repeating() {
+        assert_eq!(list_status_from_anilist(Some("CURRENT")), ListStatus::Watching);
+        assert_eq!(list_status_from_anilist(Some("REPEATING")), ListStatus::Watching);
+        assert_eq!(list_status_from_anilist(Some("PLANNING")), ListStatus::Planning);
+        assert_eq!(list_status_from_anilist(Some("PAUSED")), ListStatus::Paused);
+        assert_eq!(list_status_from_anilist(Some("COMPLETED")), ListStatus::Completed);
+        assert_eq!(list_status_from_anilist(Some("DROPPED")), ListStatus::Dropped);
+        // Unknown/absent never invents an active state.
+        assert_eq!(list_status_from_anilist(Some("HOARDING")), ListStatus::Planning);
+        assert_eq!(list_status_from_anilist(None), ListStatus::Planning);
+
+        assert_eq!(list_status_to_anilist(ListStatus::Watching), "CURRENT");
+        assert_eq!(list_status_to_anilist(ListStatus::Planning), "PLANNING");
+        assert_eq!(list_status_to_anilist(ListStatus::Paused), "PAUSED");
+        assert_eq!(list_status_to_anilist(ListStatus::Completed), "COMPLETED");
+        assert_eq!(list_status_to_anilist(ListStatus::Dropped), "DROPPED");
+    }
+
+    #[test]
+    fn classify_viewer_three_states() {
+        let ok = br#"{"data":{"Viewer":{"id":4242,"name":"rod"}}}"#;
+        assert_eq!(
+            classify_viewer(ok).unwrap(),
+            Some(Viewer { id: 4242, name: "rod".into() })
+        );
+        // 200 with no Viewer = confirmed rejection.
+        assert_eq!(classify_viewer(br#"{"data":{"Viewer":null}}"#).unwrap(), None);
+        // data:null / garbage = no answer.
+        assert!(classify_viewer(br#"{"data":null}"#).is_err());
+        assert!(classify_viewer(b"not json").is_err());
+    }
+
+    #[test]
+    fn classify_viewer_strips_control_bytes_in_name() {
+        let raw = "{\"data\":{\"Viewer\":{\"id\":1,\"name\":\"r\\u0000od\"}}}";
+        assert_eq!(classify_viewer(raw.as_bytes()).unwrap().unwrap().name, "rod");
+    }
+
+    #[test]
+    fn classify_list_flattens_groups_and_folds_repeating() {
+        let raw = br#"{"data":{"MediaListCollection":{"lists":[
+            {"entries":[
+                {"mediaId":101,"status":"CURRENT","progress":3},
+                {"mediaId":102,"status":"REPEATING","progress":12}
+            ]},
+            {"entries":[
+                {"mediaId":103,"status":"COMPLETED","progress":24}
+            ]}
+        ]}}}"#;
+        let got = classify_list(raw).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                RemoteEntry { anilist_id: 101, status: ListStatus::Watching, progress: 3 },
+                RemoteEntry { anilist_id: 102, status: ListStatus::Watching, progress: 12 },
+                RemoteEntry { anilist_id: 103, status: ListStatus::Completed, progress: 24 },
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_list_empty_and_null_cases() {
+        // No lists at all is a clean empty pull, not an error.
+        assert!(
+            classify_list(br#"{"data":{"MediaListCollection":{"lists":[]}}}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            classify_list(br#"{"data":{"MediaListCollection":null}}"#)
+                .unwrap()
+                .is_empty()
+        );
+        // Missing progress defaults to 0; unknown status degrades to Planning.
+        let sparse = br#"{"data":{"MediaListCollection":{"lists":[{"entries":[{"mediaId":9}]}]}}}"#;
+        assert_eq!(
+            classify_list(sparse).unwrap(),
+            vec![RemoteEntry { anilist_id: 9, status: ListStatus::Planning, progress: 0 }]
+        );
+        assert!(classify_list(br#"{"data":null}"#).is_err());
+    }
+
+    #[test]
+    fn classify_save_requires_non_null_id() {
+        assert_eq!(
+            classify_save(br#"{"data":{"SaveMediaListEntry":{"id":55123}}}"#).unwrap(),
+            55123
+        );
+        // 200 with a null id is a failure, never a silent success.
+        assert!(classify_save(br#"{"data":{"SaveMediaListEntry":{"id":null}}}"#).is_err());
+        assert!(classify_save(br#"{"data":{"SaveMediaListEntry":null}}"#).is_err());
+        assert!(classify_save(br#"{"data":null}"#).is_err());
+    }
+
+    #[test]
+    fn viewer_sends_the_bearer_and_parses() {
+        let (url, rx) = serve_once_capture(response_with_body(
+            "200 OK",
+            br#"{"data":{"Viewer":{"id":7,"name":"rod"}}}"#,
+        ));
+        let client = AniList::with_endpoint(url).unwrap();
+        let v = client.viewer("secret-token-value").unwrap().unwrap();
+        assert_eq!(v, Viewer { id: 7, name: "rod".into() });
+
+        let raw = rx.recv().unwrap();
+        let req = String::from_utf8_lossy(&raw);
+        assert!(
+            req.contains("authorization: Bearer secret-token-value")
+                || req.contains("Authorization: Bearer secret-token-value"),
+            "bearer not sent; request head was:\n{req}"
+        );
+    }
+
+    #[test]
+    fn push_entry_sends_status_and_returns_id() {
+        let (url, rx) = serve_once_capture(response_with_body(
+            "200 OK",
+            br#"{"data":{"SaveMediaListEntry":{"id":900}}}"#,
+        ));
+        let client = AniList::with_endpoint(url).unwrap();
+        let id = client
+            .push_entry("tok", 154587, ListStatus::Watching, 5)
+            .unwrap();
+        assert_eq!(id, 900);
+
+        let raw = rx.recv().unwrap();
+        let req = String::from_utf8_lossy(&raw);
+        // The body rides the same request; the domain status maps to CURRENT.
+        assert!(req.contains("CURRENT"), "status not mapped; body was:\n{req}");
+        assert!(req.contains("154587"));
+    }
+
+    #[test]
+    fn transport_401_is_http_status_for_the_sync_layer() {
+        // The auth calls lean on Http{401} to mean "stop the run" (06 §5.3).
+        let got = post_against(response_with_body("401 Unauthorized", b"{}"));
+        assert!(matches!(got, Err(CatalogError::Http { status: 401 })));
     }
 
     #[test]

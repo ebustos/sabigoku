@@ -3,6 +3,7 @@
 //! state. Cross-view transitions are the App's job.
 
 pub mod browse;
+pub mod connect;
 pub mod detail;
 pub mod discover;
 pub mod history;

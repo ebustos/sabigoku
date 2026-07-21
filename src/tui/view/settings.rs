@@ -367,6 +367,8 @@ pub struct SettingsEnv<'a> {
     pub providers: &'a [&'a str],
     /// Covers cache dir for the read-only Catalog row, `$HOME` collapsed.
     pub covers_dir: &'a str,
+    /// Account row copy (DESIGN 5.5): user name, reconnect prompt, or not connected.
+    pub account: &'a str,
 }
 
 const LABEL_X: u16 = 4;
@@ -404,7 +406,7 @@ fn layout(env: &SettingsEnv) -> Vec<Li> {
     (6..11).for_each(|i| lines.push(Li::Row(i)));
     lines.push(Li::Blank);
     section(&mut lines, "AniList Sync");
-    lines.push(Li::Inert("account", "not connected".into()));
+    lines.push(Li::Inert("account", env.account.to_string()));
     (11..13).for_each(|i| lines.push(Li::Row(i)));
     lines
 }

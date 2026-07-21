@@ -62,7 +62,9 @@ impl Config {
         let Ok(meta) = std::fs::metadata(path) else {
             return Config::default();
         };
-        if meta.len() > MAX_CONFIG_BYTES {
+        // Regular files only: a FIFO/device would block the read forever and
+        // wedge startup (06 §2.1 total load). A non-regular file is defaults.
+        if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
             return Config::default();
         }
         std::fs::read_to_string(path)
@@ -170,6 +172,25 @@ mod tests {
         // A non-default value for a key no Settings row surfaces survives
         // the round-trip (the file is fully rewritten, never merged).
         assert_eq!(Config::load(&path).image_protocol, "kitty");
+    }
+
+    #[test]
+    fn fifo_path_is_defaults_not_a_hang() {
+        let path = tmp("fifo.toml");
+        let _ = std::fs::remove_file(&path);
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo on a fresh path (removed just above).
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Config::load(&p));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(cfg) => assert_eq!(cfg, Config::default()),
+            Err(_) => panic!("Config::load hung on a FIFO"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
