@@ -342,6 +342,9 @@ frontier-anchored `resumeSeed` could not represent a partial behind the
 high-water, so the freeze has no test for it; the recency-anchored store must
 enforce it explicitly (`show.progress_stamped_at`, 02 §4b). A partial written
 after the stamp is deliberate post-frontier activity (a rewatch) and resumes.
+Timestamps are epoch seconds and the comparison is strict, so a checkpoint
+landing in the same second as an unrelated frontier move reads as dead: an
+accepted coarse-clock limitation, self-healing at the next ~30s checkpoint.
 
 ---
 

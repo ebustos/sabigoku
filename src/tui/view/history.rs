@@ -139,8 +139,6 @@ impl HistoryState {
         true
     }
 
-    /// Recompute-to-0 clears the row's resume marker (05 §4); in-memory
-    /// only, the next real watch re-derives it.
     /// Rebuild the nav order; the cursor follows the focused show's identity
     /// across the reorder, clamping when it fell out (05 §2 setHistory).
     fn rebuild(&mut self) {

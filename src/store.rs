@@ -592,6 +592,8 @@ impl Store {
             "UPDATE show SET
                 list_status = :status,
                 progress = :progress,
+                progress_stamped_at = CASE WHEN progress <> :progress
+                    THEN :now ELSE progress_stamped_at END,
                 library_added_at = COALESCE(library_added_at, :now)
              WHERE anilist_id = :id",
             named_params! {
@@ -618,6 +620,8 @@ impl Store {
             "UPDATE show SET
                 list_status = :status,
                 progress = :progress,
+                progress_stamped_at = CASE WHEN progress <> :progress
+                    THEN :now ELSE progress_stamped_at END,
                 library_added_at = COALESCE(library_added_at, :now)
              WHERE anilist_id = :id",
             named_params! {
@@ -1952,6 +1956,15 @@ mod tests {
         raw.execute(seed, (9, "10", 96.0, true, 600)).unwrap();
         raw.execute(seed, (9, "11", 96.0, true, 700)).unwrap();
         raw.execute(seed, (10, "1", 40.0, false, 500)).unwrap();
+        // Backfill is translation-blind like progress: a later dub full
+        // watch must own show 9's stamp.
+        raw.execute(
+            "INSERT INTO episode_progress
+                (anilist_id, translation, episode, position_secs, fully_watched, updated_at)
+                VALUES (9, 'dub', '11', 96.0, 1, 750)",
+            [],
+        )
+        .unwrap();
         drop(raw);
         let store = Store::open(&path).unwrap();
         assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
@@ -1965,9 +1978,9 @@ mod tests {
                 )
                 .unwrap()
         };
-        // Backfill = last full watch: the stale partial dies at upgrade, a
-        // partials-only show keeps its live checkpoint.
-        assert_eq!(stamp(9), Some(700));
+        // Backfill = last full watch across BOTH translations: the stale
+        // partial dies at upgrade, a partials-only show keeps its checkpoint.
+        assert_eq!(stamp(9), Some(750));
         assert_eq!(store.latest_resume(9, Translation::Sub).unwrap(), None);
         assert_eq!(stamp(10), None);
         let (label, _) = store.latest_resume(10, Translation::Sub).unwrap().unwrap();
@@ -2984,6 +2997,40 @@ mod tests {
             .unwrap();
         assert_eq!(out.imported, 1);
         assert_eq!(store.latest_resume(72, Translation::Sub).unwrap(), None);
+    }
+
+    #[test]
+    fn latest_resume_dies_on_a_completed_snap_and_undo_restore() {
+        let store = Store::open_memory().unwrap();
+        store.add_to_library(&sample(74), 100).unwrap();
+        store
+            .save_progress(74, Translation::Sub, "3", 40.0, 100.0, None, 500)
+            .unwrap();
+        // c: the manual Completed snap moves the frontier to total (12).
+        store
+            .set_list_status(74, ListStatus::Completed, 600)
+            .unwrap();
+        assert_eq!(store.get_show(74).unwrap().unwrap().progress, 12);
+        assert_eq!(
+            store.latest_resume(74, Translation::Sub).unwrap(),
+            None,
+            "the completed snap is a frontier move"
+        );
+        // u: the undo restore is one too (12 back to 0).
+        store
+            .save_progress(74, Translation::Sub, "5", 40.0, 100.0, None, 700)
+            .unwrap();
+        store
+            .restore_list_status(74, ListStatus::Watching, 0, 800)
+            .unwrap();
+        assert_eq!(store.latest_resume(74, Translation::Sub).unwrap(), None);
+        // A status flip that keeps progress stamps nothing.
+        store
+            .save_progress(74, Translation::Sub, "2", 40.0, 100.0, None, 900)
+            .unwrap();
+        store.set_list_status(74, ListStatus::Paused, 1000).unwrap();
+        let (label, _) = store.latest_resume(74, Translation::Sub).unwrap().unwrap();
+        assert_eq!(label, "2", "a no-move status flip keeps the checkpoint");
     }
 
     #[test]
