@@ -135,6 +135,8 @@ struct Active {
     started: AsyncStart,
     /// First position event = mpv is up; the launching cell ends here.
     opened: bool,
+    /// First MEANINGFUL position = engagement recorded (ROD-478); one-shot.
+    engaged: bool,
     last_checkpoint: Instant,
     token: u64,
 }
@@ -216,16 +218,19 @@ impl PlaybackSession {
             translation: deps.translation,
             started: AsyncStart::new(deps.now),
             opened: false,
+            engaged: false,
             last_checkpoint: deps.now,
             token,
         });
         Vec::new()
     }
 
-    /// Live position: flips the launching cell off and lands the periodic
-    /// checkpoint. Only meaningful positions write (a 0/NaN checkpoint would
-    /// clobber a real resume); the write itself is best-effort, the finish
-    /// write is the one that counts.
+    /// Live position: flips the launching cell off, records engagement on
+    /// the first meaningful position (ROD-478: at the finish, an app death
+    /// mid-play orphans its checkpoints out of History), and lands the
+    /// periodic checkpoint. Only meaningful positions write (a 0/NaN
+    /// checkpoint would clobber a real resume); writes are best-effort, the
+    /// finish write is the one that counts.
     pub fn on_position(
         &mut self,
         anilist_id: i64,
@@ -240,6 +245,12 @@ impl PlaybackSession {
             return;
         }
         active.opened = true;
+        if !active.engaged && position.secs.is_finite() && position.secs > 0.0 {
+            active.engaged = deps
+                .store
+                .record_engagement(active.anilist_id, deps.unix_now)
+                .is_ok();
+        }
         if position.secs.is_finite()
             && position.secs > 0.0
             && deps.now.saturating_duration_since(active.last_checkpoint) >= CHECKPOINT_PERIOD
@@ -593,6 +604,40 @@ mod tests {
                 .on_finished(7, Some(pos(9.0, None)), None, token + 1, &rig.world.deps());
         assert!(out.feedback.is_empty() && out.recorded.is_none());
         assert!(rig.session.is_playing(), "stale finish must not clear");
+    }
+
+    #[test]
+    fn engagement_lands_on_first_meaningful_position_only() {
+        let mut rig = Rig::new();
+        rig.world.seed_bound(7);
+        let token = rig.fire_settled(7, 3);
+        assert_eq!(
+            rig.world
+                .store
+                .get_show(7)
+                .unwrap()
+                .unwrap()
+                .library_added_at,
+            None
+        );
+        // Meaningless position: opens the cell, stamps nothing.
+        rig.session
+            .on_position(7, pos(0.0, None), token, &rig.world.deps());
+        assert_eq!(
+            rig.world
+                .store
+                .get_show(7)
+                .unwrap()
+                .unwrap()
+                .library_added_at,
+            None
+        );
+        rig.session
+            .on_position(7, pos(5.0, Some(1400.0)), token, &rig.world.deps());
+        let show = rig.world.store.get_show(7).unwrap().unwrap();
+        assert_eq!(show.library_added_at, Some(1000));
+        assert_eq!(show.last_watched_at, Some(1000));
+        assert_eq!(show.play_count, 0, "a checkpoint is still not a play");
     }
 
     #[test]

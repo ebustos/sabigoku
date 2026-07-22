@@ -634,6 +634,55 @@ impl Store {
         Ok(())
     }
 
+    /// Membership set-once + fresh last_watched_at, nothing else (ROD-478).
+    /// play_count/ratchet/status stay with the finish writers: a checkpoint
+    /// is still not a play (02 §4b). The NULL-to-member transition seeds
+    /// synced_* to the current pair (same born-clean hazard as the import
+    /// mint): without it, list_dirty_for_sync pushes Planning/0 to AniList
+    /// for a show mid-episode. A real status writer dirties it properly.
+    pub fn record_engagement(&self, anilist_id: i64, now: i64) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE show SET
+                last_watched_at = :now,
+                synced_status = CASE
+                    WHEN library_added_at IS NULL AND synced_status IS NULL
+                    THEN list_status ELSE synced_status END,
+                synced_progress = CASE
+                    WHEN library_added_at IS NULL AND synced_status IS NULL
+                    THEN progress ELSE synced_progress END,
+                library_added_at = COALESCE(library_added_at, :now)
+             WHERE anilist_id = :id",
+            named_params! { ":now": now, ":id": anilist_id },
+        )?;
+        Ok(())
+    }
+
+    /// Startup recovery (ROD-478): only plays write progress rows, so rows
+    /// under a non-library show prove an engagement the app died before
+    /// stamping. Timestamps come from the rows so History ordering reflects
+    /// the watch, not the recovery. Adopted rows are born clean like the
+    /// engagement path above.
+    pub fn adopt_orphaned_progress(&self) -> Result<usize, Error> {
+        let adopted = self.conn.execute(
+            "UPDATE show SET
+                library_added_at =
+                    (SELECT MIN(ep.updated_at) FROM episode_progress ep
+                     WHERE ep.anilist_id = show.anilist_id),
+                last_watched_at =
+                    (SELECT MAX(ep.updated_at) FROM episode_progress ep
+                     WHERE ep.anilist_id = show.anilist_id),
+                synced_status = CASE WHEN synced_status IS NULL
+                    THEN list_status ELSE synced_status END,
+                synced_progress = CASE WHEN synced_status IS NULL
+                    THEN progress ELSE synced_progress END
+             WHERE library_added_at IS NULL
+               AND EXISTS (SELECT 1 FROM episode_progress ep
+                           WHERE ep.anilist_id = show.anilist_id)",
+            [],
+        )?;
+        Ok(adopted)
+    }
+
     pub fn get_show(&self, anilist_id: i64) -> Result<Option<Show>, Error> {
         let sql =
             format!("SELECT {ENRICH_COLS}, {SHOW_STATE_COLS} FROM show WHERE anilist_id = ?1");
@@ -3058,6 +3107,101 @@ mod tests {
             0
         );
         assert_eq!(store.latest_resume(73, Translation::Sub).unwrap(), None);
+    }
+
+    #[test]
+    fn engagement_stamps_membership_and_nothing_else() {
+        let store = Store::open_memory().unwrap();
+        identity_row(&store, 80);
+        store.record_engagement(80, 500).unwrap();
+        let show = store.get_show(80).unwrap().unwrap();
+        assert_eq!(show.library_added_at, Some(500));
+        assert_eq!(show.last_watched_at, Some(500));
+        assert_eq!(show.progress, 0);
+        assert_eq!(show.play_count, 0);
+        assert_eq!(show.list_status, ListStatus::Planning);
+        // Membership is set-once; last_watched follows the newest engagement.
+        store.record_engagement(80, 900).unwrap();
+        let show = store.get_show(80).unwrap().unwrap();
+        assert_eq!(show.library_added_at, Some(500));
+        assert_eq!(show.last_watched_at, Some(900));
+        // Unknown show: clean no-op.
+        store.record_engagement(999, 500).unwrap();
+    }
+
+    #[test]
+    fn orphaned_progress_is_adopted_into_history_at_open() {
+        let store = Store::open_memory().unwrap();
+        // The ROD-478 ghost: checkpoints on an identity row.
+        identity_row(&store, 81);
+        store
+            .save_progress(81, Translation::Sub, "1", 100.0, 1400.0, None, 500)
+            .unwrap();
+        store
+            .save_progress(81, Translation::Sub, "1", 280.0, 1400.0, None, 530)
+            .unwrap();
+        store
+            .save_progress(81, Translation::Sub, "2", 60.0, 1400.0, None, 700)
+            .unwrap();
+        // A library row and a bare identity row must both be left alone.
+        store.add_to_library(&sample(82), 900).unwrap();
+        store
+            .save_progress(82, Translation::Sub, "1", 50.0, 1400.0, None, 950)
+            .unwrap();
+        identity_row(&store, 83);
+
+        assert_eq!(store.adopt_orphaned_progress().unwrap(), 1);
+        let ghost = store.get_show(81).unwrap().unwrap();
+        // Ep "1" upserted twice survives at 530; membership takes the MIN,
+        // last_watched the MAX, so the two must differ here.
+        assert_eq!(ghost.library_added_at, Some(530));
+        assert_eq!(ghost.last_watched_at, Some(700));
+        assert_eq!(
+            store.get_show(82).unwrap().unwrap().library_added_at,
+            Some(900)
+        );
+        assert_eq!(store.get_show(83).unwrap().unwrap().library_added_at, None);
+        assert!(
+            store
+                .list_history()
+                .unwrap()
+                .iter()
+                .any(|s| s.enrichment.anilist_id == 81)
+        );
+        // Idempotent: a second sweep adopts nothing.
+        assert_eq!(store.adopt_orphaned_progress().unwrap(), 0);
+    }
+
+    #[test]
+    fn engagement_and_adoption_are_born_sync_clean() {
+        let store = Store::open_memory().unwrap();
+        identity_row(&store, 84);
+        store.record_engagement(84, 500).unwrap();
+        let show = store.get_show(84).unwrap().unwrap();
+        assert_eq!(show.synced_status, Some(ListStatus::Planning));
+        assert_eq!(show.synced_progress, Some(0));
+        assert!(
+            store.list_dirty_for_sync().unwrap().is_empty(),
+            "engagement must never push to AniList"
+        );
+        // A real writer dirties it properly (after_play flips to watching).
+        store.record_play(84, 1, true, 600).unwrap();
+        assert_eq!(store.list_dirty_for_sync().unwrap().len(), 1);
+        // Seeding is transition-only: re-engagement must not re-seed the
+        // snapshot and silently mark the dirty row clean.
+        store.record_engagement(84, 700).unwrap();
+        assert_eq!(store.list_dirty_for_sync().unwrap().len(), 1);
+        let show = store.get_show(84).unwrap().unwrap();
+        assert_eq!(show.synced_status, Some(ListStatus::Planning));
+
+        // Adoption path: same born-clean guarantee.
+        let store2 = Store::open_memory().unwrap();
+        identity_row(&store2, 85);
+        store2
+            .save_progress(85, Translation::Sub, "1", 100.0, 1400.0, None, 500)
+            .unwrap();
+        assert_eq!(store2.adopt_orphaned_progress().unwrap(), 1);
+        assert!(store2.list_dirty_for_sync().unwrap().is_empty());
     }
 
     #[test]

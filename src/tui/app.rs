@@ -180,6 +180,9 @@ impl App {
             pool,
             encode_drain,
         };
+        // Recover any play the last run died before stamping (ROD-478);
+        // best-effort, a failure just leaves the ghost for the next launch.
+        let _ = app.store.adopt_orphaned_progress();
         // A synchronous local read, not a worker (a deliberate deviation from
         // 04 §4.2's load events; recorded on the ticket).
         app.history.load(&app.store);
@@ -2311,6 +2314,43 @@ mod tests {
         let (mut app, tx, now) = harness(name);
         app.tick(Event::Resize(w, h), now, &tx);
         (app, tx, now)
+    }
+
+    /// ROD-478: the startup sweep must run before the first history load.
+    #[test]
+    fn startup_adopts_an_orphaned_play_into_history() {
+        let store = Store::open_memory().unwrap();
+        let ghost = crate::domain::Enrichment {
+            anilist_id: 42,
+            title_romaji: "Ghost".into(),
+            ..Default::default()
+        };
+        store.bind_provider(&ghost, "megaplay", "g-1", 100).unwrap();
+        store
+            .save_progress(
+                42,
+                crate::domain::Translation::Sub,
+                "1",
+                280.0,
+                1400.0,
+                None,
+                500,
+            )
+            .unwrap();
+        let (tx, _rx) = super::super::event::channel();
+        let app = App::new(
+            &Config::default(),
+            store,
+            StubCatalog::inert(),
+            teststub::inert_registry(),
+            &test_paths("adopt-startup"),
+            Picker::halfblocks(),
+            &tx,
+        );
+        assert_eq!(
+            app.history.selected().map(|s| s.enrichment.anilist_id),
+            Some(42)
+        );
     }
 
     #[test]
