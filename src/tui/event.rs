@@ -160,6 +160,19 @@ pub enum Event {
         failure: Option<PlayFailure>,
         token: u64,
     },
+    /// Refresh-on-view answer (04 §10); keep-check by `for_id` in tick.
+    /// Boxed: the fieldset dwarfs every other variant.
+    EnrichmentRefreshed {
+        for_id: i64,
+        enrichment: Box<Enrichment>,
+    },
+    /// Confirmed no-match (05 §8): an answer, not a failure; stamps freshness.
+    EnrichmentNull {
+        for_id: i64,
+    },
+    EnrichmentFailed {
+        for_id: i64,
+    },
     /// Loopback login outcome (04 §4.6). The worker skips posting on cancel, so
     /// `Canceled` never rides this queue.
     ConnectResult(ConnectResult),
