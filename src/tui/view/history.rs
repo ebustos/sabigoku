@@ -141,17 +141,6 @@ impl HistoryState {
 
     /// Recompute-to-0 clears the row's resume marker (05 §4); in-memory
     /// only, the next real watch re-derives it.
-    pub fn clear_resume_marker(&mut self, anilist_id: i64) {
-        if let Some(ix) = self
-            .rows
-            .iter()
-            .position(|s| s.enrichment.anilist_id == anilist_id)
-            && let Some(slot) = self.resume.get_mut(ix)
-        {
-            *slot = None;
-        }
-    }
-
     /// Rebuild the nav order; the cursor follows the focused show's identity
     /// across the reorder, clamping when it fell out (05 §2 setHistory).
     fn rebuild(&mut self) {

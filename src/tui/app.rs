@@ -661,13 +661,12 @@ impl App {
         };
         let aid = show.enrichment.anilist_id;
         let translation = Translation::parse(&self.config.translation).unwrap_or(Translation::Sub);
-        match self.store.recompute_progress(aid, translation) {
-            Ok(high_water) => {
+        match self.store.recompute_progress(aid, translation, unix_now()) {
+            Ok(_) => {
                 self.undo = None;
+                // The reload re-derives every resume marker; the recompute's
+                // frontier stamp already retired stale partials (ROD-477).
                 self.reload_history(now);
-                if high_water == 0 {
-                    self.history.clear_resume_marker(aid);
-                }
                 self.arm_sync(now);
                 self.toasts.push(Kind::Success, "progress reset", now);
             }

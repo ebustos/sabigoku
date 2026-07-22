@@ -19,7 +19,7 @@ use crate::domain::{
 };
 use crate::error::Error;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// SQLITE_BUSY wait set in `open` (ROD-287 mechanism). Writer-vs-writer only
 /// (WAL lets readers through). Short: real collisions are sub-20ms and the
@@ -181,6 +181,20 @@ CREATE INDEX idx_catalog_fetched ON catalog_cache(fetched_at DESC);
 CREATE TABLE app_meta (
     key   TEXT NOT NULL PRIMARY KEY,
     value TEXT NOT NULL
+);
+";
+
+// ROD-477: when the frontier last moved, from ANY writer (play ratchet,
+// recompute, AniList adoption, import). Partials older than this stamp are
+// dead resume points. NULL = never moved. Backfill from the last full watch:
+// pre-v2 rows have no stamp history, and a partial older than the newest full
+// watch is exactly the stale state this column exists to retire. Translation-
+// blind on purpose, like `progress` itself (02 §4b).
+const MIGRATION_V2: &str = "
+ALTER TABLE show ADD COLUMN progress_stamped_at INTEGER;
+UPDATE show SET progress_stamped_at = (
+    SELECT MAX(ep.updated_at) FROM episode_progress ep
+    WHERE ep.anilist_id = show.anilist_id AND ep.fully_watched = 1
 );
 ";
 
@@ -426,6 +440,10 @@ impl Store {
     /// The read-compute-write runs under one BEGIN IMMEDIATE: a second
     /// process on the same file must not be able to regress the ratchet from
     /// a stale read (ROD-434 red-team finding).
+    ///
+    /// The `progress_stamped_at` CASE relies on SET right-hand sides reading
+    /// the OLD row: it stamps exactly when the frontier moves. Every progress
+    /// writer carries the same clause; keep them in lockstep (ROD-477).
     pub fn record_play(
         &self,
         anilist_id: i64,
@@ -451,6 +469,8 @@ impl Store {
                 play_count = play_count + 1,
                 last_watched_at = :now,
                 progress = :progress,
+                progress_stamped_at = CASE WHEN progress <> :progress
+                    THEN :now ELSE progress_stamped_at END,
                 list_status = :status,
                 library_added_at = COALESCE(library_added_at, :now)
              WHERE anilist_id = :id",
@@ -533,6 +553,8 @@ impl Store {
                 play_count = play_count + 1,
                 last_watched_at = :now,
                 progress = :progress,
+                progress_stamped_at = CASE WHEN progress <> :progress
+                    THEN :now ELSE progress_stamped_at END,
                 list_status = :status,
                 library_added_at = COALESCE(library_added_at, :now)
              WHERE anilist_id = :id",
@@ -1231,9 +1253,12 @@ impl Store {
             .map_err(Error::from)
     }
 
-    /// Freshest partial-watch row for the show + track: the DESIGN 4.6 resume
-    /// cell and its cursor override (05 §10.7). Fully-watched and unusable
-    /// positions never resume.
+    /// The DESIGN 4.6 resume cell and its cursor override (05 §10.7): the
+    /// freshest partial watched SINCE the frontier last moved. A partial at
+    /// or before the stamp was ratcheted past (locally or by an AniList
+    /// adoption, which writes no rows here) and is a dead resume point; one
+    /// written after it is deliberate post-frontier activity, e.g. a rewatch
+    /// (ROD-477). Fully-watched and unusable positions never resume.
     pub fn latest_resume(
         &self,
         anilist_id: i64,
@@ -1241,11 +1266,13 @@ impl Store {
     ) -> Result<Option<(String, Resume)>, Error> {
         self.conn
             .query_row(
-                "SELECT episode, position_secs, duration_secs, fully_watched
-                 FROM episode_progress
-                 WHERE anilist_id = ?1 AND translation = ?2
-                   AND fully_watched = 0 AND position_secs > 0
-                 ORDER BY updated_at DESC LIMIT 1",
+                "SELECT ep.episode, ep.position_secs, ep.duration_secs, ep.fully_watched
+                 FROM episode_progress ep
+                 JOIN show s ON s.anilist_id = ep.anilist_id
+                 WHERE ep.anilist_id = ?1 AND ep.translation = ?2
+                   AND ep.fully_watched = 0 AND ep.position_secs > 0
+                   AND ep.updated_at > COALESCE(s.progress_stamped_at, 0)
+                 ORDER BY ep.updated_at DESC LIMIT 1",
                 (anilist_id, translation.as_str()),
                 |row| {
                     Ok((
@@ -1271,11 +1298,15 @@ impl Store {
         &self,
         anilist_id: i64,
         translation: Translation,
+        now: i64,
     ) -> Result<u32, Error> {
         let high_water = self.watched_high_water(anilist_id, translation)?;
         self.conn.execute(
-            "UPDATE show SET progress = ?1 WHERE anilist_id = ?2",
-            (high_water, anilist_id),
+            "UPDATE show SET progress = ?1,
+                progress_stamped_at = CASE WHEN progress <> ?1
+                    THEN ?3 ELSE progress_stamped_at END
+             WHERE anilist_id = ?2",
+            (high_water, anilist_id, now),
         )?;
         Ok(high_water)
     }
@@ -1287,11 +1318,15 @@ impl Store {
         &self,
         anilist_id: i64,
         translation: Translation,
+        now: i64,
     ) -> Result<u32, Error> {
         let high_water = self.watched_high_water(anilist_id, translation)?;
         self.conn.execute(
-            "UPDATE show SET progress = MAX(progress, ?1) WHERE anilist_id = ?2",
-            (high_water, anilist_id),
+            "UPDATE show SET progress = MAX(progress, ?1),
+                progress_stamped_at = CASE WHEN progress < ?1
+                    THEN ?3 ELSE progress_stamped_at END
+             WHERE anilist_id = ?2",
+            (high_water, anilist_id, now),
         )?;
         let stored: Option<u32> = self
             .conn
@@ -1570,6 +1605,8 @@ impl Store {
                 "UPDATE show SET
                     list_status = :status,
                     progress = :progress,
+                    progress_stamped_at = CASE WHEN progress <> :progress
+                        THEN :now ELSE progress_stamped_at END,
                     synced_status = :status,
                     synced_progress = :progress
                  WHERE anilist_id = :id
@@ -1579,6 +1616,7 @@ impl Store {
                 named_params! {
                     ":status": r.status.as_str(),
                     ":progress": r.progress,
+                    ":now": now,
                     ":id": r.seed.anilist_id,
                     ":minted": ListStatus::Planning.as_str(),
                 },
@@ -1595,6 +1633,8 @@ impl Store {
                 "UPDATE show SET
                     list_status = :status,
                     progress = :progress,
+                    progress_stamped_at = CASE WHEN progress <> :progress
+                        THEN :now ELSE progress_stamped_at END,
                     synced_status = :snap_status,
                     synced_progress = :snap_progress
                  WHERE anilist_id = :id
@@ -1603,6 +1643,7 @@ impl Store {
                 named_params! {
                     ":status": p.merged.0.as_str(),
                     ":progress": p.merged.1,
+                    ":now": now,
                     ":snap_status": p.snapshot.0.as_str(),
                     ":snap_progress": p.snapshot.1,
                     ":id": p.id,
@@ -1789,6 +1830,10 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
         tx.execute_batch(MIGRATION_V1)?;
         v = 1;
     }
+    if v < 2 {
+        tx.execute_batch(MIGRATION_V2)?;
+        v = 2;
+    }
 
     // Real runtime check in every build mode: a strippable assert here is
     // exactly the half-applied-schema bug (02 §5).
@@ -1883,6 +1928,50 @@ mod tests {
         drop(Store::open(&path).unwrap());
         let store = Store::open(&path).unwrap();
         assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v1_database_upgrades_and_backfills_the_stamp() {
+        let path = tmp_db("v1-upgrade.db");
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(MIGRATION_V1).unwrap();
+        raw.pragma_update(None, "user_version", 1).unwrap();
+        // Show 9 is the live-bug shape: a stale partial (500) behind fresher
+        // full watches (700). Show 10 has partials only.
+        for id in [9, 10] {
+            raw.execute(
+                "INSERT INTO show (anilist_id, title_romaji, progress) VALUES (?1, 'Held', 7)",
+                [id],
+            )
+            .unwrap();
+        }
+        let seed = "INSERT INTO episode_progress
+            (anilist_id, translation, episode, position_secs, fully_watched, updated_at)
+            VALUES (?1, 'sub', ?2, ?3, ?4, ?5)";
+        raw.execute(seed, (9, "9", 40.0, false, 500)).unwrap();
+        raw.execute(seed, (9, "10", 96.0, true, 600)).unwrap();
+        raw.execute(seed, (9, "11", 96.0, true, 700)).unwrap();
+        raw.execute(seed, (10, "1", 40.0, false, 500)).unwrap();
+        drop(raw);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        let stamp = |id: i64| -> Option<i64> {
+            store
+                .conn
+                .query_row(
+                    "SELECT progress_stamped_at FROM show WHERE anilist_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        // Backfill = last full watch: the stale partial dies at upgrade, a
+        // partials-only show keeps its live checkpoint.
+        assert_eq!(stamp(9), Some(700));
+        assert_eq!(store.latest_resume(9, Translation::Sub).unwrap(), None);
+        assert_eq!(stamp(10), None);
+        let (label, _) = store.latest_resume(10, Translation::Sub).unwrap().unwrap();
+        assert_eq!(label, "1");
     }
 
     #[test]
@@ -2811,6 +2900,119 @@ mod tests {
         assert_eq!(store.latest_resume(60, Translation::Dub).unwrap(), None);
     }
 
+    // ROD-477 rule: a resume point is a partial watched since the frontier
+    // last moved. The four tests below pin one frontier writer each; the
+    // scenario zigoku could not reach (partial BEHIND the high-water) is the
+    // discriminating case.
+    #[test]
+    fn latest_resume_dies_when_a_local_ratchet_passes_it() {
+        let store = Store::open_memory().unwrap();
+        identity_row(&store, 70);
+        // Ep 9 abandoned short of WATCHED_RATIO, then 10 and 11 finished.
+        store
+            .save_progress(70, Translation::Sub, "9", 40.0, 100.0, None, 500)
+            .unwrap();
+        assert!(store.latest_resume(70, Translation::Sub).unwrap().is_some());
+        store
+            .record_finish(70, Translation::Sub, "10", 10, 96.0, 100.0, None, 600)
+            .unwrap();
+        store
+            .record_finish(70, Translation::Sub, "11", 11, 96.0, 100.0, None, 700)
+            .unwrap();
+        assert_eq!(
+            store.latest_resume(70, Translation::Sub).unwrap(),
+            None,
+            "a partial behind the ratchet is a dead resume point"
+        );
+
+        // A rewatch checkpoint written after the ratchet is live again.
+        store
+            .save_progress(70, Translation::Sub, "3", 30.0, 100.0, None, 800)
+            .unwrap();
+        let (label, _) = store.latest_resume(70, Translation::Sub).unwrap().unwrap();
+        assert_eq!(label, "3", "post-frontier activity is a deliberate rewatch");
+
+        // Replaying an episode without moving the frontier stamps nothing:
+        // the rewatch checkpoint survives an unrelated full replay.
+        store
+            .record_finish(70, Translation::Sub, "5", 5, 96.0, 100.0, None, 900)
+            .unwrap();
+        let (label, _) = store.latest_resume(70, Translation::Sub).unwrap().unwrap();
+        assert_eq!(label, "3", "a no-move replay must not kill the checkpoint");
+    }
+
+    #[test]
+    fn latest_resume_dies_when_a_pull_adopts_higher_progress() {
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            71,
+            ListStatus::Watching,
+            9,
+            Some((ListStatus::Watching, 9)),
+        );
+        store
+            .save_progress(71, Translation::Sub, "9", 40.0, 100.0, None, 500)
+            .unwrap();
+
+        // A no-op sync must not assassinate the live checkpoint.
+        store
+            .reconcile_pull(&[remote(71, ListStatus::Watching, 9)], 600)
+            .unwrap();
+        assert!(store.latest_resume(71, Translation::Sub).unwrap().is_some());
+
+        // Watched 10 and 11 on the tablet; the pull adopts the remote
+        // frontier and writes no episode rows. The stale partial dies.
+        store
+            .reconcile_pull(&[remote(71, ListStatus::Watching, 11)], 700)
+            .unwrap();
+        assert_eq!(store.get_show(71).unwrap().unwrap().progress, 11);
+        assert_eq!(store.latest_resume(71, Translation::Sub).unwrap(), None);
+    }
+
+    #[test]
+    fn latest_resume_dies_when_an_import_adopts_progress() {
+        let store = Store::open_memory().unwrap();
+        // A pre-library identity row can carry a checkpoint (a crashed play
+        // never reaches record_finish's membership stamp).
+        identity_row(&store, 72);
+        store
+            .save_progress(72, Translation::Sub, "2", 40.0, 100.0, None, 500)
+            .unwrap();
+        let out = store
+            .reconcile_pull(&[remote_seed(72, ListStatus::Watching, 4, "Imported")], 600)
+            .unwrap();
+        assert_eq!(out.imported, 1);
+        assert_eq!(store.latest_resume(72, Translation::Sub).unwrap(), None);
+    }
+
+    #[test]
+    fn latest_resume_dies_on_recompute_reset() {
+        let store = Store::open_memory().unwrap();
+        identity_row(&store, 73);
+        store
+            .record_finish(73, Translation::Sub, "1", 1, 96.0, 100.0, None, 500)
+            .unwrap();
+        store
+            .save_progress(73, Translation::Sub, "2", 40.0, 100.0, None, 600)
+            .unwrap();
+        assert!(store.latest_resume(73, Translation::Sub).unwrap().is_some());
+        // Wipe the watched row; recompute-to-0 moves the frontier, so the
+        // partial dies with it (the rows themselves stay, 02 recompute law).
+        store
+            .conn
+            .execute(
+                "DELETE FROM episode_progress WHERE anilist_id = 73 AND episode = '1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.recompute_progress(73, Translation::Sub, 700).unwrap(),
+            0
+        );
+        assert_eq!(store.latest_resume(73, Translation::Sub).unwrap(), None);
+    }
+
     #[test]
     fn resume_start_rule() {
         let resume = |position_secs, duration_secs, fully_watched| Resume {
@@ -2845,7 +3047,10 @@ mod tests {
         watch("1", true);
         watch("2", false);
         watch("SP1", false);
-        assert_eq!(store.recompute_progress(61, Translation::Sub).unwrap(), 3);
+        assert_eq!(
+            store.recompute_progress(61, Translation::Sub, 600).unwrap(),
+            3
+        );
         assert_eq!(store.get_show(61).unwrap().unwrap().progress, 3);
 
         // Gap-watch under-counts on purpose: only "5" watched → 1.
@@ -2854,13 +3059,23 @@ mod tests {
         store2
             .save_progress(61, Translation::Sub, "5", 100.0, 100.0, None, 500)
             .unwrap();
-        assert_eq!(store2.recompute_progress(61, Translation::Sub).unwrap(), 1);
+        assert_eq!(
+            store2
+                .recompute_progress(61, Translation::Sub, 600)
+                .unwrap(),
+            1
+        );
 
         // Dub rows never count toward a sub recompute.
         store2
             .save_progress(61, Translation::Dub, "1", 100.0, 100.0, None, 500)
             .unwrap();
-        assert_eq!(store2.recompute_progress(61, Translation::Sub).unwrap(), 1);
+        assert_eq!(
+            store2
+                .recompute_progress(61, Translation::Sub, 600)
+                .unwrap(),
+            1
+        );
 
         // Recompute overwrites unconditionally; no rows → 0 clears the marker.
         let store3 = Store::open_memory().unwrap();
@@ -2868,7 +3083,12 @@ mod tests {
         store3
             .restore_list_status(61, ListStatus::Watching, 9, 100)
             .unwrap();
-        assert_eq!(store3.recompute_progress(61, Translation::Sub).unwrap(), 0);
+        assert_eq!(
+            store3
+                .recompute_progress(61, Translation::Sub, 600)
+                .unwrap(),
+            0
+        );
         assert_eq!(store3.get_show(61).unwrap().unwrap().progress, 0);
     }
 
@@ -2885,7 +3105,9 @@ mod tests {
             .save_progress(62, Translation::Sub, "1", 100.0, 100.0, None, 300)
             .unwrap();
         assert_eq!(
-            store.raise_progress_to_union(62, Translation::Sub).unwrap(),
+            store
+                .raise_progress_to_union(62, Translation::Sub, 400)
+                .unwrap(),
             12
         );
         assert_eq!(store.get_show(62).unwrap().unwrap().progress, 12);
@@ -2893,7 +3115,7 @@ mod tests {
         let empty = Store::open_memory().unwrap();
         assert_eq!(
             empty
-                .raise_progress_to_union(999, Translation::Sub)
+                .raise_progress_to_union(999, Translation::Sub, 400)
                 .unwrap(),
             0
         );

@@ -1347,7 +1347,7 @@ mod tests {
             .unwrap();
         rig.world
             .store
-            .recompute_progress(5, Translation::Sub)
+            .recompute_progress(5, Translation::Sub, 170)
             .unwrap();
         rig.session.for_id = Some(5);
         rig.session.canonical = Some(c.clone());
@@ -1386,13 +1386,40 @@ mod tests {
         }
         done.world
             .store
-            .recompute_progress(5, Translation::Sub)
+            .recompute_progress(5, Translation::Sub, 170)
             .unwrap();
         done.session.for_id = Some(5);
         done.session.canonical = Some(c);
         done.session
             .land("megaplay".into(), labels, &done.world.deps(""));
         assert_eq!(done.session.cursor(), 0, "completed wraps to episode one");
+    }
+
+    /// ROD-477 repro: an abandoned partial behind the watched frontier must
+    /// not seed the resume cell or steal the cursor from next-unwatched.
+    #[test]
+    fn stale_partial_behind_the_frontier_never_seeds_resume() {
+        let labels: Vec<String> = (1..=12).map(|i| i.to_string()).collect();
+        let c = canonical(5);
+        let mut rig = Rig::new(vec![StubProvider::new("megaplay")]);
+        rig.world.store.add_to_library(&c, 100).unwrap();
+        rig.world
+            .store
+            .save_progress(5, Translation::Sub, "9", 40.0, 100.0, None, 500)
+            .unwrap();
+        for (ep, ix, at) in [("10", 10, 600), ("11", 11, 700)] {
+            rig.world
+                .store
+                .record_finish(5, Translation::Sub, ep, ix, 96.0, 100.0, None, at)
+                .unwrap();
+        }
+        rig.session.for_id = Some(5);
+        rig.session.canonical = Some(c);
+        rig.session
+            .land("megaplay".into(), labels, &rig.world.deps(""));
+        assert_eq!(rig.session.watched(), 11);
+        assert_eq!(rig.session.resume_ix(), None, "ep 9 partial is dead");
+        assert_eq!(rig.session.cursor(), 11, "seeds next-unwatched, ep 12");
     }
 
     #[test]

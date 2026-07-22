@@ -296,6 +296,11 @@ const CONTRACTS: &[Contract] = &[
         "grid cursor seeds from progress; resume overrides; completed -> ep one",
         Seeded("tui::episodes::cursor_seeds_from_progress_resume_and_completion"),
     ),
+    c(
+        "10.7",
+        "resume = freshest partial since the frontier last moved (ROD-477)",
+        Seeded("tui::episodes::stale_partial_behind_the_frontier_never_seeds_resume"),
+    ),
     // 11 · Playback session
     c(
         "11",
@@ -870,7 +875,7 @@ fn completion_survives_a_lower_union_join() {
         .unwrap();
     assert_eq!(
         store
-            .raise_progress_to_union(104, Translation::Sub)
+            .raise_progress_to_union(104, Translation::Sub, 400)
             .unwrap(),
         12
     );
