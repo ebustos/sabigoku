@@ -139,7 +139,10 @@ mod tests {
     }
 
     fn viewer() -> Viewer {
-        Viewer { id: 7, name: "rod".into() }
+        Viewer {
+            id: 7,
+            name: "rod".into(),
+        }
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
@@ -162,9 +165,15 @@ mod tests {
     fn complete_login_verifies_then_saves() {
         let path = tmp("ok.toml");
         let _ = std::fs::remove_file(&path);
-        let raw = format!("http://localhost:8766/#access_token={GOOD_TOKEN}&expires_in=3600&state=n");
+        let raw =
+            format!("http://localhost:8766/#access_token={GOOD_TOKEN}&expires_in=3600&state=n");
         let out = complete_login(&raw, &FakeV::Ok(viewer()), &path, 1000);
-        assert_eq!(out, ConnectResult::Ok { user_name: "rod".into() });
+        assert_eq!(
+            out,
+            ConnectResult::Ok {
+                user_name: "rod".into()
+            }
+        );
 
         let auth = Auth::load(&path);
         assert_eq!(auth.anilist.bearer(), Some(GOOD_TOKEN));
@@ -189,7 +198,12 @@ mod tests {
         let path = tmp("short.toml");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
-            complete_login("#access_token=tooshort&state=n", &FakeV::Ok(viewer()), &path, 0),
+            complete_login(
+                "#access_token=tooshort&state=n",
+                &FakeV::Ok(viewer()),
+                &path,
+                0
+            ),
             ConnectResult::NoToken
         );
         assert_eq!(
@@ -220,11 +234,20 @@ mod tests {
     #[test]
     fn param_is_anchored_to_a_boundary() {
         // A suffix key must not match the longer one before it.
-        assert_eq!(param("xstate=evil&state=real", "state").as_deref(), Some("real"));
+        assert_eq!(
+            param("xstate=evil&state=real", "state").as_deref(),
+            Some("real")
+        );
         // First real occurrence wins; boundaries are start / & / ? / #.
-        assert_eq!(param("state=first&state=second", "state").as_deref(), Some("first"));
+        assert_eq!(
+            param("state=first&state=second", "state").as_deref(),
+            Some("first")
+        );
         assert_eq!(param("a=1?state=q", "state").as_deref(), Some("q"));
-        assert_eq!(param("#access_token=tok&x=y", "access_token").as_deref(), Some("tok"));
+        assert_eq!(
+            param("#access_token=tok&x=y", "access_token").as_deref(),
+            Some("tok")
+        );
         // No real (boundary-anchored) occurrence.
         assert_eq!(param("notstate=nope", "state"), None);
     }

@@ -220,7 +220,10 @@ mod tests {
         std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
         signed_in().save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "stale temp must not leak its mode, got {mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "stale temp must not leak its mode, got {mode:o}"
+        );
     }
 
     #[test]
@@ -264,7 +267,13 @@ mod tests {
 
     #[test]
     fn control_bytes_force_signed_out() {
-        for bad in ["with\nnewline", "with\rcr", "with\ttab", "with\0nul", "\x01lead"] {
+        for bad in [
+            "with\nnewline",
+            "with\rcr",
+            "with\ttab",
+            "with\0nul",
+            "\x01lead",
+        ] {
             let a = AniListAuth {
                 access_token: bad.into(),
                 ..AniListAuth::default()

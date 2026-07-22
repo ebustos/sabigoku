@@ -185,7 +185,14 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, palette: &Palette, view: &Connect
 
 /// The URL in its own `palette.surface` inset band (DESIGN 5.5a): a real
 /// fallback action, not near-invisible dim text.
-fn draw_band(frame: &mut Frame<'_>, area: Rect, y: u16, band_w: u16, lines: &[String], palette: &Palette) {
+fn draw_band(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    y: u16,
+    band_w: u16,
+    lines: &[String],
+    palette: &Palette,
+) {
     if y >= area.height {
         return;
     }
@@ -293,7 +300,10 @@ mod tests {
         let rows = render(100, 34, Duration::from_secs(1));
         assert!(rows.iter().any(|r| r.contains("Connect AniList")));
         assert!(rows[0].chars().all(|c| c == ' '), "bled to the top edge");
-        assert!(rows[33].chars().all(|c| c == ' '), "bled to the bottom edge");
+        assert!(
+            rows[33].chars().all(|c| c == ' '),
+            "bled to the bottom edge"
+        );
         assert!(
             rows.iter().all(|r| r.starts_with(' ') && r.ends_with(' ')),
             "bled to a side edge"

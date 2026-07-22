@@ -696,11 +696,7 @@ impl AniList {
         self.send(body, Some(token))
     }
 
-    fn send(
-        &self,
-        body: serde_json::Value,
-        token: Option<&str>,
-    ) -> Result<Vec<u8>, CatalogError> {
+    fn send(&self, body: serde_json::Value, token: Option<&str>) -> Result<Vec<u8>, CatalogError> {
         let mut req = self
             .http
             .post(&self.endpoint)
@@ -1042,14 +1038,32 @@ mod tests {
 
     #[test]
     fn list_status_maps_both_directions_and_folds_repeating() {
-        assert_eq!(list_status_from_anilist(Some("CURRENT")), ListStatus::Watching);
-        assert_eq!(list_status_from_anilist(Some("REPEATING")), ListStatus::Watching);
-        assert_eq!(list_status_from_anilist(Some("PLANNING")), ListStatus::Planning);
+        assert_eq!(
+            list_status_from_anilist(Some("CURRENT")),
+            ListStatus::Watching
+        );
+        assert_eq!(
+            list_status_from_anilist(Some("REPEATING")),
+            ListStatus::Watching
+        );
+        assert_eq!(
+            list_status_from_anilist(Some("PLANNING")),
+            ListStatus::Planning
+        );
         assert_eq!(list_status_from_anilist(Some("PAUSED")), ListStatus::Paused);
-        assert_eq!(list_status_from_anilist(Some("COMPLETED")), ListStatus::Completed);
-        assert_eq!(list_status_from_anilist(Some("DROPPED")), ListStatus::Dropped);
+        assert_eq!(
+            list_status_from_anilist(Some("COMPLETED")),
+            ListStatus::Completed
+        );
+        assert_eq!(
+            list_status_from_anilist(Some("DROPPED")),
+            ListStatus::Dropped
+        );
         // Unknown/absent never invents an active state.
-        assert_eq!(list_status_from_anilist(Some("HOARDING")), ListStatus::Planning);
+        assert_eq!(
+            list_status_from_anilist(Some("HOARDING")),
+            ListStatus::Planning
+        );
         assert_eq!(list_status_from_anilist(None), ListStatus::Planning);
 
         assert_eq!(list_status_to_anilist(ListStatus::Watching), "CURRENT");
@@ -1064,10 +1078,16 @@ mod tests {
         let ok = br#"{"data":{"Viewer":{"id":4242,"name":"rod"}}}"#;
         assert_eq!(
             classify_viewer(ok).unwrap(),
-            Some(Viewer { id: 4242, name: "rod".into() })
+            Some(Viewer {
+                id: 4242,
+                name: "rod".into()
+            })
         );
         // 200 with no Viewer = confirmed rejection.
-        assert_eq!(classify_viewer(br#"{"data":{"Viewer":null}}"#).unwrap(), None);
+        assert_eq!(
+            classify_viewer(br#"{"data":{"Viewer":null}}"#).unwrap(),
+            None
+        );
         // data:null / garbage = no answer.
         assert!(classify_viewer(br#"{"data":null}"#).is_err());
         assert!(classify_viewer(b"not json").is_err());
@@ -1076,7 +1096,10 @@ mod tests {
     #[test]
     fn classify_viewer_strips_control_bytes_in_name() {
         let raw = "{\"data\":{\"Viewer\":{\"id\":1,\"name\":\"r\\u0000od\"}}}";
-        assert_eq!(classify_viewer(raw.as_bytes()).unwrap().unwrap().name, "rod");
+        assert_eq!(
+            classify_viewer(raw.as_bytes()).unwrap().unwrap().name,
+            "rod"
+        );
     }
 
     #[test]
@@ -1094,9 +1117,24 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                RemoteEntry { anilist_id: 101, status: ListStatus::Watching, progress: 3, import_seed: None },
-                RemoteEntry { anilist_id: 102, status: ListStatus::Watching, progress: 12, import_seed: None },
-                RemoteEntry { anilist_id: 103, status: ListStatus::Completed, progress: 24, import_seed: None },
+                RemoteEntry {
+                    anilist_id: 101,
+                    status: ListStatus::Watching,
+                    progress: 3,
+                    import_seed: None
+                },
+                RemoteEntry {
+                    anilist_id: 102,
+                    status: ListStatus::Watching,
+                    progress: 12,
+                    import_seed: None
+                },
+                RemoteEntry {
+                    anilist_id: 103,
+                    status: ListStatus::Completed,
+                    progress: 24,
+                    import_seed: None
+                },
             ]
         );
     }
@@ -1137,7 +1175,12 @@ mod tests {
         let sparse = br#"{"data":{"MediaListCollection":{"lists":[{"entries":[{"mediaId":9}]}]}}}"#;
         assert_eq!(
             classify_list(sparse).unwrap(),
-            vec![RemoteEntry { anilist_id: 9, status: ListStatus::Planning, progress: 0, import_seed: None }]
+            vec![RemoteEntry {
+                anilist_id: 9,
+                status: ListStatus::Planning,
+                progress: 0,
+                import_seed: None
+            }]
         );
         assert!(classify_list(br#"{"data":null}"#).is_err());
     }
@@ -1162,7 +1205,13 @@ mod tests {
         ));
         let client = AniList::with_endpoint(url).unwrap();
         let v = client.viewer("secret-token-value").unwrap().unwrap();
-        assert_eq!(v, Viewer { id: 7, name: "rod".into() });
+        assert_eq!(
+            v,
+            Viewer {
+                id: 7,
+                name: "rod".into()
+            }
+        );
 
         let raw = rx.recv().unwrap();
         let req = String::from_utf8_lossy(&raw);
@@ -1188,7 +1237,10 @@ mod tests {
         let raw = rx.recv().unwrap();
         let req = String::from_utf8_lossy(&raw);
         // The body rides the same request; the domain status maps to CURRENT.
-        assert!(req.contains("CURRENT"), "status not mapped; body was:\n{req}");
+        assert!(
+            req.contains("CURRENT"),
+            "status not mapped; body was:\n{req}"
+        );
         assert!(req.contains("154587"));
     }
 

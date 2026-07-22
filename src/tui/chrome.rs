@@ -476,7 +476,8 @@ mod tests {
             // Settings is the last tab, so its full label is the one the
             // right-edge dot is most likely to clip.
             let row = top_row(w, Tab::Settings, Some("夏 2026"));
-            let intact = row.contains("[S]ettings") || (row.contains("[S]") && !row.contains("[S]e"));
+            let intact =
+                row.contains("[S]ettings") || (row.contains("[S]") && !row.contains("[S]e"));
             assert!(intact, "width {w}: active tab label corrupted: {row:?}");
         }
     }

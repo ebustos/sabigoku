@@ -1050,11 +1050,20 @@ impl App {
         // store merge can keep fields the fetch dropped (02 §3.5 forbids a
         // read-time merge, so the read-back IS the merge).
         let merged = if patched {
-            self.store.get_show(for_id).ok().flatten().map(|s| s.enrichment)
+            self.store
+                .get_show(for_id)
+                .ok()
+                .flatten()
+                .map(|s| s.enrichment)
         } else {
-            self.store.get_catalog(for_id).ok().flatten().map(|h| h.enrichment)
+            self.store
+                .get_catalog(for_id)
+                .ok()
+                .flatten()
+                .map(|h| h.enrichment)
         };
-        self.detail.on_enrichment(for_id, merged.as_ref().unwrap_or(e));
+        self.detail
+            .on_enrichment(for_id, merged.as_ref().unwrap_or(e));
         self.toasts.clear_topic(ANILIST_TOPIC);
         self.dirty = true;
     }
@@ -1330,7 +1339,9 @@ impl App {
             ConnectResult::NoToken => (Kind::Error, "no token received".into()),
             ConnectResult::Rejected => (Kind::Error, "AniList rejected the token".into()),
             ConnectResult::NetworkError => (Kind::Error, "could not reach AniList".into()),
-            ConnectResult::SaveFailed => (Kind::Error, "signed in, but saving the token failed".into()),
+            ConnectResult::SaveFailed => {
+                (Kind::Error, "signed in, but saving the token failed".into())
+            }
             ConnectResult::BadState => (Kind::Error, "login state mismatch".into()),
             // Never posted by the worker; nothing to report.
             ConnectResult::Canceled => return,
@@ -1900,7 +1911,14 @@ impl App {
 
     fn draw_zoom(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
         let env = self.view_env(now);
-        detail::draw_zoom(frame, area, self.palette, &self.detail, &env, &mut self.pool);
+        detail::draw_zoom(
+            frame,
+            area,
+            self.palette,
+            &self.detail,
+            &env,
+            &mut self.pool,
+        );
     }
 
     fn draw_discover(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect, now: Instant) {
@@ -2361,7 +2379,10 @@ mod tests {
 
         // A no-op run is silent.
         let (mut app, _tx, now) = harness("sync-flushed-noop");
-        app.on_sync_flushed(sync::SyncSummary::terminal(sync::SyncOutcome::Completed), now);
+        app.on_sync_flushed(
+            sync::SyncSummary::terminal(sync::SyncOutcome::Completed),
+            now,
+        );
         assert_eq!(app.toasts.iter().count(), 0);
     }
 
@@ -2823,7 +2844,9 @@ mod tests {
         let catalog = StubCatalog::enrich_scripted(vec![Ok(Some(healed(7)))]);
         let (mut app, tx, rx, now) = harness_with("enrich-heal", catalog.clone());
         // The import-seed shape (ROD-467 pull): title only, no stamp.
-        app.store.add_to_library(&feed_entry(7), unix_now()).unwrap();
+        app.store
+            .add_to_library(&feed_entry(7), unix_now())
+            .unwrap();
         enter_history(&mut app, &tx, now);
         app.tick(Event::Tick, now, &tx);
         settle_feed(&mut app, &tx, &rx, now);
@@ -2849,12 +2872,12 @@ mod tests {
 
     #[test]
     fn enrich_failure_toasts_persistently_and_reselect_retries() {
-        let catalog = StubCatalog::enrich_scripted(vec![
-            Err(CatalogError::Network),
-            Ok(Some(healed(7))),
-        ]);
+        let catalog =
+            StubCatalog::enrich_scripted(vec![Err(CatalogError::Network), Ok(Some(healed(7)))]);
         let (mut app, tx, rx, now) = harness_with("enrich-outage", catalog.clone());
-        app.store.add_to_library(&feed_entry(7), unix_now()).unwrap();
+        app.store
+            .add_to_library(&feed_entry(7), unix_now())
+            .unwrap();
         enter_history(&mut app, &tx, now);
         app.tick(Event::Tick, now, &tx);
         settle_feed(&mut app, &tx, &rx, now);
@@ -2942,18 +2965,27 @@ mod tests {
     fn confirmed_null_stamps_and_stays_silent() {
         let catalog = StubCatalog::enrich_scripted(Vec::new());
         let (mut app, tx, rx, now) = harness_with("enrich-null", catalog.clone());
-        app.store.add_to_library(&feed_entry(7), unix_now()).unwrap();
+        app.store
+            .add_to_library(&feed_entry(7), unix_now())
+            .unwrap();
         enter_history(&mut app, &tx, now);
         app.tick(Event::Tick, now, &tx);
         settle_feed(&mut app, &tx, &rx, now);
         assert_eq!(*catalog.enrich_calls.lock().unwrap(), vec![7]);
         let show = app.store.get_show(7).unwrap().unwrap();
-        assert!(show.enrichment_fetched_at.is_some(), "a true negative stamps");
+        assert!(
+            show.enrichment_fetched_at.is_some(),
+            "a true negative stamps"
+        );
         assert!(show.enrichment.description.is_none(), "no fields invented");
         assert!(app.toasts.is_empty(), "an answer is not a failure");
         app.tick(Event::Tick, now + Duration::from_secs(1), &tx);
         settle_feed(&mut app, &tx, &rx, now);
-        assert_eq!(catalog.enrich_calls.lock().unwrap().len(), 1, "stamped rows never requery");
+        assert_eq!(
+            catalog.enrich_calls.lock().unwrap().len(),
+            1,
+            "stamped rows never requery"
+        );
     }
 
     #[test]

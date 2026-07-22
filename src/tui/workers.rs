@@ -164,12 +164,26 @@ pub fn spawn_sync(
     })
 }
 
-fn sync_worker(db_path: &std::path::Path, auth: &Auth, enabled: bool, pull_only: bool, now: i64) -> SyncSummary {
+fn sync_worker(
+    db_path: &std::path::Path,
+    auth: &Auth,
+    enabled: bool,
+    pull_only: bool,
+    now: i64,
+) -> SyncSummary {
     let (Ok(client), Ok(store)) = (AniList::new(), Store::open(db_path)) else {
         return SyncSummary::terminal(SyncOutcome::Failed);
     };
-    sync::run_sync(&client, auth, &store, now, enabled, pull_only, &ThreadSleeper)
-        .unwrap_or_else(|_| SyncSummary::terminal(SyncOutcome::Failed))
+    sync::run_sync(
+        &client,
+        auth,
+        &store,
+        now,
+        enabled,
+        pull_only,
+        &ThreadSleeper,
+    )
+    .unwrap_or_else(|_| SyncSummary::terminal(SyncOutcome::Failed))
 }
 
 /// Quit flush worker (04 §11): push only, no spacing/backoff (`NoSleep`), so it

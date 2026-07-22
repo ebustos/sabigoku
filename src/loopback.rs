@@ -172,7 +172,9 @@ fn write_html(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
 /// the terminal, not the tab.
 fn result_page(result: &ConnectResult) -> String {
     match result {
-        ConnectResult::Ok { .. } => scrubbed_page("✓ signed in to AniList", "you can close this tab"),
+        ConnectResult::Ok { .. } => {
+            scrubbed_page("✓ signed in to AniList", "you can close this tab")
+        }
         _ => scrubbed_page("sign-in didn't complete", "check your terminal"),
     }
 }
@@ -216,7 +218,10 @@ mod tests {
     struct FakeV;
     impl Verifier for FakeV {
         fn verify(&self, _token: &str) -> Result<Option<Viewer>, CatalogError> {
-            Ok(Some(Viewer { id: 7, name: "rod".into() }))
+            Ok(Some(Viewer {
+                id: 7,
+                name: "rod".into(),
+            }))
         }
     }
 
@@ -250,7 +255,8 @@ mod tests {
 
             // First hit: any path -> relay HTML.
             let mut c1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            c1.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            c1.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
             let relay = read_response(c1);
             assert!(
                 relay.contains("location.hash.substring(1)"),
@@ -266,13 +272,21 @@ mod tests {
             .unwrap();
             let done = read_response(c2);
             assert!(done.contains("signed in to AniList"));
-            assert!(done.contains("history.replaceState"), "address bar not scrubbed");
+            assert!(
+                done.contains("history.replaceState"),
+                "address bar not scrubbed"
+            );
             assert!(done.contains(WORDMARK), "wordmark missing");
 
             h.join().unwrap()
         });
 
-        assert_eq!(result, ConnectResult::Ok { user_name: "rod".into() });
+        assert_eq!(
+            result,
+            ConnectResult::Ok {
+                user_name: "rod".into()
+            }
+        );
         assert_eq!(Auth::load(&path).anilist.bearer(), Some(TOKEN));
     }
 
@@ -288,7 +302,8 @@ mod tests {
             let h = s.spawn(|| lp.serve(&verifier, &path, 0));
             let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
             c.write_all(
-                format!("GET /callback?access_token={TOKEN}&state=forged HTTP/1.1\r\n\r\n").as_bytes(),
+                format!("GET /callback?access_token={TOKEN}&state=forged HTTP/1.1\r\n\r\n")
+                    .as_bytes(),
             )
             .unwrap();
             let _ = read_response(c);
@@ -296,13 +311,19 @@ mod tests {
         });
 
         assert_eq!(result, ConnectResult::BadState);
-        assert!(!path.exists(), "a forged state must never verify or persist");
+        assert!(
+            !path.exists(),
+            "a forged state must never verify or persist"
+        );
     }
 
     #[test]
     fn relay_redirects_without_scrub_results_scrub_first() {
         let relay = relay_page();
-        assert!(relay.contains("location.hash.substring(1)"), "relay redirect line");
+        assert!(
+            relay.contains("location.hash.substring(1)"),
+            "relay redirect line"
+        );
         assert!(
             !relay.contains("history.replaceState"),
             "relay navigates away; it must not carry the scrub"

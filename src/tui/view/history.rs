@@ -402,10 +402,7 @@ fn draw_title_row(
     let width = area.width.saturating_sub(4) as usize;
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{} ", status_glyph(show.list_status)),
-                glyph_style,
-            ),
+            Span::styled(format!("{} ", status_glyph(show.list_status)), glyph_style),
             Span::styled(
                 render::truncate_to_width(title, width).into_owned(),
                 title_style,

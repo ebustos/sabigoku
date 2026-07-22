@@ -240,7 +240,10 @@ mod tests {
     }
 
     impl FakeAni {
-        fn new(remote: Result<Vec<RemoteEntry>, CatalogError>, pushes: Vec<Result<i64, CatalogError>>) -> Self {
+        fn new(
+            remote: Result<Vec<RemoteEntry>, CatalogError>,
+            pushes: Vec<Result<i64, CatalogError>>,
+        ) -> Self {
             FakeAni {
                 remote: RefCell::new(Some(remote)),
                 pushes: RefCell::new(pushes.into()),
@@ -255,8 +258,16 @@ mod tests {
             *self.pull_calls.borrow_mut() += 1;
             self.remote.borrow_mut().take().unwrap_or(Ok(vec![]))
         }
-        fn save_entry(&self, _t: &str, media_id: i64, status: ListStatus, progress: u32) -> Result<i64, CatalogError> {
-            self.push_calls.borrow_mut().push((media_id, status, progress));
+        fn save_entry(
+            &self,
+            _t: &str,
+            media_id: i64,
+            status: ListStatus,
+            progress: u32,
+        ) -> Result<i64, CatalogError> {
+            self.push_calls
+                .borrow_mut()
+                .push((media_id, status, progress));
             self.pushes.borrow_mut().pop_front().unwrap_or(Ok(1))
         }
     }
@@ -266,7 +277,9 @@ mod tests {
     }
     impl RecordingSleeper {
         fn new() -> Self {
-            RecordingSleeper { slept: RefCell::new(Vec::new()) }
+            RecordingSleeper {
+                slept: RefCell::new(Vec::new()),
+            }
         }
     }
     impl Sleeper for RecordingSleeper {
@@ -296,7 +309,16 @@ mod tests {
     fn disabled_is_a_noop() {
         let client = FakeAni::new(Ok(vec![]), vec![]);
         let store = Store::open_memory().unwrap();
-        let out = run_sync(&client, &connected(0), &store, 0, false, false, &RecordingSleeper::new()).unwrap();
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            false,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
         assert_eq!(out.outcome, SyncOutcome::Disabled);
         assert_eq!(*client.pull_calls.borrow(), 0);
         assert!(client.push_calls.borrow().is_empty());
@@ -306,13 +328,31 @@ mod tests {
     fn no_token_and_expired_short_circuit_before_any_call() {
         let store = Store::open_memory().unwrap();
         let client = FakeAni::new(Ok(vec![]), vec![]);
-        let out = run_sync(&client, &Auth::default(), &store, 0, true, false, &RecordingSleeper::new()).unwrap();
+        let out = run_sync(
+            &client,
+            &Auth::default(),
+            &store,
+            0,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
         assert_eq!(out.outcome, SyncOutcome::NoToken);
         assert_eq!(*client.pull_calls.borrow(), 0);
 
         let client = FakeAni::new(Ok(vec![]), vec![]);
         // Token dated at 1000, now is 2000: expired.
-        let out = run_sync(&client, &connected(1000), &store, 2000, true, false, &RecordingSleeper::new()).unwrap();
+        let out = run_sync(
+            &client,
+            &connected(1000),
+            &store,
+            2000,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
         assert_eq!(out.outcome, SyncOutcome::Expired);
         assert_eq!(*client.pull_calls.borrow(), 0);
     }
@@ -321,12 +361,32 @@ mod tests {
     fn pull_only_reconciles_and_never_pushes() {
         let store = Store::open_memory().unwrap();
         dirty_lib(&store, 10); // a dirty row exists, but pull_only must not push it
-        let client = FakeAni::new(Ok(vec![RemoteEntry { anilist_id: 10, status: ListStatus::Watching, progress: 3, import_seed: None }]), vec![]);
-        let out = run_sync(&client, &connected(0), &store, 0, true, true, &RecordingSleeper::new()).unwrap();
+        let client = FakeAni::new(
+            Ok(vec![RemoteEntry {
+                anilist_id: 10,
+                status: ListStatus::Watching,
+                progress: 3,
+                import_seed: None,
+            }]),
+            vec![],
+        );
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            true,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
         assert_eq!(out.outcome, SyncOutcome::Completed);
         assert_eq!(out.pulled.reconciled, 1);
         assert_eq!(*client.pull_calls.borrow(), 1);
-        assert!(client.push_calls.borrow().is_empty(), "pull_only must not push");
+        assert!(
+            client.push_calls.borrow().is_empty(),
+            "pull_only must not push"
+        );
     }
 
     #[test]
@@ -334,9 +394,21 @@ mod tests {
         let store = Store::open_memory().unwrap();
         dirty_lib(&store, 11);
         let client = FakeAni::new(Err(CatalogError::Http { status: 401 }), vec![Ok(1)]);
-        let out = run_sync(&client, &connected(0), &store, 0, true, false, &RecordingSleeper::new()).unwrap();
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
         assert_eq!(out.outcome, SyncOutcome::PullFailed);
-        assert!(client.push_calls.borrow().is_empty(), "push must not run after a failed pull");
+        assert!(
+            client.push_calls.borrow().is_empty(),
+            "push must not run after a failed pull"
+        );
     }
 
     #[test]
@@ -344,7 +416,16 @@ mod tests {
         let store = Store::open_memory().unwrap();
         dirty_lib(&store, 12);
         let client = FakeAni::new(Ok(vec![]), vec![Ok(555)]);
-        let out = run_sync(&client, &connected(0), &store, 0, true, false, &RecordingSleeper::new()).unwrap();
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
         assert_eq!(out.outcome, SyncOutcome::Completed);
         assert_eq!(out.pushed, 1);
         assert_eq!(client.push_calls.borrow()[0], (12, ListStatus::Planning, 0));
@@ -357,12 +438,32 @@ mod tests {
         let store = Store::open_memory().unwrap();
         dirty_lib(&store, 13);
         dirty_lib(&store, 14);
-        let client = FakeAni::new(Ok(vec![]), vec![Err(CatalogError::Http { status: 401 }), Ok(1)]);
-        let out = run_sync(&client, &connected(0), &store, 0, true, false, &RecordingSleeper::new()).unwrap();
+        let client = FakeAni::new(
+            Ok(vec![]),
+            vec![Err(CatalogError::Http { status: 401 }), Ok(1)],
+        );
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
         assert_eq!(out.outcome, SyncOutcome::Unauthorized);
         assert_eq!(out.pushed, 0);
-        assert_eq!(client.push_calls.borrow().len(), 1, "stops at the first 401");
-        assert_eq!(store.list_dirty_for_sync().unwrap().len(), 2, "both rows stay dirty");
+        assert_eq!(
+            client.push_calls.borrow().len(),
+            1,
+            "stops at the first 401"
+        );
+        assert_eq!(
+            store.list_dirty_for_sync().unwrap().len(),
+            2,
+            "both rows stay dirty"
+        );
     }
 
     #[test]
@@ -373,14 +474,21 @@ mod tests {
         // Row15: 429 -> backoff -> Ok. Row16: 429 -> second, stop.
         let client = FakeAni::new(
             Ok(vec![]),
-            vec![Err(CatalogError::RateLimited), Ok(1), Err(CatalogError::RateLimited)],
+            vec![
+                Err(CatalogError::RateLimited),
+                Ok(1),
+                Err(CatalogError::RateLimited),
+            ],
         );
         let sleeper = RecordingSleeper::new();
         let out = run_sync(&client, &connected(0), &store, 0, true, false, &sleeper).unwrap();
         assert_eq!(out.outcome, SyncOutcome::RateLimited);
         assert_eq!(out.pushed, 1);
         // 60s backoff on row15, then 2s spacing before row16.
-        assert_eq!(*sleeper.slept.borrow(), vec![RATE_LIMIT_BACKOFF, PUSH_SPACING]);
+        assert_eq!(
+            *sleeper.slept.borrow(),
+            vec![RATE_LIMIT_BACKOFF, PUSH_SPACING]
+        );
         // Row16 stays dirty for the next run.
         assert_eq!(store.list_dirty_for_sync().unwrap().len(), 1);
     }
@@ -405,7 +513,16 @@ mod tests {
         dirty_lib(&store, 20);
         dirty_lib(&store, 21);
         let client = FakeAni::new(Ok(vec![]), vec![Err(CatalogError::Network), Ok(1)]);
-        let out = run_sync(&client, &connected(0), &store, 0, true, false, &RecordingSleeper::new()).unwrap();
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
         assert_eq!(out.outcome, SyncOutcome::Completed);
         assert_eq!(out.push_failed, 1);
         assert_eq!(out.pushed, 1);
@@ -416,8 +533,24 @@ mod tests {
     fn flush_push_is_push_only() {
         let store = Store::open_memory().unwrap();
         dirty_lib(&store, 22);
-        let client = FakeAni::new(Ok(vec![RemoteEntry { anilist_id: 99, status: ListStatus::Watching, progress: 1, import_seed: None }]), vec![Ok(1)]);
-        let out = flush_push(&client, &connected(0), &store, 0, true, &RecordingSleeper::new()).unwrap();
+        let client = FakeAni::new(
+            Ok(vec![RemoteEntry {
+                anilist_id: 99,
+                status: ListStatus::Watching,
+                progress: 1,
+                import_seed: None,
+            }]),
+            vec![Ok(1)],
+        );
+        let out = flush_push(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
         assert_eq!(out.outcome, SyncOutcome::Completed);
         assert_eq!(out.pushed, 1);
         assert_eq!(*client.pull_calls.borrow(), 0, "quit flush never pulls");

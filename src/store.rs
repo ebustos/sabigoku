@@ -1517,9 +1517,12 @@ impl Store {
                 continue;
             }
             match seeds.remove(&id) {
-                Some(seed) if status == ListStatus::Watching && seed_has_title(&seed) => {
-                    imports.push(ImportRow { seed, status, progress })
-                }
+                Some(seed) if status == ListStatus::Watching && seed_has_title(&seed) => imports
+                    .push(ImportRow {
+                        seed,
+                        status,
+                        progress,
+                    }),
                 _ => unmatched.push(id),
             }
         }
@@ -1684,8 +1687,8 @@ fn reconcile(
     let remote_moved = remote.0 != eff_base;
     let (status, conflict) = match (local_moved, remote_moved) {
         (false, false) => (eff_base, false),
-        (false, true) => (remote.0, false),             // adopt remote
-        (true, false) => (local.0, false),              // keep local
+        (false, true) => (remote.0, false), // adopt remote
+        (true, false) => (local.0, false),  // keep local
         (true, true) => (local.0, local.0 != remote.0), // keep local; conflict if divergent
     };
     let snapshot = match base {
@@ -2956,7 +2959,12 @@ mod tests {
     use crate::anilist::RemoteEntry;
 
     fn remote(id: i64, status: ListStatus, progress: u32) -> RemoteEntry {
-        RemoteEntry { anilist_id: id, status, progress, import_seed: None }
+        RemoteEntry {
+            anilist_id: id,
+            status,
+            progress,
+            import_seed: None,
+        }
     }
 
     fn remote_seed(id: i64, status: ListStatus, progress: u32, romaji: &str) -> RemoteEntry {
@@ -2966,7 +2974,12 @@ mod tests {
             total_episodes: Some(12),
             ..Enrichment::default()
         });
-        RemoteEntry { anilist_id: id, status, progress, import_seed }
+        RemoteEntry {
+            anilist_id: id,
+            status,
+            progress,
+            import_seed,
+        }
     }
 
     /// Library row at a precise pair + snapshot, bypassing the auto-status snaps.
@@ -2978,7 +2991,9 @@ mod tests {
         snapshot: Option<(ListStatus, u32)>,
     ) {
         store.add_to_library(&sample(id), 100).unwrap();
-        store.restore_list_status(id, status, progress, 100).unwrap();
+        store
+            .restore_list_status(id, status, progress, 100)
+            .unwrap();
         if let Some((s, p)) = snapshot {
             store.mark_synced(id, s, p).unwrap();
         }
@@ -2986,51 +3001,120 @@ mod tests {
 
     fn state(store: &Store, id: i64) -> (ListStatus, u32, Option<ListStatus>, Option<u32>) {
         let s = store.get_show(id).unwrap().unwrap();
-        (s.list_status, s.progress, s.synced_status, s.synced_progress)
+        (
+            s.list_status,
+            s.progress,
+            s.synced_status,
+            s.synced_progress,
+        )
     }
 
     #[test]
     fn reconcile_matrix_covers_every_cell() {
         // no/no: unchanged status, progress still maxes.
-        let r = reconcile(Some((ListStatus::Watching, 5)), (ListStatus::Watching, 5), (ListStatus::Watching, 9));
-        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Watching, 9, false));
+        let r = reconcile(
+            Some((ListStatus::Watching, 5)),
+            (ListStatus::Watching, 5),
+            (ListStatus::Watching, 9),
+        );
+        assert_eq!(
+            (r.status, r.progress, r.conflict),
+            (ListStatus::Watching, 9, false)
+        );
         // progress-only remote bump rebaselines the snapshot too.
-        assert_eq!((r.snapshot_status, r.snapshot_progress), (ListStatus::Watching, 9));
+        assert_eq!(
+            (r.snapshot_status, r.snapshot_progress),
+            (ListStatus::Watching, 9)
+        );
 
         // no/yes: adopt remote.
-        let r = reconcile(Some((ListStatus::Planning, 0)), (ListStatus::Planning, 0), (ListStatus::Watching, 5));
-        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Watching, 5, false));
+        let r = reconcile(
+            Some((ListStatus::Planning, 0)),
+            (ListStatus::Planning, 0),
+            (ListStatus::Watching, 5),
+        );
+        assert_eq!(
+            (r.status, r.progress, r.conflict),
+            (ListStatus::Watching, 5, false)
+        );
 
         // yes/no: keep local; snapshot stays (base == remote).
-        let r = reconcile(Some((ListStatus::Planning, 2)), (ListStatus::Watching, 4), (ListStatus::Planning, 2));
-        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Watching, 4, false));
-        assert_eq!((r.snapshot_status, r.snapshot_progress), (ListStatus::Planning, 2));
+        let r = reconcile(
+            Some((ListStatus::Planning, 2)),
+            (ListStatus::Watching, 4),
+            (ListStatus::Planning, 2),
+        );
+        assert_eq!(
+            (r.status, r.progress, r.conflict),
+            (ListStatus::Watching, 4, false)
+        );
+        assert_eq!(
+            (r.snapshot_status, r.snapshot_progress),
+            (ListStatus::Planning, 2)
+        );
 
         // yes/yes same target: converged, no conflict.
-        let r = reconcile(Some((ListStatus::Planning, 0)), (ListStatus::Completed, 12), (ListStatus::Completed, 10));
-        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Completed, 12, false));
+        let r = reconcile(
+            Some((ListStatus::Planning, 0)),
+            (ListStatus::Completed, 12),
+            (ListStatus::Completed, 10),
+        );
+        assert_eq!(
+            (r.status, r.progress, r.conflict),
+            (ListStatus::Completed, 12, false)
+        );
 
         // yes/yes different: keep local, conflict, snapshot is raw remote.
-        let r = reconcile(Some((ListStatus::Planning, 0)), (ListStatus::Dropped, 3), (ListStatus::Watching, 8));
-        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Dropped, 8, true));
-        assert_eq!((r.snapshot_status, r.snapshot_progress), (ListStatus::Watching, 8));
+        let r = reconcile(
+            Some((ListStatus::Planning, 0)),
+            (ListStatus::Dropped, 3),
+            (ListStatus::Watching, 8),
+        );
+        assert_eq!(
+            (r.status, r.progress, r.conflict),
+            (ListStatus::Dropped, 8, true)
+        );
+        assert_eq!(
+            (r.snapshot_status, r.snapshot_progress),
+            (ListStatus::Watching, 8)
+        );
     }
 
     #[test]
     fn reconcile_first_contact_treats_base_as_planning() {
         // base null: both sides "moved" from Planning; same target keeps local.
         let r = reconcile(None, (ListStatus::Watching, 4), (ListStatus::Watching, 2));
-        assert_eq!((r.status, r.progress, r.conflict), (ListStatus::Watching, 4, false));
+        assert_eq!(
+            (r.status, r.progress, r.conflict),
+            (ListStatus::Watching, 4, false)
+        );
         // Snapshot re-baselines to the raw remote pair on first contact.
-        assert_eq!((r.snapshot_status, r.snapshot_progress), (ListStatus::Watching, 2));
+        assert_eq!(
+            (r.snapshot_status, r.snapshot_progress),
+            (ListStatus::Watching, 2)
+        );
     }
 
     #[test]
     fn pull_adopts_remote_on_a_clean_row() {
         let store = Store::open_memory().unwrap();
-        lib_row(&store, 1, ListStatus::Planning, 0, Some((ListStatus::Planning, 0)));
-        let out = store.reconcile_pull(&[remote(1, ListStatus::Watching, 5)], 0).unwrap();
-        assert_eq!(out, PullOutcome { reconciled: 1, ..Default::default() });
+        lib_row(
+            &store,
+            1,
+            ListStatus::Planning,
+            0,
+            Some((ListStatus::Planning, 0)),
+        );
+        let out = store
+            .reconcile_pull(&[remote(1, ListStatus::Watching, 5)], 0)
+            .unwrap();
+        assert_eq!(
+            out,
+            PullOutcome {
+                reconciled: 1,
+                ..Default::default()
+            }
+        );
         assert_eq!(
             state(&store, 1),
             (ListStatus::Watching, 5, Some(ListStatus::Watching), Some(5))
@@ -3040,8 +3124,16 @@ mod tests {
     #[test]
     fn pull_conflict_keeps_local_and_stays_dirty() {
         let store = Store::open_memory().unwrap();
-        lib_row(&store, 2, ListStatus::Dropped, 3, Some((ListStatus::Planning, 0)));
-        let out = store.reconcile_pull(&[remote(2, ListStatus::Watching, 8)], 0).unwrap();
+        lib_row(
+            &store,
+            2,
+            ListStatus::Dropped,
+            3,
+            Some((ListStatus::Planning, 0)),
+        );
+        let out = store
+            .reconcile_pull(&[remote(2, ListStatus::Watching, 8)], 0)
+            .unwrap();
         assert_eq!(out.reconciled, 1);
         assert_eq!(out.conflicts, 1);
         // Local kept, progress maxed, snapshot = raw remote (server truth).
@@ -3057,8 +3149,16 @@ mod tests {
     #[test]
     fn pull_skips_a_fully_converged_row() {
         let store = Store::open_memory().unwrap();
-        lib_row(&store, 3, ListStatus::Watching, 5, Some((ListStatus::Watching, 5)));
-        let out = store.reconcile_pull(&[remote(3, ListStatus::Watching, 5)], 0).unwrap();
+        lib_row(
+            &store,
+            3,
+            ListStatus::Watching,
+            5,
+            Some((ListStatus::Watching, 5)),
+        );
+        let out = store
+            .reconcile_pull(&[remote(3, ListStatus::Watching, 5)], 0)
+            .unwrap();
         assert_eq!(out, PullOutcome::default());
         assert_eq!(
             state(&store, 3),
@@ -3071,7 +3171,13 @@ mod tests {
         let store = Store::open_memory().unwrap();
         lib_row(&store, 4, ListStatus::Planning, 0, None);
         let out = store
-            .reconcile_pull(&[remote(4, ListStatus::Planning, 0), remote(999, ListStatus::Watching, 3)], 0)
+            .reconcile_pull(
+                &[
+                    remote(4, ListStatus::Planning, 0),
+                    remote(999, ListStatus::Watching, 3),
+                ],
+                0,
+            )
             .unwrap();
         assert_eq!(out.unmatched, vec![999]);
         // The unmatched id was not minted into the library.
@@ -3084,7 +3190,13 @@ mod tests {
         let out = store
             .reconcile_pull(&[remote_seed(700, ListStatus::Watching, 4, "Frieren")], 50)
             .unwrap();
-        assert_eq!(out, PullOutcome { imported: 1, ..Default::default() });
+        assert_eq!(
+            out,
+            PullOutcome {
+                imported: 1,
+                ..Default::default()
+            }
+        );
         let show = store.get_show(700).unwrap().expect("row minted");
         assert_eq!(show.enrichment.title_romaji, "Frieren");
         assert_eq!(show.list_status, ListStatus::Watching);
@@ -3142,17 +3254,30 @@ mod tests {
             ..Enrichment::default()
         };
         store.bind_provider(&rich, "senshi", "abc", 10).unwrap();
-        assert!(store.get_show(704).unwrap().unwrap().library_added_at.is_none());
+        assert!(
+            store
+                .get_show(704)
+                .unwrap()
+                .unwrap()
+                .library_added_at
+                .is_none()
+        );
 
         // A sparse WATCHING seed for the same id promotes it into the library.
         let out = store
-            .reconcile_pull(&[remote_seed(704, ListStatus::Watching, 2, "Seed Title")], 50)
+            .reconcile_pull(
+                &[remote_seed(704, ListStatus::Watching, 2, "Seed Title")],
+                50,
+            )
             .unwrap();
         assert_eq!(out.imported, 1);
         let show = store.get_show(704).unwrap().unwrap();
         assert_eq!(show.library_added_at, Some(50));
         // Sparse seed did not clobber the richer existing cover.
-        assert_eq!(show.enrichment.cover_url.as_deref(), Some("https://img/cover.jpg"));
+        assert_eq!(
+            show.enrichment.cover_url.as_deref(),
+            Some("https://img/cover.jpg")
+        );
     }
 
     #[test]
@@ -3175,9 +3300,13 @@ mod tests {
             ..Enrichment::default()
         };
         other.add_to_library(&e, 10).unwrap();
-        other.restore_list_status(800, ListStatus::Completed, 20, 10).unwrap();
+        other
+            .restore_list_status(800, ListStatus::Completed, 20, 10)
+            .unwrap();
 
-        let out = store.apply_reconcile(&plan, &imports, unmatched, 0).unwrap();
+        let out = store
+            .apply_reconcile(&plan, &imports, unmatched, 0)
+            .unwrap();
         assert_eq!(out.contended, 1);
         assert_eq!(out.imported, 0);
         // The concurrent edit survives; the mint rolled back.
@@ -3217,16 +3346,32 @@ mod tests {
         assert_eq!(out.imported as usize, IMPORT_CAP);
         assert_eq!(out.unmatched.len(), 10);
         // Kept slice is the lowest ids; overflow is the highest, count-only.
-        assert!(out.unmatched.iter().all(|&id| id >= 1000 + IMPORT_CAP as i64));
+        assert!(
+            out.unmatched
+                .iter()
+                .all(|&id| id >= 1000 + IMPORT_CAP as i64)
+        );
     }
 
     #[test]
     fn pull_collapses_duplicate_remote_ids_keeping_max_progress() {
         let store = Store::open_memory().unwrap();
-        lib_row(&store, 5, ListStatus::Watching, 0, Some((ListStatus::Watching, 0)));
+        lib_row(
+            &store,
+            5,
+            ListStatus::Watching,
+            0,
+            Some((ListStatus::Watching, 0)),
+        );
         // Same id twice (custom-list duplication); the higher progress wins.
         let out = store
-            .reconcile_pull(&[remote(5, ListStatus::Watching, 2), remote(5, ListStatus::Watching, 7)], 0)
+            .reconcile_pull(
+                &[
+                    remote(5, ListStatus::Watching, 2),
+                    remote(5, ListStatus::Watching, 7),
+                ],
+                0,
+            )
             .unwrap();
         assert_eq!(out.reconciled, 1);
         assert_eq!(state(&store, 5).1, 7);
@@ -3238,17 +3383,28 @@ mod tests {
         // and the write (apply) fails the guard, so the row is left untouched.
         let path = tmp_db("reconcile-cas.db");
         let store = Store::open(&path).unwrap();
-        lib_row(&store, 6, ListStatus::Planning, 0, Some((ListStatus::Planning, 0)));
+        lib_row(
+            &store,
+            6,
+            ListStatus::Planning,
+            0,
+            Some((ListStatus::Planning, 0)),
+        );
 
-        let (plan, imports, unmatched) =
-            store.reconcile_plan(&[remote(6, ListStatus::Watching, 5)]).unwrap();
+        let (plan, imports, unmatched) = store
+            .reconcile_plan(&[remote(6, ListStatus::Watching, 5)])
+            .unwrap();
         assert_eq!(plan.len(), 1, "the remote change should plan a write");
 
         // A concurrent edit lands through a second connection before apply.
         let other = Store::open(&path).unwrap();
-        other.restore_list_status(6, ListStatus::Dropped, 9, 200).unwrap();
+        other
+            .restore_list_status(6, ListStatus::Dropped, 9, 200)
+            .unwrap();
 
-        let out = store.apply_reconcile(&plan, &imports, unmatched, 0).unwrap();
+        let out = store
+            .apply_reconcile(&plan, &imports, unmatched, 0)
+            .unwrap();
         assert_eq!(out.contended, 1);
         assert_eq!(out.reconciled, 0);
         // The concurrent edit survives; the stale merge did not overwrite it.

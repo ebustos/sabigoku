@@ -66,7 +66,12 @@ pub fn synopsis_cap(remaining: u16) -> u16 {
 /// then the grid. The synopsis yields so the grid keeps >= 2 rows; the
 /// provider caption draws only when a grid row still follows it, never
 /// orphaned above an empty region. Returns `(synopsis_rows, show_provider)`.
-fn body_budget(remaining: u16, syn_natural: u16, grid_rows: u16, has_provider: bool) -> (u16, bool) {
+fn body_budget(
+    remaining: u16,
+    syn_natural: u16,
+    grid_rows: u16,
+    has_provider: bool,
+) -> (u16, bool) {
     let prov = u16::from(has_provider);
     let syn_rows = syn_natural
         .min(remaining.saturating_sub(1 + prov + grid_rows).max(2))
@@ -563,10 +568,9 @@ fn draw_body(
         draw_synopsis(frame, area, palette, entry, state.scroll, y, cap);
         return;
     }
-    let syn_natural = entry
-        .description
-        .as_deref()
-        .map_or(1, |t| render::wrap_text(t, area.width as usize).len() as u16);
+    let syn_natural = entry.description.as_deref().map_or(1, |t| {
+        render::wrap_text(t, area.width as usize).len() as u16
+    });
     let cols = grid_cols(area.width);
     let grid_rows = (session.grid().len().div_ceil(cols).max(1)) as u16;
     let fields = detail_meta_fields(entry, session);
@@ -575,9 +579,7 @@ fn draw_body(
         body_budget(remaining, syn_natural, grid_rows, provider.is_some());
     draw_synopsis(frame, area, palette, entry, state.scroll, y, syn_rows);
     let mut grid_y = y + syn_rows + 1;
-    if show_provider
-        && let Some(pline) = provider
-    {
+    if show_provider && let Some(pline) = provider {
         frame.render_widget(
             Paragraph::new(pline),
             Rect::new(area.x, area.y + grid_y, area.width, 1),
@@ -1392,8 +1394,7 @@ mod tests {
             palette,
         ));
         assert_eq!(
-            full,
-            "28 eps · TV · Light novel · 24 min · Madhouse · #12 rated 2023",
+            full, "28 eps · TV · Light novel · 24 min · Madhouse · #12 rated 2023",
             "Rank rides the compact line, last"
         );
         assert!(
