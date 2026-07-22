@@ -12,6 +12,7 @@ pub mod episodes;
 pub mod event;
 pub mod layout;
 pub mod playback;
+pub mod prewarm;
 pub mod render;
 pub mod theme;
 pub mod toast;

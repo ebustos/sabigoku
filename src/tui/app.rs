@@ -246,6 +246,8 @@ impl App {
                 failure,
                 token,
             } => self.on_play_finished(anilist_id, position, failure, token, now, tx),
+            // Inert until the fire triggers land (ROD-449 chunk 2).
+            Event::PrewarmResult { .. } => {}
             Event::ConnectResult(result) => self.on_connect_result(result, now, tx),
             Event::SyncFlushed(summary) => self.on_sync_flushed(summary, now),
         }

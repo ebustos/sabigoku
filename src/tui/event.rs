@@ -55,6 +55,16 @@ pub enum PlayFailure {
     Internal,
 }
 
+/// What one settled prewarm probe learned (03 §6.5). `Nothing` = transport
+/// failure or clean search miss; the walk mints only from an authoritative
+/// listing (03 §4.3), so `Nothing` writes no row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrewarmVerdict {
+    Found { provider_id: String },
+    Absent,
+    Nothing,
+}
+
 /// No `Eq`: cover events carry pixel payloads (`DynamicImage` is `PartialEq`
 /// only).
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +147,14 @@ pub enum Event {
         anilist_id: i64,
         provider: String,
         class: FetchClass,
+        token: u64,
+    },
+    /// One settled prewarm probe (04 §4.3, §7.6). The prewarm transport paces
+    /// the walk and mints; a stale token is discarded there.
+    PrewarmResult {
+        anilist_id: i64,
+        provider: String,
+        verdict: PrewarmVerdict,
         token: u64,
     },
     /// Observed playback position (04 §4.5), throttled at the worker bridge
