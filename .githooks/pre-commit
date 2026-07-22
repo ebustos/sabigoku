@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Chained from ~/.githooks/pre-commit (global core.hooksPath). Checks the WORKING
+# TREE, not the index: a file staged with `git add -p` can pass here while its
+# staged half is unformatted. Same simplicity trade as the global comment-lint.
+if ! cargo fmt --all --check -q; then
+  echo 'Commit rejected: rustfmt drift.' >&2
+  cargo fmt --all --check 2>/dev/null | grep '^Diff in' | sed 's/^Diff in /  /; s/:[0-9]*:$//' | sort -u >&2
+  echo 'Run `cargo fmt --all` and restage.' >&2
+  exit 1
+fi
