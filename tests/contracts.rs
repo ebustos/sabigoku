@@ -309,16 +309,6 @@ const CONTRACTS: &[Contract] = &[
     ),
     c(
         "11",
-        "first meaningful position stamps History membership (ROD-478)",
-        Seeded("tui::playback::engagement_lands_on_first_meaningful_position_only"),
-    ),
-    c(
-        "11",
-        "startup adopts orphaned progress rows into History (ROD-478)",
-        Seeded("store::orphaned_progress_is_adopted_into_history_at_open"),
-    ),
-    c(
-        "11",
         "meaningful final persists; no observed position keeps the checkpoint",
         Seeded("player::ipc_without_meaningful_position_keeps_the_gate_shut"),
     ),
@@ -341,6 +331,21 @@ const CONTRACTS: &[Contract] = &[
         "11",
         "landing/reroute progress joins are raise-only (02 4b / ROD-346)",
         Seeded("store::raise_to_union_never_lowers"),
+    ),
+    c(
+        "11",
+        "first meaningful position stamps History membership, born sync-clean (ROD-478)",
+        Seeded("tui::playback::engagement_lands_on_first_meaningful_position_only"),
+    ),
+    c(
+        "11",
+        "startup adopts orphaned progress rows into History (ROD-478)",
+        Seeded("store::orphaned_progress_is_adopted_into_history_at_open"),
+    ),
+    c(
+        "11",
+        "engagement and adoption never dirty the AniList push (ROD-478)",
+        Seeded("store::engagement_and_adoption_are_born_sync_clean"),
     ),
     // 12 · Covers
     c(
