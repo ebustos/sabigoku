@@ -3842,13 +3842,16 @@ mod tests {
     }
 
     /// 05 §10.4 busy half: a save while a play is launching fires no walk
-    /// (the launching window is the play gate in this port).
+    /// (the launching window is the play gate in this port). The unbound
+    /// second provider is the point: the open already bound megaplay, and
+    /// without a live candidate fire() short-circuits before reading gates.
     #[test]
     fn plan_save_during_play_launch_is_gated() {
         let registry = teststub::registry(vec![
             teststub::StubProvider::new("megaplay")
                 .with_key("505")
                 .with_episodes(Ok(vec!["1".into()])),
+            teststub::StubProvider::new("senshi").with_key("505"),
         ]);
         let (mut app, tx, rx, now) = harness_full(
             "prewarm-busy",
