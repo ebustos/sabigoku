@@ -114,7 +114,9 @@ preference this rule interacts with, and §10 for the rationale.
 **Underline is unused.** Keybind characters in help lines and confirm prompts use
 bold instead: the same "promotion" treatment as H1/H2 above.
 
-**Blink is used exactly once:** the `▌` status cursor. Nowhere else.
+**Blink is unused.** The `▌` status cursor was the one sanctioned use until
+ROD-481: ghostty never rendered SGR blink, kitty does, and it reads as a stray
+terminal cursor. Steady `state.now` now; nothing blinks.
 
 ### 1.4 Palette Selection (themes)
 
@@ -156,7 +158,7 @@ terminal with a Nerd-Font-adjacent or well-populated Unicode font.
 
 | Glyph | Token | Meaning | Color |
 |---|---|---|---|
-| `▌` | CURSOR | Persistent status cursor, blinks ~1hz | `state.now` |
+| `▌` | CURSOR | Persistent status cursor, steady | `state.now` |
 | `▸` | PLAY | Playable / resume point | `state.focus` |
 | `▹` | PLAY_QUEUED | In queue, not started | `text.muted` |
 | `◉` | DOT_ACTIVE | Currently airing, episode just dropped | `state.now` |
@@ -411,7 +413,7 @@ Single row. Full terminal width. This row does triple duty:
 ```
   ▌  hjkl · / search · : command · q quit
 ```
-- `▌` in `state.now`, blinking ~1hz.
+- `▌` in `state.now`, steady.
 - Text in `text.dim`.
 - Keybind characters (h, j, k, l, /, :, q) in `text.muted` + bold (§1.3).
 
@@ -437,7 +439,7 @@ Single row. Full terminal width. This row does triple duty:
 - Unknown command: flash bottom bar `state.error` for 800ms, return to idle.
 
 A fourth in-practice state, the hard-delete **confirm prompt**, is specified in
-§4.2/§6.5; it shares the blink-suppression rule below.
+§4.2/§6.5; it shares the marker-replacement rule below.
 
 ### 3.6 Internal Dividers
 
@@ -725,14 +727,14 @@ Fully specified in §3.5. Component summary:
 
 | State | Trigger | Left indicator | Prompt color | Input color |
 |---|---|---|---|---|
-| Idle help | default | `▌` blink `state.now` | - | `text.dim` |
+| Idle help | default | `▌` steady `state.now` | - | `text.dim` |
 | Search | `/` | `/` static | `state.focus` + bold | `text.primary` + bold |
 | Command | `:` | `:` static | `state.now` + bold | `text.primary` + bold |
 | Confirm (delete) | `X` (History list) | `[!]` static `state.now` (▌ suppressed) | static text `text.muted` | title `text.primary` + bold |
 
-When search or command is active, the `▌` blink is suppressed; the prompt character
+When search or command is active, the `▌` is replaced; the prompt character
 takes its visual position. The confirm state (§6.5) is a fourth in-practice mode
-with the same suppression rule, driven by `confirm_delete` rather than `input_mode`.
+with the same replacement rule, driven by `confirm_delete` rather than `input_mode`.
 
 **Confirm prompt (80-col):**
 
@@ -978,14 +980,16 @@ In the bottom bar: `[~]` prefixes the status text during a sync.
 
 ### 4.9 The Magenta Cursor
 
-The `▌` lives at the leftmost position of the bottom bar. It blinks at ~1hz (500ms
-on, 500ms off). It is always `state.now`.
+The `▌` lives at the leftmost position of the bottom bar. It is steady, always
+`state.now`. The original ~1hz blink is retired (ROD-481): ghostty never rendered
+SGR blink, kitty does, and a blinking block in the corner reads as a stray
+terminal cursor, not a status marker.
 
 It is suppressed (replaced by the prompt character) when the command line is active
 in search or command state, and by the `[!]` glyph in the confirm state.
 
-This is the only blinking element in the entire UI. If something else seems like it
-should blink, it should not. Use color weight change instead.
+Nothing blinks in this UI. If something seems like it should blink, it should not.
+Use color weight change instead.
 
 ### 4.10 Toast Event Matrix
 
