@@ -322,12 +322,9 @@ pub fn draw_bottom_bar(frame: &mut Frame<'_>, area: Rect, palette: &Palette, bar
         BottomBar::Help(line) => {
             let mut spans: Vec<Span<'_>> = vec![
                 Span::raw("  "),
-                Span::styled(
-                    "▌",
-                    Style::new()
-                        .fg(palette.hot)
-                        .add_modifier(Modifier::SLOW_BLINK),
-                ),
+                // Steady, never SLOW_BLINK: terminals that honor SGR blink
+                // render a stray-cursor lookalike (ROD-481, DESIGN 4.9).
+                Span::styled("▌", Style::new().fg(palette.hot)),
                 Span::raw(" "),
             ];
             for seg in help_segments(*line) {
@@ -479,6 +476,46 @@ mod tests {
             let intact =
                 row.contains("[S]ettings") || (row.contains("[S]") && !row.contains("[S]e"));
             assert!(intact, "width {w}: active tab label corrupted: {row:?}");
+        }
+    }
+
+    /// DESIGN 4.9 (ROD-481): nothing blinks. SGR blink reads as a stray
+    /// terminal cursor in terminals that honor it (kitty); ghostty ignores
+    /// it, which is how the old `▌` blink shipped unseen.
+    #[test]
+    fn bottom_bar_never_carries_a_blink_modifier() {
+        use super::{BottomBar, HelpLine, draw_bottom_bar};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        for bar in [
+            BottomBar::Help(HelpLine::BrowseList),
+            BottomBar::Help(HelpLine::HistoryList),
+            BottomBar::Help(HelpLine::Discover),
+            BottomBar::Search {
+                query: "frieren",
+                scope: "catalogue",
+                count: 3,
+            },
+            BottomBar::Command { input: "dub" },
+            BottomBar::Confirm { title: "Frieren" },
+        ] {
+            let mut term = Terminal::new(TestBackend::new(80, 1)).unwrap();
+            term.draw(|f| {
+                draw_bottom_bar(f, f.area(), &crate::tui::theme::TERMINAL_GHOST, &bar);
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            for x in 0..80u16 {
+                let cell = &buf[(x, 0)];
+                assert!(
+                    !cell
+                        .style()
+                        .add_modifier
+                        .intersects(Modifier::SLOW_BLINK | Modifier::RAPID_BLINK),
+                    "blink modifier at col {x} in {bar:?}"
+                );
+            }
         }
     }
 }
