@@ -268,8 +268,33 @@ const CONTRACTS: &[Contract] = &[
     ),
     c(
         "10.4",
-        "prewarm candidates = unchecked only; results mint hidden bind/negative",
-        Pending("M2 prewarm walk (ROD-449)"),
+        "prewarm candidates = unchecked only (not bound, not fresh-absent)",
+        Seeded("tui::prewarm::candidates_skip_bound_and_fresh_absent"),
+    ),
+    c(
+        "10.4",
+        "prewarm results mint hidden bind/negative; done clears the guard",
+        Seeded("tui::prewarm::fire_probes_every_candidate_and_mints"),
+    ),
+    c(
+        "10.4",
+        "prewarm write refreshes the open show availability rail",
+        Seeded("tui::app::play_open_fires_prewarm_and_the_mint_refreshes_the_rail"),
+    ),
+    c(
+        "10.4",
+        "add success triggers the warm; ring dedup silences a repeat",
+        Seeded("tui::app::plan_save_fires_prewarm_and_the_ring_silences_a_repeat"),
+    ),
+    c(
+        "10.4",
+        "busy silent: a save during a play launch fires no walk",
+        Seeded("tui::app::plan_save_during_play_launch_is_gated"),
+    ),
+    c(
+        "10.4",
+        "prewarm cancel honored: fallback yield stops the walk",
+        Seeded("tui::prewarm::cancel_mid_flight_honors_result_then_stops"),
     ),
     c(
         "10.5",

@@ -12,18 +12,20 @@ use std::time::{Duration, Instant};
 use crate::anilist::AniList;
 use crate::aniskip::{self, SkipMode};
 use crate::auth::Auth;
-use crate::domain::{Quality, Translation};
+use crate::domain::{Enrichment, Quality, Translation, expected_episode_count};
 use crate::error::Error;
 use crate::login::ConnectResult;
 use crate::loopback::Loopback;
 use crate::player::{self, PlayError, PlayOpts, PlayerEvent, Position};
 use crate::providers::{
-    CatalogProvider, DiscoverAxis, ProviderError, ProviderRegistry, SEARCH_PAGE_SIZE, SearchOptions,
+    CatalogProvider, DiscoverAxis, ProviderError, ProviderRegistry, SEARCH_PAGE_SIZE,
+    SearchOptions, StreamProvider,
 };
+use crate::resolver;
 use crate::store::Store;
 use crate::sync::{self, SyncOutcome, SyncSummary, ThreadSleeper};
 use crate::tui::covers::{self, CoverCaches};
-use crate::tui::event::{Event, EventTx, FetchClass, PlayFailure};
+use crate::tui::event::{Event, EventTx, FetchClass, PlayFailure, PrewarmVerdict};
 
 /// The 02 §4b post-play gate, the one owner of the finish writes (01 §3 glue).
 /// No meaningful position, no writes of any kind; the player already collapsed
@@ -372,6 +374,86 @@ pub fn spawn_provider_search(
         };
         tx.post(event);
     })
+}
+
+/// One prewarm candidate, described as data (03 §6.5). The worker runs the
+/// whole tier-A-or-search chain blocking and always answers with exactly one
+/// `PrewarmResult`.
+#[derive(Debug, Clone)]
+pub struct PrewarmProbe {
+    pub provider: String,
+    pub canonical: Enrichment,
+    pub translation: Translation,
+    pub token: u64,
+}
+
+#[must_use]
+pub fn spawn_prewarm_probe(
+    drain: &Drain,
+    tx: EventTx,
+    registry: Arc<ProviderRegistry>,
+    probe: PrewarmProbe,
+) -> bool {
+    drain.spawn("prewarm", move || {
+        let PrewarmProbe {
+            provider,
+            canonical,
+            translation,
+            token,
+        } = probe;
+        let verdict = match registry.by_name(&provider) {
+            Some(p) => probe_candidate(p, &canonical, translation),
+            None => PrewarmVerdict::Nothing,
+        };
+        tx.post(Event::PrewarmResult {
+            anilist_id: canonical.anilist_id,
+            provider,
+            verdict,
+            token,
+        });
+    })
+}
+
+/// Per-candidate classification, mirroring the user walk (03 §4.3): tier-A
+/// key → episodes; else title search → episodes on the match. Only an
+/// authoritative empty listing is an absence; a search miss or any transport
+/// error learns nothing (03 §6.4: no new absence rule).
+fn probe_candidate(
+    p: &dyn StreamProvider,
+    canonical: &Enrichment,
+    translation: Translation,
+) -> PrewarmVerdict {
+    let count_hint = expected_episode_count(
+        canonical.status.as_deref(),
+        canonical.total_episodes,
+        canonical.next_airing_episode,
+    );
+    let classify = |id: String, listing: Result<Vec<String>, ProviderError>| match listing {
+        Ok(eps) if !eps.is_empty() => PrewarmVerdict::Found { provider_id: id },
+        Ok(_) => PrewarmVerdict::Absent,
+        Err(_) => PrewarmVerdict::Nothing,
+    };
+    if let Some(key) = p.canonical_key(canonical) {
+        let listing = p.episodes(&key, translation, count_hint);
+        return classify(key, listing);
+    }
+    let opts = SearchOptions {
+        translation,
+        limit: SEARCH_PAGE_SIZE,
+        page: 1,
+    };
+    let hits = match p.search(&canonical.title_romaji, &opts) {
+        Ok(hits) => hits,
+        Err(_) => return PrewarmVerdict::Nothing,
+    };
+    let Some(ix) = resolver::best_id_match(canonical, &hits)
+        .or_else(|| resolver::best_provider_match(canonical, &hits))
+    else {
+        return PrewarmVerdict::Nothing;
+    };
+    let id = hits[ix].provider_id.clone();
+    let listing = p.episodes(&id, translation, count_hint);
+    classify(id, listing)
 }
 
 /// One play, described as data: everything the worker needs without touching

@@ -774,6 +774,19 @@ impl EpisodeSession {
         self.no_source
     }
 
+    /// A fallback walk is armed (03 §6.4); the prewarm walk yields to it.
+    pub fn walk_active(&self) -> bool {
+        self.walk.is_some()
+    }
+
+    /// A background write changed availability for `anilist_id` (prewarm,
+    /// 05 §10.4): refresh the rail when it is the engaged show.
+    pub fn on_availability_write(&mut self, anilist_id: i64, deps: &EpisodeDeps) {
+        if self.for_id == Some(anilist_id) {
+            self.refresh_meta(deps);
+        }
+    }
+
     /// Linear grid cursor (freeze parity: j/k step episodes, not rows).
     pub fn cursor_by(&mut self, delta: i64) {
         if self.episodes.is_empty() {
