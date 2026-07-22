@@ -21,10 +21,12 @@ pub const HOP_GAP: Duration = Duration::from_millis(1500);
 const RING_SLOTS: usize = 32;
 
 /// User-facing resolve signals sampled at fire time (04 §7.6). They gate walk
-/// starts only; a gate rising mid-walk does not cancel it.
+/// starts only; a gate rising mid-walk does not cancel it. The freeze's
+/// add_resolving gate has no port: P-save is a synchronous store write here.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Gates {
-    pub add_resolving: bool,
+    /// Play launching window: resolve runs inside the play worker, so the
+    /// warm waits for mpv to open (glance clears).
     pub play_resolving: bool,
     pub fallback_active: bool,
 }
@@ -141,6 +143,10 @@ impl PrewarmState {
         }
     }
 
+    pub fn active(&self) -> bool {
+        self.run.is_some()
+    }
+
     /// An advancing fallback owns the CDN budget (03 §6.4).
     pub fn cancel(&mut self) {
         match self.run.as_mut() {
@@ -155,11 +161,7 @@ impl PrewarmState {
     }
 
     fn blocked(&self, anilist_id: i64, now: Instant, gates: Gates) -> bool {
-        if self.run.is_some()
-            || gates.add_resolving
-            || gates.play_resolving
-            || gates.fallback_active
-        {
+        if self.run.is_some() || gates.play_resolving || gates.fallback_active {
             return true;
         }
         if self.attempted.iter().flatten().any(|&a| a == anilist_id) {
@@ -428,10 +430,6 @@ mod tests {
         let state = PrewarmState::default();
         let t = Instant::now();
         for gates in [
-            Gates {
-                add_resolving: true,
-                ..Gates::default()
-            },
             Gates {
                 play_resolving: true,
                 ..Gates::default()

@@ -130,6 +130,7 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
     app.browse.drain(Duration::from_secs(1));
     app.detail.drain(Duration::from_secs(1));
     app.discover.drain(Duration::from_secs(1));
+    app.prewarm.drain(Duration::from_secs(1));
     // Wake a blocked connect worker before its drain (06 §4.4).
     app.shutdown_connect();
     // Quit flush (04 §11): push what's dirty, bounded by the drain below.

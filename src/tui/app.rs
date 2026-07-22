@@ -33,9 +33,10 @@ use super::clock::Debounce;
 use super::covers::CoverCaches;
 use super::covers::render::ProtocolPool;
 use super::episodes::{EpisodeDeps, Feedback};
-use super::event::{Event, EventTx, FetchClass, PlayFailure};
+use super::event::{Event, EventTx, FetchClass, PlayFailure, PrewarmVerdict};
 use super::layout;
 use super::playback::{HopAsk, PlayFeedback, PlayRequest, PlaybackDeps, PlaybackSession};
+use super::prewarm::{self, PrewarmState};
 use super::render;
 use super::theme::{self, Palette};
 use super::toast::{Kind, Toasts};
@@ -88,6 +89,7 @@ pub struct App {
     settings: SettingsState,
     pub(super) detail: DetailState,
     playback: PlaybackSession,
+    pub(super) prewarm: PrewarmState,
     store: Store,
     catalog: Arc<dyn CatalogProvider>,
     registry: Arc<ProviderRegistry>,
@@ -160,6 +162,7 @@ impl App {
             settings: SettingsState::default(),
             detail: DetailState::default(),
             playback: PlaybackSession::default(),
+            prewarm: PrewarmState::default(),
             store,
             catalog,
             registry,
@@ -246,8 +249,12 @@ impl App {
                 failure,
                 token,
             } => self.on_play_finished(anilist_id, position, failure, token, now, tx),
-            // Inert until the fire triggers land (ROD-449 chunk 2).
-            Event::PrewarmResult { .. } => {}
+            Event::PrewarmResult {
+                anilist_id,
+                provider,
+                verdict,
+                token,
+            } => self.on_prewarm_result(anilist_id, &provider, &verdict, token, now, tx),
             Event::ConnectResult(result) => self.on_connect_result(result, now, tx),
             Event::SyncFlushed(summary) => self.on_sync_flushed(summary, now),
         }
@@ -315,7 +322,7 @@ impl App {
             KeyCode::Char('g') => self.on_jump(true, now),
             KeyCode::Char('G') => self.on_jump(false, now),
             KeyCode::Char('v') => self.on_pin_cycle(now, tx),
-            KeyCode::Char('P') => self.on_plan(now),
+            KeyCode::Char('P') => self.on_plan(now, tx),
             KeyCode::Char('p') => self.on_status_key(domain::ListStatus::Paused, now),
             KeyCode::Char('x') => self.on_status_key(domain::ListStatus::Dropped, now),
             KeyCode::Char('c') => self.on_status_key(domain::ListStatus::Completed, now),
@@ -587,7 +594,7 @@ impl App {
     /// `P` "plan it" (DESIGN 6.1): saves the highlighted Discover card or
     /// Browse result as planning; in the History list it is the fifth manual
     /// transition (re-plan, with undo).
-    fn on_plan(&mut self, now: Instant) {
+    fn on_plan(&mut self, now: Instant, tx: &EventTx) {
         if self.view == View::History {
             if self.pane == Pane::List {
                 self.on_status_key(domain::ListStatus::Planning, now);
@@ -604,8 +611,16 @@ impl App {
         };
         match self.store.add_to_library(entry, unix_now()) {
             Ok(()) => {
-                self.arm_sync(now);
                 self.toasts.push(Kind::Success, "added to watchlist", now);
+                // Warm siblings so a later flip is tier-0 (03 §6.5); the
+                // gates make a busy/repeat fire silent.
+                let gates = prewarm::Gates {
+                    play_resolving: self.playback.glance().is_some(),
+                    fallback_active: self.detail.episodes.walk_active(),
+                };
+                let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+                self.prewarm.fire(entry, gates, &deps);
+                self.arm_sync(now);
             }
             Err(_) => self
                 .toasts
@@ -940,6 +955,10 @@ impl App {
         if self.sync_debounce.fire(now) {
             self.flush_sync(now, tx, false);
         }
+        {
+            let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+            self.prewarm.tick(&deps);
+        }
         self.dirty = true;
     }
 
@@ -1174,6 +1193,11 @@ impl App {
             }
         }
         self.maybe_continue_play(now, tx);
+        // Any armed fallback walk owns the CDN budget (03 §6.4): a live
+        // prewarm walk yields to it.
+        if self.detail.episodes.walk_active() {
+            self.prewarm.cancel();
+        }
         self.dirty = true;
     }
 
@@ -1603,6 +1627,7 @@ impl App {
         now: Instant,
         tx: &EventTx,
     ) {
+        let launching = self.playback.glance().is_some();
         let deps = playback_deps(
             &self.store,
             &self.registry,
@@ -1613,7 +1638,47 @@ impl App {
         );
         self.playback
             .on_position(anilist_id, position, token, &deps);
+        // mpv is up (launching cell cleared): warm siblings while it runs so
+        // a mid-episode flip is tier-0 (03 §6.5). Firing here instead of at
+        // the play fire keeps the warm off the CDN during the play's own
+        // resolve (the launching window IS the resolve in this port).
+        if launching && self.playback.glance().is_none() && self.playback.is_playing() {
+            let canonical = self
+                .store
+                .get_show(anilist_id)
+                .ok()
+                .flatten()
+                .map(|s| s.enrichment);
+            if let Some(canonical) = canonical {
+                let gates = prewarm::Gates {
+                    play_resolving: false,
+                    fallback_active: self.detail.episodes.walk_active(),
+                };
+                let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+                self.prewarm.fire(&canonical, gates, &deps);
+            }
+        }
         self.dirty = true;
+    }
+
+    /// One settled prewarm probe: the transport mints and paces; a changed
+    /// availability row refreshes the engaged show's rail (05 §10.4).
+    fn on_prewarm_result(
+        &mut self,
+        anilist_id: i64,
+        provider: &str,
+        verdict: &PrewarmVerdict,
+        token: u64,
+        now: Instant,
+        tx: &EventTx,
+    ) {
+        let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+        if self.prewarm.on_result(provider, verdict, token, &deps) {
+            self.detail
+                .episodes
+                .on_availability_write(anilist_id, &deps);
+            self.dirty = true;
+        }
     }
 
     fn on_play_retry(&mut self, anilist_id: i64, attempt: u32, token: u64, now: Instant) {
@@ -1662,6 +1727,10 @@ impl App {
         }
         if let Some(ask) = out.hop {
             self.on_play_hop(ask, now, tx);
+            // The hop's fallback walk owns the CDN budget (03 §6.4).
+            if self.detail.episodes.walk_active() {
+                self.prewarm.cancel();
+            }
         }
         self.dirty = true;
     }
@@ -3719,6 +3788,104 @@ mod tests {
             let Ok(ev) = rx.try_recv() else { break };
             app.tick(ev, now, tx);
         }
+    }
+
+    /// Drain probes, route results, hop the gap; loops until the walk clears.
+    fn settle_prewarm(
+        app: &mut App,
+        tx: &EventTx,
+        rx: &super::super::event::EventRx,
+        now: Instant,
+    ) {
+        let mut t = now;
+        while app.prewarm.active() {
+            assert!(app.prewarm.drain(Duration::from_secs(5)));
+            while let Ok(ev) = rx.try_recv() {
+                app.tick(ev, t, tx);
+            }
+            t += prewarm::HOP_GAP;
+            app.tick(Event::Tick, t, tx);
+        }
+    }
+
+    /// 05 §10.4: add success triggers the warm; busy/repeat is silent.
+    #[test]
+    fn plan_save_fires_prewarm_and_the_ring_silences_a_repeat() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "prewarm-plan",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('/'), ch('a')]);
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        app.tick(key(KeyCode::Enter), t1, &tx); // locks the search
+        app.tick(ch('P'), t1, &tx);
+        assert!(app.prewarm.active(), "the save started the warm walk");
+        settle_prewarm(&mut app, &tx, &rx, t1);
+        assert_eq!(
+            app.store.bindings_for(1).unwrap()[0].provider_id,
+            "505",
+            "the probe minted the binding"
+        );
+        // Repeat P: the ring blocks a re-fire (the exhausted stub would
+        // otherwise spawn a fresh walk off its Network fallback answers).
+        app.tick(ch('P'), t1, &tx);
+        assert!(!app.prewarm.active(), "repeat save is silent");
+    }
+
+    /// 05 §10.4: the play warm starts when mpv opens (first position), and a
+    /// minted sibling refreshes the engaged show's availability rail.
+    #[test]
+    fn play_open_fires_prewarm_and_the_mint_refreshes_the_rail() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into()])),
+            teststub::StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into(), "2".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "prewarm-play",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        let token = app.playback.active_token().unwrap();
+        assert!(
+            !app.prewarm.active(),
+            "the launching window never hosts the warm"
+        );
+        discard_worker_finish(&mut app, &rx);
+        app.tick(
+            Event::PlayPosition {
+                anilist_id: 1,
+                position: PlayPos {
+                    secs: 5.0,
+                    duration: Some(1400.0),
+                },
+                token,
+            },
+            t1,
+            &tx,
+        );
+        assert!(app.prewarm.active(), "mpv up fired the sibling warm");
+        settle_prewarm(&mut app, &tx, &rx, t1);
+        assert!(
+            app.detail.episodes.avail().iter().any(
+                |(name, a)| name == "senshi" && *a == crate::store::ProviderAvailability::Bound
+            ),
+            "the minted sibling reached the rail"
+        );
     }
 
     #[test]
