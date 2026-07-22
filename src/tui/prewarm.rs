@@ -88,8 +88,9 @@ impl PrewarmState {
 
     /// Route one settled probe: mint what it learned, then pace the next
     /// spawn. Returns true when an availability row changed (the caller
-    /// refreshes the open show's rail). At most one probe is ever in flight,
-    /// so a stale token means a superseded run: discard.
+    /// refreshes the open show's rail). The stale-token check is redundant
+    /// while the single-flight guard holds; kept as the subsystem token
+    /// idiom, not a live defense.
     pub fn on_result(
         &mut self,
         provider: &str,
@@ -105,11 +106,26 @@ impl PrewarmState {
         };
         // Best-effort mints (05 §10.4): binding rows only, no library chrome.
         // A failed write costs a re-probe after ring eviction, nothing else.
+        // A background mint never steals: bind_provider moves a colliding
+        // (provider, provider_id) pair between shows, and a probe's
+        // search-derived id is provider-claimed data, so a pair another show
+        // already owns refuses the mint instead of silently unbinding a
+        // bystander (the user-facing walk keeps its freeze semantics).
         let wrote = match verdict {
-            PrewarmVerdict::Found { provider_id } => deps
-                .store
-                .bind_provider(&run.canonical, provider, provider_id, deps.unix_now)
-                .is_ok(),
+            PrewarmVerdict::Found { provider_id } => {
+                // Read error fails CLOSED here, unlike the candidate filter:
+                // a missed warm is cheap, a steal is not.
+                let mintable = match deps.store.show_id_for_binding(provider, provider_id) {
+                    Ok(None) => true,
+                    Ok(Some(owner)) => owner == run.canonical.anilist_id,
+                    Err(_) => false,
+                };
+                mintable
+                    && deps
+                        .store
+                        .bind_provider(&run.canonical, provider, provider_id, deps.unix_now)
+                        .is_ok()
+            }
             PrewarmVerdict::Absent => deps
                 .store
                 .mark_provider_absent(&run.canonical, provider, deps.unix_now)
@@ -351,6 +367,30 @@ mod tests {
         assert!(w.store.provider_absent_fresh(7, "b", 1_000).unwrap());
         assert_eq!(w.bound_id(7, "c").as_deref(), Some("c1"));
         assert!(state.attempted.iter().flatten().any(|&a| a == 7));
+        assert!(!state.active(), "done clears the guard");
+    }
+
+    #[test]
+    fn found_mint_never_steals_another_shows_binding() {
+        // Provider "c" search-matches show 2 but answers show 1's id: the
+        // steal-delete inside bind_provider must never fire off a background
+        // probe's provider-claimed data.
+        let w = World::new(vec![
+            StubProvider::new("c")
+                .with_search(Ok(vec![hit(2, "COLLIDE")]))
+                .with_episodes(Ok(vec!["1".into()])),
+        ]);
+        let victim = canonical(1);
+        w.store.bind_provider(&victim, "c", "COLLIDE", 500).unwrap();
+        let mut state = PrewarmState::default();
+        state.fire(&canonical(2), Gates::default(), &w.deps_at(w.t0));
+        w.settle(&mut state);
+        assert_eq!(
+            w.bound_id(1, "c").as_deref(),
+            Some("COLLIDE"),
+            "the victim keeps its binding"
+        );
+        assert_eq!(w.bound_id(2, "c"), None, "the colliding mint was refused");
     }
 
     #[test]

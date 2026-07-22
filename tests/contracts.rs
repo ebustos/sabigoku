@@ -283,8 +283,13 @@ const CONTRACTS: &[Contract] = &[
     ),
     c(
         "10.4",
-        "add success triggers the warm; busy/repeat silent",
+        "add success triggers the warm; ring dedup silences a repeat",
         Seeded("tui::app::plan_save_fires_prewarm_and_the_ring_silences_a_repeat"),
+    ),
+    c(
+        "10.4",
+        "busy silent: a save during a play launch fires no walk",
+        Seeded("tui::app::plan_save_during_play_launch_is_gated"),
     ),
     c(
         "10.4",

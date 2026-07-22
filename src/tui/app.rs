@@ -3841,6 +3841,30 @@ mod tests {
         assert!(!app.prewarm.active(), "repeat save is silent");
     }
 
+    /// 05 §10.4 busy half: a save while a play is launching fires no walk
+    /// (the launching window is the play gate in this port).
+    #[test]
+    fn plan_save_during_play_launch_is_gated() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "prewarm-busy",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        // Precondition named: the play is mid-launch (no position yet).
+        assert!(app.playback.glance().is_some());
+        app.tick(key(KeyCode::Esc), t1, &tx);
+        app.tick(ch('P'), t1, &tx);
+        assert!(!app.prewarm.active(), "the launch gate held");
+        discard_worker_finish(&mut app, &rx);
+    }
+
     /// 05 §10.4: the play warm starts when mpv opens (first position), and a
     /// minted sibling refreshes the engaged show's availability rail.
     #[test]
