@@ -221,6 +221,28 @@ pub fn spawn_search(
     })
 }
 
+/// Detail refresh-on-view fetch (04 §5.1 `enrich_refresh`), three-state
+/// answer (05 §8): metadata, confirmed null, or no answer.
+#[must_use]
+pub fn spawn_enrich(
+    drain: &Drain,
+    tx: EventTx,
+    catalog: Arc<dyn CatalogProvider>,
+    anilist_id: i64,
+) -> bool {
+    drain.spawn("enrich_refresh", move || {
+        let event = match catalog.enrich(anilist_id) {
+            Ok(Some(e)) => Event::EnrichmentRefreshed {
+                for_id: anilist_id,
+                enrichment: Box::new(e),
+            },
+            Ok(None) => Event::EnrichmentNull { for_id: anilist_id },
+            Err(_) => Event::EnrichmentFailed { for_id: anilist_id },
+        };
+        tx.post(event);
+    })
+}
+
 /// One episode listing fetch, described as data so the spawn stays under the
 /// argument lint and the session can log/replay the spec in tests.
 #[derive(Debug, Clone, PartialEq)]

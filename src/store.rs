@@ -346,6 +346,44 @@ impl Store {
         Ok(self.conn.execute(&sql, params.as_slice())? > 0)
     }
 
+    /// Refresh-on-view staleness (04 §10): a show row judges by its own stamp
+    /// (NULL = never enriched: an import seed or a fresh mint), else the
+    /// catalog_cache row by its expiry; no row anywhere is a miss. Fieldset
+    /// drift re-heals without waiting out the TTL (02 §5).
+    pub fn enrichment_stale(&self, anilist_id: i64, now: i64) -> Result<bool, Error> {
+        if let Some(show) = self.get_show(anilist_id)? {
+            let Some(fetched_at) = show.enrichment_fetched_at else {
+                return Ok(true);
+            };
+            if show.enrichment_fieldset_version != Some(ENRICHMENT_FIELDSET_VERSION) {
+                return Ok(true);
+            }
+            let ttl = enrichment_ttl_secs(show.enrichment.status.as_deref());
+            return Ok(now >= fetched_at + ttl);
+        }
+        match self.get_catalog(anilist_id)? {
+            Some(hit) => Ok(hit.fieldset_version != ENRICHMENT_FIELDSET_VERSION
+                || hit.expires_at.is_none_or(|t| now >= t)),
+            None => Ok(true),
+        }
+    }
+
+    /// A confirmed-null enrich answer stamps freshness with no fields (05 §8:
+    /// a true negative is an answer, never re-queried forever). UPDATE-only,
+    /// like the patch: null never mints.
+    pub fn stamp_enrichment_checked(&self, anilist_id: i64, now: i64) -> Result<bool, Error> {
+        Ok(self.conn.execute(
+            "UPDATE show SET enrichment_fetched_at = :now,
+                enrichment_fieldset_version = :fieldset_version
+             WHERE anilist_id = :id",
+            named_params! {
+                ":now": now,
+                ":fieldset_version": ENRICHMENT_FIELDSET_VERSION,
+                ":id": anilist_id,
+            },
+        )? > 0)
+    }
+
     /// Promote a cached card into the library (02 §3.5): straight enrichment
     /// copy plus the membership stamp; the cache row remains.
     pub fn promote_catalog_to_show(&self, anilist_id: i64, now: i64) -> Result<bool, Error> {
@@ -3373,6 +3411,72 @@ mod tests {
         assert_eq!(store.meta_get("flag").unwrap().as_deref(), Some("on"));
         store.meta_set("flag", "off").unwrap();
         assert_eq!(store.meta_get("flag").unwrap().as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn refresh_on_view_staleness_ladder() {
+        let store = Store::open_memory().unwrap();
+        let now = 1_000_000;
+
+        assert!(store.enrichment_stale(7, now).unwrap(), "miss is stale");
+
+        // A minted library row carries no stamp (the import-seed shape).
+        store.add_to_library(&sample(7), now).unwrap();
+        assert!(store.enrichment_stale(7, now).unwrap());
+
+        // A stamped full answer is fresh until its status TTL lapses.
+        assert!(store.patch_show_enrichment(&sample(7), true, now).unwrap());
+        assert!(!store.enrichment_stale(7, now).unwrap());
+        assert!(
+            !store
+                .enrichment_stale(7, now + ENRICH_TTL_FINISHED_SECS - 1)
+                .unwrap()
+        );
+        assert!(
+            store
+                .enrichment_stale(7, now + ENRICH_TTL_FINISHED_SECS)
+                .unwrap()
+        );
+
+        // Fieldset drift re-heals without waiting out the TTL (02 §5).
+        store
+            .conn
+            .execute(
+                "UPDATE show SET enrichment_fieldset_version = 0 WHERE anilist_id = 7",
+                [],
+            )
+            .unwrap();
+        assert!(store.enrichment_stale(7, now).unwrap());
+    }
+
+    #[test]
+    fn staleness_falls_back_to_catalog_cache_expiry() {
+        let store = Store::open_memory().unwrap();
+        let now = 1_000_000;
+        store
+            .upsert_catalog_cache(&sample(9), now, Some(now + 100))
+            .unwrap();
+        assert!(!store.enrichment_stale(9, now).unwrap());
+        assert!(store.enrichment_stale(9, now + 100).unwrap());
+    }
+
+    #[test]
+    fn confirmed_null_stamp_is_update_only() {
+        let store = Store::open_memory().unwrap();
+        let now = 1_000_000;
+        assert!(
+            !store.stamp_enrichment_checked(9, now).unwrap(),
+            "null never mints"
+        );
+        assert!(store.get_show(9).unwrap().is_none());
+
+        store.add_to_library(&sample(9), now).unwrap();
+        assert!(store.stamp_enrichment_checked(9, now).unwrap());
+        assert!(!store.enrichment_stale(9, now).unwrap());
+        assert_eq!(
+            store.get_show(9).unwrap().unwrap().enrichment_fetched_at,
+            Some(now)
+        );
     }
 
     #[test]

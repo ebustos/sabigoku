@@ -26,7 +26,7 @@ use crate::domain::{self, TitleLanguage, Translation};
 use crate::paths::Paths;
 use crate::player::{self, Position};
 use crate::providers::{CatalogProvider, DiscoverAxis, ProviderRegistry};
-use crate::store::Store;
+use crate::store::{Store, enrichment_ttl_secs};
 
 use super::chrome::{self, BottomBar, HelpLine, Tab, TopBar};
 use super::clock::Debounce;
@@ -218,6 +218,11 @@ impl App {
                 results,
             } => self.on_search_done(&query, results, now),
             Event::SearchFailed { query, cause: _ } => self.on_search_failed(&query, now),
+            Event::EnrichmentRefreshed { for_id, enrichment } => {
+                self.on_enrichment_refreshed(for_id, &enrichment)
+            }
+            Event::EnrichmentNull { for_id } => self.on_enrichment_null(for_id),
+            Event::EnrichmentFailed { for_id: _ } => self.on_enrichment_failed(now),
             e @ (Event::EpisodesDone { .. }
             | Event::EpisodesError { .. }
             | Event::ProviderSearchDone { .. }
@@ -914,6 +919,8 @@ impl App {
         }
         self.browse.maybe_fire(now, tx, &self.catalog);
         if self.detail_surface_visible() {
+            self.detail
+                .maybe_enrich(now, tx, &self.catalog, &self.store, unix_now());
             self.detail.maybe_sync(
                 now,
                 self.config.cover_art,
@@ -1020,6 +1027,39 @@ impl App {
             self.toasts
                 .push_persistent(Kind::Error, "can't reach AniList", ANILIST_TOPIC, now);
         }
+        self.dirty = true;
+    }
+
+    /// Refresh-on-view answer (04 §10): show patches when library (never
+    /// clobbering user state), catalog_cache always refreshes, and a success
+    /// doubles as the AniList recovery signal (DESIGN 8.5).
+    fn on_enrichment_refreshed(&mut self, for_id: i64, e: &domain::Enrichment) {
+        let now_unix = unix_now();
+        let ttl = enrichment_ttl_secs(e.status.as_deref());
+        let patched = self
+            .store
+            .patch_show_enrichment(e, true, now_unix)
+            .unwrap_or(false);
+        let _ = self
+            .store
+            .upsert_catalog_cache(e, now_unix, Some(now_unix + ttl));
+        if patched {
+            self.history.load(&self.store);
+        }
+        self.detail.on_enrichment(for_id, e);
+        self.toasts.clear_topic(ANILIST_TOPIC);
+        self.dirty = true;
+    }
+
+    fn on_enrichment_null(&mut self, for_id: i64) {
+        let _ = self.store.stamp_enrichment_checked(for_id, unix_now());
+        self.toasts.clear_topic(ANILIST_TOPIC);
+        self.dirty = true;
+    }
+
+    fn on_enrichment_failed(&mut self, now: Instant) {
+        self.toasts
+            .push_persistent(Kind::Error, "can't reach AniList", ANILIST_TOPIC, now);
         self.dirty = true;
     }
 
@@ -2125,6 +2165,8 @@ mod tests {
     struct StubCatalog {
         discover: Mutex<VecDeque<Result<CatalogPage, CatalogError>>>,
         search: Mutex<VecDeque<Result<CatalogPage, CatalogError>>>,
+        enrich: Mutex<VecDeque<Result<Option<Enrichment>, CatalogError>>>,
+        enrich_calls: Mutex<Vec<i64>>,
     }
 
     impl StubCatalog {
@@ -2140,6 +2182,17 @@ mod tests {
         ) -> Arc<dyn CatalogProvider> {
             Arc::new(StubCatalog {
                 search: Mutex::new(pages.into()),
+                ..Default::default()
+            })
+        }
+
+        /// Concrete Arc so tests can read `enrich_calls` after coercing a
+        /// clone into the harness.
+        fn enrich_scripted(
+            answers: Vec<Result<Option<Enrichment>, CatalogError>>,
+        ) -> Arc<StubCatalog> {
+            Arc::new(StubCatalog {
+                enrich: Mutex::new(answers.into()),
                 ..Default::default()
             })
         }
@@ -2164,8 +2217,11 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Err(CatalogError::Network))
         }
-        fn enrich(&self, _id: i64) -> Result<Option<Enrichment>, CatalogError> {
-            Ok(None)
+        // The empty-script fallback is the silent answer: a confirmed null
+        // stamps but never toasts, so unrelated tests stay unperturbed.
+        fn enrich(&self, id: i64) -> Result<Option<Enrichment>, CatalogError> {
+            self.enrich_calls.lock().unwrap().push(id);
+            self.enrich.lock().unwrap().pop_front().unwrap_or(Ok(None))
         }
     }
 
@@ -2735,6 +2791,93 @@ mod tests {
         assert_eq!(app.browse.count(), 1);
     }
 
+    fn healed(id: i64) -> Enrichment {
+        Enrichment {
+            anilist_id: id,
+            title_romaji: format!("Show {id}"),
+            cover_url: Some("http://127.0.0.1:9/healed.png".into()),
+            total_episodes: Some(25),
+            description: Some("a synopsis".into()),
+            status: Some("FINISHED".into()),
+            ..Enrichment::default()
+        }
+    }
+
+    /// Force a real History entry (switch_view early-returns on the landing
+    /// view, and only a real switch loads + pushes the selection).
+    fn enter_history(app: &mut App, tx: &EventTx, now: Instant) {
+        app.tick(Event::Resize(100, 30), now, tx);
+        press(app, tx, now, &[ch('B'), ch('H')]);
+    }
+
+    #[test]
+    fn history_detail_heals_an_import_seeded_row() {
+        let catalog = StubCatalog::enrich_scripted(vec![Ok(Some(healed(7)))]);
+        let (mut app, tx, rx, now) = harness_with("enrich-heal", catalog.clone());
+        // The import-seed shape (ROD-467 pull): title only, no stamp.
+        app.store.add_to_library(&feed_entry(7), unix_now()).unwrap();
+        enter_history(&mut app, &tx, now);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(*catalog.enrich_calls.lock().unwrap(), vec![7]);
+        let show = app.store.get_show(7).unwrap().unwrap();
+        assert_eq!(show.enrichment.description.as_deref(), Some("a synopsis"));
+        assert!(show.enrichment_fetched_at.is_some(), "answer stamps");
+        assert_eq!(
+            app.detail.shown().and_then(|e| e.total_episodes),
+            Some(25),
+            "shown snapshot heals in place"
+        );
+        assert_eq!(
+            app.history.selected().unwrap().enrichment.total_episodes,
+            Some(25),
+            "list row heals"
+        );
+        // Healed is fresh: later ticks never refetch.
+        app.tick(Event::Tick, now + Duration::from_secs(1), &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(catalog.enrich_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn enrich_failure_toasts_persistently_and_reselect_retries() {
+        let catalog = StubCatalog::enrich_scripted(vec![
+            Err(CatalogError::Network),
+            Ok(Some(healed(7))),
+        ]);
+        let (mut app, tx, rx, now) = harness_with("enrich-outage", catalog.clone());
+        app.store.add_to_library(&feed_entry(7), unix_now()).unwrap();
+        enter_history(&mut app, &tx, now);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(app.toasts.iter().count(), 1, "persistent unreachable toast");
+        // The failed id is settled while shown; leaving and returning re-arms.
+        app.tick(Event::Tick, now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('H')]);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(*catalog.enrich_calls.lock().unwrap(), vec![7, 7]);
+        assert!(app.toasts.is_empty(), "success clears the topic");
+    }
+
+    #[test]
+    fn confirmed_null_stamps_and_stays_silent() {
+        let catalog = StubCatalog::enrich_scripted(Vec::new());
+        let (mut app, tx, rx, now) = harness_with("enrich-null", catalog.clone());
+        app.store.add_to_library(&feed_entry(7), unix_now()).unwrap();
+        enter_history(&mut app, &tx, now);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(*catalog.enrich_calls.lock().unwrap(), vec![7]);
+        let show = app.store.get_show(7).unwrap().unwrap();
+        assert!(show.enrichment_fetched_at.is_some(), "a true negative stamps");
+        assert!(show.enrichment.description.is_none(), "no fields invented");
+        assert!(app.toasts.is_empty(), "an answer is not a failure");
+        app.tick(Event::Tick, now + Duration::from_secs(1), &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(catalog.enrich_calls.lock().unwrap().len(), 1, "stamped rows never requery");
+    }
+
     #[test]
     fn browse_nav_pushes_the_shared_detail() {
         let (mut app, tx, rx, now) = harness_with(
@@ -2820,6 +2963,7 @@ mod tests {
             Arc::new(StubCatalog {
                 discover: Mutex::new(vec![discover_page].into()),
                 search: Mutex::new(vec![one_page(2)].into()),
+                ..Default::default()
             }),
         );
         app.tick(Event::Resize(100, 30), now, &tx);

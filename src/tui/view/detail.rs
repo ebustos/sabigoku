@@ -20,7 +20,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::domain::{self, Enrichment, Season, preferred_title};
-use crate::store::ProviderAvailability;
+use crate::providers::CatalogProvider;
+use crate::store::{ProviderAvailability, Store};
 use crate::tui::clock::Debounce;
 use crate::tui::covers::detail::{Action, CoverState};
 use crate::tui::covers::render::ProtocolPool;
@@ -105,6 +106,13 @@ pub struct DetailState {
     started: Option<crate::tui::clock::AsyncStart>,
     drain: Drain,
     settle: Debounce,
+    /// Refresh-on-view family (04 §5.1). Its own drain: the cover drain's
+    /// single-flight gate counts inflight and must not see enrich fetches.
+    enrich_drain: Drain,
+    enrich_settle: Debounce,
+    /// One staleness decision per shown id; a failed fetch retries only when
+    /// the selection changes shows (set_target re-arms on a new id).
+    enrich_checked: Option<i64>,
     pub(crate) episodes: EpisodeSession,
 }
 
@@ -122,6 +130,7 @@ impl DetailState {
             // A new show voids the grid immediately (ROD-329: a stale grid
             // must never let play launch the wrong show).
             self.episodes.reset();
+            self.enrich_checked = None;
         }
         self.shown = Some(entry.clone());
         let window = if discrete {
@@ -130,6 +139,7 @@ impl DetailState {
             COVER_SETTLE
         };
         self.settle.arm(now, window);
+        self.enrich_settle.arm(now, window);
     }
 
     /// Nothing selected: the pane clears, no stale detail (DESIGN 8.4).
@@ -168,6 +178,47 @@ impl DetailState {
         self.shown
             .as_ref()
             .is_some_and(|e| self.episodes.is_for(e.anilist_id) && self.episodes.has_grid())
+    }
+
+    /// Refresh-on-view (04 §10): freshness is judged locally, the network is
+    /// spent only on miss/stale. Rides the tick beat next to the cover
+    /// reconcile but independent of `cover_art`: metadata heals with covers
+    /// off. Single-flight; a spawn refusal retries on the next tick.
+    pub fn maybe_enrich(
+        &mut self,
+        now: Instant,
+        tx: &EventTx,
+        catalog: &Arc<dyn CatalogProvider>,
+        store: &Store,
+        now_unix: i64,
+    ) {
+        if self.enrich_settle.is_armed() && !self.enrich_settle.fire(now) {
+            return;
+        }
+        let Some(id) = self.shown.as_ref().map(|e| e.anilist_id) else {
+            return;
+        };
+        if self.enrich_checked == Some(id) || self.enrich_drain.inflight() > 0 {
+            return;
+        }
+        match store.enrichment_stale(id, now_unix) {
+            Ok(true) => {
+                if workers::spawn_enrich(&self.enrich_drain, tx.clone(), Arc::clone(catalog), id) {
+                    self.enrich_checked = Some(id);
+                }
+            }
+            // A store read error counts as fresh: no basis to spend network.
+            Ok(false) | Err(_) => self.enrich_checked = Some(id),
+        }
+    }
+
+    /// A healed answer replaces the shown snapshot in place (scroll and grid
+    /// survive: same show, fresher fields). A stale id is dropped; the store
+    /// write already landed in app.
+    pub fn on_enrichment(&mut self, for_id: i64, e: &Enrichment) {
+        if self.shown.as_ref().map(|s| s.anilist_id) == Some(for_id) {
+            self.shown = Some(e.clone());
+        }
     }
 
     /// Cover reconcile (05 §12), called each tick while a detail surface is
@@ -250,12 +301,13 @@ impl DetailState {
         self.cover.on_error(for_id, now);
     }
 
-    /// Drains both worker families; attempts the second even when the first
+    /// Drains every worker family; attempts each even when an earlier one
     /// times out so teardown reclaims whatever it can.
     pub fn drain(&self, timeout: Duration) -> bool {
         let covers = self.drain.drain(timeout);
+        let enrich = self.enrich_drain.drain(timeout);
         let episodes = self.episodes.drain(timeout);
-        covers && episodes
+        covers && enrich && episodes
     }
 }
 
@@ -1499,6 +1551,64 @@ mod tests {
         assert_eq!(d.scroll, 3, "same show keeps the scroll");
         d.set_target(&entry(2), true, now);
         assert_eq!(d.scroll, 0, "new show resets");
+    }
+
+    struct CountingCatalog(std::sync::Mutex<Vec<i64>>);
+
+    impl CatalogProvider for CountingCatalog {
+        fn search(
+            &self,
+            _q: &str,
+            _p: u32,
+        ) -> Result<crate::providers::CatalogPage, crate::providers::CatalogError> {
+            Err(crate::providers::CatalogError::Network)
+        }
+        fn discover(
+            &self,
+            _a: crate::providers::DiscoverAxis,
+            _p: u32,
+        ) -> Result<crate::providers::CatalogPage, crate::providers::CatalogError> {
+            Err(crate::providers::CatalogError::Network)
+        }
+        fn enrich(&self, id: i64) -> Result<Option<Enrichment>, crate::providers::CatalogError> {
+            self.0.lock().unwrap().push(id);
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn continuous_scroll_settles_before_enriching_then_decides_once() {
+        let mut d = DetailState::default();
+        let (tx, _rx, _caches, _dir) = deps();
+        let store = Store::open_memory().unwrap();
+        let counting = Arc::new(CountingCatalog(std::sync::Mutex::new(Vec::new())));
+        let catalog: Arc<dyn CatalogProvider> = counting.clone();
+        let t0 = Instant::now();
+        d.set_target(&entry(1), false, t0);
+        d.maybe_enrich(t0, &tx, &catalog, &store, 1_000);
+        assert!(counting.0.lock().unwrap().is_empty(), "settle window holds");
+        d.maybe_enrich(t0 + COVER_SETTLE, &tx, &catalog, &store, 1_000);
+        assert!(d.drain(Duration::from_secs(5)));
+        assert_eq!(
+            *counting.0.lock().unwrap(),
+            vec![1],
+            "a store miss fires after settle"
+        );
+        d.maybe_enrich(t0 + COVER_SETTLE * 2, &tx, &catalog, &store, 1_000);
+        assert!(d.drain(Duration::from_secs(5)));
+        assert_eq!(
+            counting.0.lock().unwrap().len(),
+            1,
+            "one decision per shown id"
+        );
+
+        // A fresh cache row spends nothing.
+        store
+            .upsert_catalog_cache(&entry(2), 1_000, Some(2_000))
+            .unwrap();
+        d.set_target(&entry(2), true, t0);
+        d.maybe_enrich(t0, &tx, &catalog, &store, 1_000);
+        assert_eq!(counting.0.lock().unwrap().len(), 1);
     }
 
     #[test]
