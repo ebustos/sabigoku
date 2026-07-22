@@ -180,6 +180,9 @@ impl App {
             pool,
             encode_drain,
         };
+        // Recover any play the last run died before stamping (ROD-478);
+        // best-effort, a failure just leaves the ghost for the next launch.
+        let _ = app.store.adopt_orphaned_progress();
         // A synchronous local read, not a worker (a deliberate deviation from
         // 04 §4.2's load events; recorded on the ticket).
         app.history.load(&app.store);

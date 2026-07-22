@@ -375,7 +375,7 @@ grid adds a History entry. The fix is an explicit marker column:
 |---|---|
 | Show row creation | A `show` row is minted by whichever comes first: binding mint, absence mark, route stamp, or library add. Identity rows are cheap and carry no UI meaning. (Route stamp joined the list at ROD-439: stamp-before-fetch must land for never-resolved shows, 03 §5.3.) |
 | History contents | History = `show` rows with `library_added_at IS NOT NULL`. Nothing else, ever. |
-| Membership set by | Watchlist add (`P` / reveal), user status writers (`setListStatus` / restore), or a **successful `recordPlay`**. Stamp membership **inside** those writers (set-once). Callers gate `recordPlay` with meaningful position (finite pos > 0) + known episode index; do not re-derive membership from isMeaningful alone. Partial watches join History. |
+| Membership set by | Watchlist add (`P` / reveal), user status writers (`setListStatus` / restore), or a **successful `recordPlay`**. Stamp membership **inside** those writers (set-once). Callers gate `recordPlay` with meaningful position (finite pos > 0) + known episode index; do not re-derive membership from isMeaningful alone. Partial watches join History. (sabigoku extension: also the first meaningful position event of a play, and the startup orphan-adoption sweep; 08 §10 ROD-478.) |
 | Membership NOT set by | Episode grid open, availability probe, prewarm, enrichment, Discover/Browse paint, sync `applyPulled`, bind-on-resolve with `visible=false`. Natural-end / `completed` (progress ratchet, §4b) is **not** the membership gate. |
 
 Ancestry: zigoku's `history_visible` was a `MAX()` ratchet folded into the upsert

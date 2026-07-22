@@ -161,6 +161,8 @@ last (zigoku `failureClassCopy` pattern).
 
 | 2026-07-22 | ROD-477: `show.progress_stamped_at` (schema v2) records when the frontier last moved, stamped by every progress writer (record_play/record_finish ratchet, recompute, raise-to-union, AniList adoption, import mint, manual status snap, undo restore) only when the value changes. `latest_resume` returns the freshest partial NEWER than the stamp. Root cause: ROD-439 rebuilt zigoku's frontier-anchored `resumeSeed` recency-anchored, reaching a state the freeze could not (stale partial behind the high-water); the freeze had no test for it and 05 §10.7's prose lost the anchoring qualifier. Deliberately NOT a re-port of `resumeSeed`: recency semantics fit the AniList-keyed multi-writer world (tablet syncs move the frontier with no local rows) and keep live rewatch checkpoints, which frontier anchoring discards |
 
+| 2026-07-22 | ROD-478: History membership no longer depends on the app surviving to observe the play end. `record_engagement` (membership set-once + last_watched_at, nothing else) fires on the first meaningful position event; `adopt_orphaned_progress` at startup adopts progress rows under non-library shows (only plays write them, so an orphan proves an engagement the app died before stamping), timestamps from the rows. play_count/ratchet/status stay with the finish writers; a checkpoint is still not a play (02 §4b) |
+
 When M1 picks config format, image crate, or channel crate, add a row here rather
 than rewriting product chapters.
 

@@ -309,6 +309,16 @@ const CONTRACTS: &[Contract] = &[
     ),
     c(
         "11",
+        "first meaningful position stamps History membership (ROD-478)",
+        Seeded("tui::playback::engagement_lands_on_first_meaningful_position_only"),
+    ),
+    c(
+        "11",
+        "startup adopts orphaned progress rows into History (ROD-478)",
+        Seeded("store::orphaned_progress_is_adopted_into_history_at_open"),
+    ),
+    c(
+        "11",
         "meaningful final persists; no observed position keeps the checkpoint",
         Seeded("player::ipc_without_meaningful_position_keeps_the_gate_shut"),
     ),
