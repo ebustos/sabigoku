@@ -889,7 +889,10 @@ available column width.
 | Airing/not-yet-released | `[NN]` | `bg.base` | `text.dim` + italic |
 
 The resume point cell (`[▸N]`) is always the most visually prominent cell in the
-grid; `state.now` is only ever earned by one cell at a time.
+grid; `state.now` is only ever earned by one cell at a time. A resume point is
+the freshest partial watch recorded **since the frontier last moved**, whichever
+writer moved it (local ratchet, recompute, AniList sync); a partial the frontier
+has passed is dead, a partial written after it is a live rewatch (ROD-477).
 
 **Launching cell state.** When playback is resolving (the 2-3s resolve → mpv-launch
 window), the played episode's cell renders the current braille spinner frame

@@ -453,6 +453,9 @@ ratchets it). Resume and counting never mix sub with dub.
 **Resume marker:** derived UI state, not a column. The episode grid's resume seed
 returns null when `progress == 0`; that is all "recompute-to-0 clears the marker"
 means. `episode_progress.position_secs` rows are untouched by recompute.
+(sabigoku deviation: the marker derives from `latest_resume` gated by
+`show.progress_stamped_at`, so any frontier move retires older partials while the
+rows still remain; 08 §10 ROD-477.)
 
 **Clamping:** storage is **unclamped**. `progress` may exceed `total` (overshoot
 still counts as completed). The "14/2" fix (0.3.1 / ROD-297) is a render-time
