@@ -1046,7 +1046,15 @@ impl App {
         if patched {
             self.history.load(&self.store);
         }
-        self.detail.on_enrichment(for_id, e);
+        // Render from the canonical merged row, never the raw answer: the
+        // store merge can keep fields the fetch dropped (02 §3.5 forbids a
+        // read-time merge, so the read-back IS the merge).
+        let merged = if patched {
+            self.store.get_show(for_id).ok().flatten().map(|s| s.enrichment)
+        } else {
+            self.store.get_catalog(for_id).ok().flatten().map(|h| h.enrichment)
+        };
+        self.detail.on_enrichment(for_id, merged.as_ref().unwrap_or(e));
         self.toasts.clear_topic(ANILIST_TOPIC);
         self.dirty = true;
     }
@@ -2858,6 +2866,76 @@ mod tests {
         settle_feed(&mut app, &tx, &rx, now);
         assert_eq!(*catalog.enrich_calls.lock().unwrap(), vec![7, 7]);
         assert!(app.toasts.is_empty(), "success clears the topic");
+    }
+
+    #[test]
+    fn reheal_renders_the_merged_row_never_the_raw_answer() {
+        // The degraded re-answer: cancelled, no total, no synopsis. The store
+        // merge keeps the better stored fields; the render must follow it.
+        let degraded = Enrichment {
+            anilist_id: 7,
+            title_romaji: "Show 7".into(),
+            status: Some("CANCELLED".into()),
+            ..Enrichment::default()
+        };
+        let catalog = StubCatalog::enrich_scripted(vec![Ok(Some(degraded))]);
+        let (mut app, tx, rx, now) = harness_with("enrich-reheal", catalog.clone());
+        // A fully healed library row whose stamp lapsed long ago.
+        app.store.add_to_library(&healed(7), 1_000).unwrap();
+        assert!(
+            app.store
+                .patch_show_enrichment(&healed(7), true, 1_000)
+                .unwrap()
+        );
+        assert!(
+            app.store.enrichment_stale(7, unix_now()).unwrap(),
+            "stamp lapsed"
+        );
+        enter_history(&mut app, &tx, now);
+        app.tick(Event::Tick, now, &tx);
+        settle_feed(&mut app, &tx, &rx, now);
+        assert_eq!(*catalog.enrich_calls.lock().unwrap(), vec![7]);
+        let shown = app.detail.shown().unwrap();
+        assert_eq!(
+            shown.total_episodes,
+            Some(25),
+            "the raw answer must not regress the render below the merged row"
+        );
+        assert_eq!(shown.description.as_deref(), Some("a synopsis"));
+        assert_eq!(
+            shown.status.as_deref(),
+            Some("CANCELLED"),
+            "fresh drift fields still land"
+        );
+    }
+
+    #[test]
+    fn browse_detail_restamps_an_expired_catalog_only_card() {
+        let catalog = Arc::new(StubCatalog {
+            search: Mutex::new(vec![one_page(1)].into()),
+            ..Default::default()
+        });
+        let (mut app, tx, rx, now) = harness_with("enrich-cache-null", catalog.clone());
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(&mut app, &tx, now, &[ch('B'), ch('/'), ch('a')]);
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        assert_eq!(app.detail.shown().map(|e| e.anilist_id), Some(1));
+        // Age the card far past its expiry (the long-idle session shape),
+        // then let the tick decide with a confirmed-null answer scripted.
+        app.store
+            .upsert_catalog_cache(&feed_entry(1), 100, Some(200))
+            .unwrap();
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        assert_eq!(*catalog.enrich_calls.lock().unwrap(), vec![1]);
+        assert!(
+            !app.store.enrichment_stale(1, unix_now()).unwrap(),
+            "the null answer stamps the cache row durably"
+        );
+        assert!(app.store.get_show(1).unwrap().is_none(), "never mints");
+        assert!(app.toasts.is_empty());
     }
 
     #[test]

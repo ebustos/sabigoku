@@ -370,9 +370,10 @@ impl Store {
 
     /// A confirmed-null enrich answer stamps freshness with no fields (05 §8:
     /// a true negative is an answer, never re-queried forever). UPDATE-only,
-    /// like the patch: null never mints.
+    /// like the patch: null never mints. Cache rows judge staleness by
+    /// expiry, so their stamp is a renewed expires_at.
     pub fn stamp_enrichment_checked(&self, anilist_id: i64, now: i64) -> Result<bool, Error> {
-        Ok(self.conn.execute(
+        let show = self.conn.execute(
             "UPDATE show SET enrichment_fetched_at = :now,
                 enrichment_fieldset_version = :fieldset_version
              WHERE anilist_id = :id",
@@ -381,7 +382,28 @@ impl Store {
                 ":fieldset_version": ENRICHMENT_FIELDSET_VERSION,
                 ":id": anilist_id,
             },
-        )? > 0)
+        )? > 0;
+        let cache_ttl = self
+            .get_catalog(anilist_id)?
+            .map(|hit| enrichment_ttl_secs(hit.enrichment.status.as_deref()));
+        let cache = match cache_ttl {
+            Some(ttl) => {
+                self.conn.execute(
+                    "UPDATE catalog_cache SET fetched_at = :now,
+                        fieldset_version = :fieldset_version,
+                        expires_at = :expires_at
+                     WHERE anilist_id = :id",
+                    named_params! {
+                        ":now": now,
+                        ":fieldset_version": ENRICHMENT_FIELDSET_VERSION,
+                        ":expires_at": now + ttl,
+                        ":id": anilist_id,
+                    },
+                )? > 0
+            }
+            None => false,
+        };
+        Ok(show || cache)
     }
 
     /// Promote a cached card into the library (02 §3.5): straight enrichment
@@ -3477,6 +3499,20 @@ mod tests {
             store.get_show(9).unwrap().unwrap().enrichment_fetched_at,
             Some(now)
         );
+    }
+
+    #[test]
+    fn confirmed_null_stamp_renews_a_catalog_only_row() {
+        let store = Store::open_memory().unwrap();
+        let now = 1_000_000;
+        store
+            .upsert_catalog_cache(&sample(3), now, Some(now + 100))
+            .unwrap();
+        let later = now + 200;
+        assert!(store.enrichment_stale(3, later).unwrap());
+        assert!(store.stamp_enrichment_checked(3, later).unwrap());
+        assert!(!store.enrichment_stale(3, later).unwrap());
+        assert!(store.get_show(3).unwrap().is_none(), "still never mints");
     }
 
     #[test]
