@@ -1,5 +1,6 @@
-//! Log sink (06 §1): the TUI owns the terminal, so lines go to a rotating file
-//! under the data dir, never stderr. Call sites use the `log` facade macros;
+//! Log sinks (06 §1/§7): the TUI owns the terminal, so its lines go to a
+//! rotating file under the data dir; CLI paths log to stderr via
+//! `init_stderr`. Call sites use the `log` facade macros;
 //! before `init` runs they are no-ops. Debug is gated by SABIGOKU_DEBUG; info
 //! and up always emit. zigoku opened its log O_NOFOLLOW (planted-symlink
 //! defense); flexi_logger owns the open here, so that check is gone. The data
@@ -15,8 +16,8 @@ const ROTATED_FILES_KEPT: usize = 3;
 /// Install the sink: `sabigoku_rCURRENT.log` in `data_dir`, appended across
 /// runs, rotated by size. Dropping the handle shuts the sink down (later
 /// emits are dropped); hold it for the whole run.
-pub fn init(data_dir: &Path) -> Result<LoggerHandle, FlexiLoggerError> {
-    let debug = env_debug();
+pub fn init(data_dir: &Path, flag_debug: bool) -> Result<LoggerHandle, FlexiLoggerError> {
+    let debug = flag_debug || env_debug();
     let handle = Logger::try_with_str(spec(debug))?
         .log_to_file(
             FileSpec::default()
@@ -41,14 +42,15 @@ pub fn init(data_dir: &Path) -> Result<LoggerHandle, FlexiLoggerError> {
     Ok(handle)
 }
 
-/// Sink-down fallback: without any installed logger the `log` macros are
-/// no-ops, so a worker panic would leave no trace at all. Frame-punching
-/// stderr beats invisible. Level gating rides on `set_max_level`; a second
-/// install attempt is a harmless no-op.
-pub fn init_stderr_fallback() {
-    static FALLBACK: StderrFallback = StderrFallback;
-    if log::set_logger(&FALLBACK).is_ok() {
-        log::set_max_level(if env_debug() {
+/// CLI sink (06 §7 policy: CLI logs to stderr, the TUI to the file). Doubles
+/// as the TUI's sink-down fallback: without any installed logger the `log`
+/// macros are no-ops, so a worker panic would leave no trace at all, and
+/// frame-punching stderr beats invisible there. Level gating rides on
+/// `set_max_level`; a second install attempt is a harmless no-op.
+pub fn init_stderr(flag_debug: bool) {
+    static SINK: StderrSink = StderrSink;
+    if log::set_logger(&SINK).is_ok() {
+        log::set_max_level(if flag_debug || env_debug() {
             log::LevelFilter::Debug
         } else {
             log::LevelFilter::Info
@@ -56,9 +58,9 @@ pub fn init_stderr_fallback() {
     }
 }
 
-struct StderrFallback;
+struct StderrSink;
 
-impl log::Log for StderrFallback {
+impl log::Log for StderrSink {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         true
     }
@@ -141,7 +143,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let handle = init(&dir).unwrap();
+        let handle = init(&dir, false).unwrap();
         log::warn!("logging-test sentinel");
         handle.flush();
 
