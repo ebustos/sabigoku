@@ -296,7 +296,7 @@ fn ua_clean(s: &str) -> bool {
 fn socket_path(dir: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid();
     let pid = std::process::id();
     dir.join(format!("sabigoku-mpv-{uid}-{pid}-{counter}.sock"))
 }
@@ -347,30 +347,21 @@ fn connect_ipc(path: &Path, gone: &AtomicBool, child_pid: u32) -> Option<UnixStr
 
 /// PID of the process on the other end of a Unix socket (Linux SO_PEERCRED).
 /// None if the kernel cannot answer, which is treated as "not our child".
+#[cfg(target_os = "linux")]
 fn peer_pid(stream: &UnixStream) -> Option<u32> {
-    use std::os::unix::io::AsRawFd;
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: getsockopt writes a ucred no larger than `len` into `cred` and
-    // updates `len`; both outlive the call and the fd is owned by `stream`.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    if rc == 0 && cred.pid > 0 {
-        Some(cred.pid as u32)
-    } else {
-        None
-    }
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let cred = getsockopt(stream, PeerCredentials).ok()?;
+    u32::try_from(cred.pid()).ok().filter(|&pid| pid > 0)
+}
+
+/// PID of the process on the other end of a Unix socket (macOS LOCAL_PEERPID;
+/// LOCAL_PEERCRED's xucred carries no pid, so it cannot back this check).
+/// None if the kernel cannot answer, which is treated as "not our child".
+#[cfg(target_os = "macos")]
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+    let pid = getsockopt(stream, LocalPeerPid).ok()?;
+    u32::try_from(pid).ok().filter(|&pid| pid > 0)
 }
 
 /// Subscribe then blocking-read property-change events until EOF (mpv exit
