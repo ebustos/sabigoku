@@ -35,6 +35,7 @@ fn main() {
         Ok(handle) => Some(handle),
         Err(e) => {
             eprintln!("sabigoku: log sink unavailable: {e}");
+            sabigoku::logging::init_stderr_fallback();
             None
         }
     };

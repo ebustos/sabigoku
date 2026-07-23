@@ -41,6 +41,33 @@ pub fn init(data_dir: &Path) -> Result<LoggerHandle, FlexiLoggerError> {
     Ok(handle)
 }
 
+/// Sink-down fallback: without any installed logger the `log` macros are
+/// no-ops, so a worker panic would leave no trace at all. Frame-punching
+/// stderr beats invisible. Level gating rides on `set_max_level`; a second
+/// install attempt is a harmless no-op.
+pub fn init_stderr_fallback() {
+    static FALLBACK: StderrFallback = StderrFallback;
+    if log::set_logger(&FALLBACK).is_ok() {
+        log::set_max_level(if env_debug() {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        });
+    }
+}
+
+struct StderrFallback;
+
+impl log::Log for StderrFallback {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record) {
+        eprintln!("[{}] {}", record.level(), record.args());
+    }
+    fn flush(&self) {}
+}
+
 /// Truthy SABIGOKU_DEBUG turns debug lines on; anything else leaves them off.
 pub fn env_debug() -> bool {
     debug_requested(std::env::var("SABIGOKU_DEBUG").ok().as_deref())
@@ -76,6 +103,34 @@ mod tests {
         for falsy in ["0", "false", "no", "off", "", "2", "maybe"] {
             assert!(!debug_requested(Some(falsy)), "{falsy:?}");
         }
+    }
+
+    #[test]
+    fn spec_strings_parse_and_gate_only_our_crate() {
+        use flexi_logger::LogSpecification;
+        use log::LevelFilter;
+
+        let on = LogSpecification::parse(spec(true)).unwrap();
+        let ours = on
+            .module_filters()
+            .iter()
+            .find(|f| f.module_name.as_deref() == Some("sabigoku"))
+            .expect("sabigoku override present");
+        assert_eq!(ours.level_filter, LevelFilter::Debug);
+        let default = on
+            .module_filters()
+            .iter()
+            .find(|f| f.module_name.is_none())
+            .expect("global default present");
+        assert_eq!(default.level_filter, LevelFilter::Info);
+
+        let off = LogSpecification::parse(spec(false)).unwrap();
+        assert!(off.module_filters().iter().all(|f| f.module_name.is_none()));
+        assert!(
+            off.module_filters()
+                .iter()
+                .all(|f| f.level_filter == LevelFilter::Info)
+        );
     }
 
     // The process has one global-logger slot; this is the only test in the
