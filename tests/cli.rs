@@ -42,13 +42,31 @@ fn subcommand_stubs_exit_zero() {
     for (args, word) in [
         (&["login"][..], "login"),
         (&["login", "--paste"][..], "login"),
-        (&["sync"][..], "sync"),
         (&["--debug", "update"][..], "update"),
     ] {
         let out = run(args);
         assert_eq!(out.status.code(), Some(0), "{args:?}");
         assert!(stdout(&out).contains(word), "{args:?}");
     }
+}
+
+#[test]
+fn sync_without_a_token_reports_not_connected_and_exits_zero() {
+    let dir = std::env::temp_dir().join("sabigoku-cli-test-sync");
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = Command::new(env!("CARGO_BIN_EXE_sabigoku"))
+        .arg("sync")
+        .env("HOME", &dir)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CACHE_HOME")
+        .output()
+        .expect("spawn sabigoku");
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout(&out);
+    assert!(text.contains("not connected"), "{text}");
+    assert!(!text.contains("syncing with AniList"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -77,8 +77,13 @@ pub enum SyncOutcome {
     Disabled,
     NoToken,
     Expired,
-    /// Pull hit 401/429/network; push skipped (06 §5.2).
-    PullFailed,
+    /// Token without a user id (mangled auth.toml; login always stamps one).
+    /// The whole run skips; zigoku skipped only the pull (08 §10, ROD-472).
+    NoUserId,
+    /// 401 on the pull; push skipped (06 §5.2).
+    PullUnauthorized,
+    /// 429 on the pull; push skipped (06 §5.2).
+    PullRateLimited,
     /// 401 during push; run stopped (06 §5.3).
     Unauthorized,
     /// Second 429 during push; run stopped, the rest stay dirty (06 §5.3).
@@ -90,7 +95,12 @@ pub enum SyncOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyncSummary {
     pub outcome: SyncOutcome,
+    /// Transport/decode-failed pull. Not terminal: only 401/429/store errors
+    /// gate the push (06 §5.2); a fetch miss lets the push run.
+    pub pull_failed: bool,
     pub pulled: PullOutcome,
+    /// Size of this run's push work list (dirty rows).
+    pub dirty: u32,
     pub pushed: u32,
     pub push_failed: u32,
 }
@@ -99,7 +109,9 @@ impl SyncSummary {
     pub(crate) fn terminal(outcome: SyncOutcome) -> Self {
         SyncSummary {
             outcome,
+            pull_failed: false,
             pulled: PullOutcome::default(),
+            dirty: 0,
             pushed: 0,
             push_failed: 0,
         }
@@ -115,7 +127,7 @@ fn usable_auth(auth: &Auth, now: i64) -> Result<(&str, i64), SyncOutcome> {
         return Err(SyncOutcome::Expired);
     }
     if auth.anilist.user_id <= 0 {
-        return Err(SyncOutcome::NoToken);
+        return Err(SyncOutcome::NoUserId);
     }
     Ok((token, auth.anilist.user_id))
 }
@@ -139,16 +151,32 @@ pub fn run_sync<A: AniListSync, S: Sleeper>(
         Err(o) => return Ok(SyncSummary::terminal(o)),
     };
     let remote = match client.fetch_list(token, user_id) {
-        Ok(r) => r,
-        Err(_) => return Ok(SyncSummary::terminal(SyncOutcome::PullFailed)),
+        Ok(r) => Some(r),
+        Err(CatalogError::Http { status: 401 }) => {
+            return Ok(SyncSummary::terminal(SyncOutcome::PullUnauthorized));
+        }
+        Err(CatalogError::RateLimited) => {
+            return Ok(SyncSummary::terminal(SyncOutcome::PullRateLimited));
+        }
+        // Transport/decode miss does not gate the push (06 §5.2): the push
+        // has its own transport. The AniList client skips the provider-http
+        // warn path, so the detail is logged here or nowhere.
+        Err(e) => {
+            log::warn!("sync pull: {e}");
+            None
+        }
     };
-    let pulled = store.reconcile_pull(&remote, now)?;
     let mut summary = SyncSummary {
         outcome: SyncOutcome::Completed,
-        pulled,
+        pull_failed: remote.is_none(),
+        pulled: PullOutcome::default(),
+        dirty: 0,
         pushed: 0,
         push_failed: 0,
     };
+    if let Some(remote) = remote {
+        summary.pulled = store.reconcile_pull(&remote, now)?;
+    }
     if pull_only {
         return Ok(summary);
     }
@@ -190,6 +218,7 @@ fn push_dirty<A: AniListSync, S: Sleeper>(
     summary: &mut SyncSummary,
 ) -> Result<(), Error> {
     let dirty = store.list_dirty_for_sync()?;
+    summary.dirty = dirty.len() as u32;
     let mut backed_off = false;
     for (i, row) in dirty.iter().enumerate() {
         if i > 0 {
@@ -215,7 +244,8 @@ fn push_dirty<A: AniListSync, S: Sleeper>(
                     sleeper.sleep(RATE_LIMIT_BACKOFF);
                     // retry the same row
                 }
-                Err(_) => {
+                Err(e) => {
+                    log::warn!("sync push {}: {e}", row.anilist_id);
                     summary.push_failed += 1;
                     break;
                 }
@@ -390,10 +420,63 @@ mod tests {
     }
 
     #[test]
-    fn pull_failure_skips_push() {
+    fn token_without_user_id_skips_the_whole_run() {
         let store = Store::open_memory().unwrap();
-        dirty_lib(&store, 11);
-        let client = FakeAni::new(Err(CatalogError::Http { status: 401 }), vec![Ok(1)]);
+        dirty_lib(&store, 9);
+        let client = FakeAni::new(Ok(vec![]), vec![Ok(1)]);
+        let mut auth = connected(0);
+        auth.anilist.user_id = 0;
+        let out = run_sync(
+            &client,
+            &auth,
+            &store,
+            0,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
+        assert_eq!(out.outcome, SyncOutcome::NoUserId);
+        assert_eq!(*client.pull_calls.borrow(), 0);
+        assert!(client.push_calls.borrow().is_empty());
+    }
+
+    // Both walls have a dirty row staged, so a broken gate would visibly push.
+    #[test]
+    fn pull_401_and_429_skip_the_push() {
+        for (err, want) in [
+            (
+                CatalogError::Http { status: 401 },
+                SyncOutcome::PullUnauthorized,
+            ),
+            (CatalogError::RateLimited, SyncOutcome::PullRateLimited),
+        ] {
+            let store = Store::open_memory().unwrap();
+            dirty_lib(&store, 11);
+            let client = FakeAni::new(Err(err), vec![Ok(1)]);
+            let out = run_sync(
+                &client,
+                &connected(0),
+                &store,
+                0,
+                true,
+                false,
+                &RecordingSleeper::new(),
+            )
+            .unwrap();
+            assert_eq!(out.outcome, want);
+            assert!(
+                client.push_calls.borrow().is_empty(),
+                "push must not run after {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pull_transport_failure_still_pushes() {
+        let store = Store::open_memory().unwrap();
+        dirty_lib(&store, 30);
+        let client = FakeAni::new(Err(CatalogError::Network), vec![Ok(1)]);
         let out = run_sync(
             &client,
             &connected(0),
@@ -404,11 +487,10 @@ mod tests {
             &RecordingSleeper::new(),
         )
         .unwrap();
-        assert_eq!(out.outcome, SyncOutcome::PullFailed);
-        assert!(
-            client.push_calls.borrow().is_empty(),
-            "push must not run after a failed pull"
-        );
+        assert_eq!(out.outcome, SyncOutcome::Completed);
+        assert!(out.pull_failed, "the miss is reported");
+        assert_eq!(out.pushed, 1, "push has its own transport (06 §5.2)");
+        assert_eq!(out.dirty, 1);
     }
 
     #[test]
@@ -454,6 +536,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.outcome, SyncOutcome::Unauthorized);
         assert_eq!(out.pushed, 0);
+        assert_eq!(out.dirty, 2, "work-list size lands in the summary");
         assert_eq!(
             client.push_calls.borrow().len(),
             1,
