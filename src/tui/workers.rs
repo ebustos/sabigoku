@@ -138,7 +138,9 @@ pub fn spawn_connect(
 ) -> bool {
     drain.spawn("connect", move || {
         let result = match AniList::new() {
-            Ok(client) => loopback.serve(&client, &auth_path, now),
+            Ok(client) => loopback.serve(&client, &auth_path, now, || {
+                log::warn!("connect: ignoring a callback with a bad state");
+            }),
             Err(_) => ConnectResult::NetworkError,
         };
         if result != ConnectResult::Canceled {

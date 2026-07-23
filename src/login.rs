@@ -18,9 +18,40 @@ const AUTHORIZE_ENDPOINT: &str = "https://anilist.co/api/v2/oauth/authorize";
 /// Implicit-grant tokens are ~1y JWTs; anything shorter is not one (06 §4.2).
 const TOKEN_FLOOR: usize = 20;
 
+/// The authorize URL without `state`: the paste flow has no CSRF check to
+/// anchor one (06 §4.1/§4.3), so it carries none, like zigoku's.
+pub fn authorize_url_bare() -> String {
+    format!("{AUTHORIZE_ENDPOINT}?client_id={CLIENT_ID}&response_type=token")
+}
+
 /// The Implicit-grant authorize URL with the CSRF nonce as `state` (06 §4.1).
 pub fn authorize_url(state: &str) -> String {
-    format!("{AUTHORIZE_ENDPOINT}?client_id={CLIENT_ID}&response_type=token&state={state}")
+    format!("{}&state={state}", authorize_url_bare())
+}
+
+/// A pasted bare JWT (zigoku extractToken parity) becomes an extractable
+/// param; anything else passes through for the normal redirect-URL extract.
+pub fn normalize_paste(line: &str) -> String {
+    if line.starts_with("eyJ") {
+        format!("access_token={line}")
+    } else {
+        line.to_string()
+    }
+}
+
+/// Open a URL in the user's browser, best-effort: a failure just means the
+/// user opens the printed URL themselves. Detached, never blocks the caller.
+pub fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    const OPEN_CMD: &str = "open";
+    #[cfg(not(target_os = "macos"))]
+    const OPEN_CMD: &str = "xdg-open";
+    let _ = std::process::Command::new(OPEN_CMD)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Outcome of a connect attempt, posted to the TUI. Never `Ok` unless the token
@@ -159,6 +190,19 @@ mod tests {
         assert!(u.contains("client_id=46528"));
         assert!(u.contains("response_type=token"));
         assert!(u.contains("state=nonce123"));
+        // The paste flow has no CSRF anchor, so its URL carries no state at all.
+        assert!(!authorize_url_bare().contains("state"));
+    }
+
+    #[test]
+    fn normalize_paste_wraps_a_bare_jwt_and_passes_urls_through() {
+        assert_eq!(
+            normalize_paste("eyJabc.def.ghi"),
+            "access_token=eyJabc.def.ghi"
+        );
+        let url = "http://localhost:8766/#access_token=tok&state=n";
+        assert_eq!(normalize_paste(url), url);
+        assert_eq!(normalize_paste(""), "");
     }
 
     #[test]
