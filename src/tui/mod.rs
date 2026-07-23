@@ -59,10 +59,13 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
     ]));
     let mut terminal = ratatui::init();
     scope_panic_hook_to_main_thread();
-    // The protocol query can stall for seconds where the terminal answers
-    // late or not at all (tmux); paint a minimal DESIGN 5.6 startup frame
-    // first so the wait is never a black screen.
-    let _ = terminal.draw(|frame| draw_startup_frame(frame, config));
+    // The protocol query can stall for seconds where the terminal answers late
+    // or not at all; paint a minimal DESIGN 5.6 startup frame first so the wait
+    // is never a black screen. A prompt-answering local terminal has no stall to
+    // cover, so the splash would only flash then get overwritten (ROD-474).
+    if splash_wanted(&config.image_protocol, slow_query_env()) {
+        let _ = terminal.draw(|frame| draw_startup_frame(frame, config));
+    }
     // Protocol query must run after entering the alternate screen and BEFORE
     // the input thread exists: it reads stdio itself (04 §3 query leftovers).
     // `image_protocol = "halfblocks"` skips the query outright: no stall, and
@@ -145,6 +148,21 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
     result
 }
 
+/// The splash earns its paint only when a stall-prone query will run:
+/// `halfblocks` issues no query, so it has nothing to cover regardless of
+/// terminal.
+fn splash_wanted(image_protocol: &str, slow_query_env: bool) -> bool {
+    image_protocol != "halfblocks" && slow_query_env
+}
+
+/// Environments whose DA reply arrives late or never: a terminal multiplexer
+/// (tmux/screen) or an ssh session.
+fn slow_query_env() -> bool {
+    ["TMUX", "STY", "SSH_TTY", "SSH_CONNECTION"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some())
+}
+
 /// Minimal DESIGN 5.6 startup frame, painted before the protocol query so a
 /// slow-answering terminal never shows a black hole. The real views take over
 /// on the first loop draw.
@@ -179,4 +197,21 @@ fn scope_panic_hook_to_main_thread() {
             restore_hook(info);
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::splash_wanted;
+
+    #[test]
+    fn splash_only_when_a_stall_prone_query_will_run() {
+        // halfblocks issues no query, so nothing to cover in any environment.
+        assert!(!splash_wanted("halfblocks", true));
+        assert!(!splash_wanted("halfblocks", false));
+        // A querying protocol wants the splash only where the reply can lag.
+        assert!(splash_wanted("kitty", true));
+        assert!(splash_wanted("auto", true));
+        assert!(!splash_wanted("kitty", false));
+        assert!(!splash_wanted("auto", false));
+    }
 }
