@@ -10,6 +10,7 @@ pub mod error;
 pub mod fetchguard;
 pub mod login;
 pub mod loopback;
+pub mod nonce;
 pub mod paths;
 pub mod player;
 pub mod providers;
