@@ -130,6 +130,15 @@ pub const USAGE: &str = "  usage: sabigoku <query> [--dub] [--quality <q>] [--de
   ~/.local/share/sabigoku/sabigoku.log in the TUI.
 ";
 
+/// Whether a completed stdin read yields a usable paste line, given the byte
+/// count and the buffer. Ratified looser than zigoku (08 §10): a complete line
+/// is accepted even without a trailing newline, so a newline-less pipe still
+/// logs in. Only an empty EOF (`n == 0`) or a cap-length read with no newline
+/// (a truncated overlong paste) aborts. `cap` is the reader's byte ceiling.
+pub fn paste_line_usable(n: usize, line: &str, cap: u64) -> bool {
+    n != 0 && (line.ends_with('\n') || (line.len() as u64) < cap)
+}
+
 /// Login outcome line (zigoku login/login_loopback wording, punctuation ours).
 /// `paste` picks the retry coaching: re-copy the fragment vs re-run the flow.
 /// BadState/Canceled never reach the CLI (serve waits through bad states, and
@@ -137,10 +146,10 @@ pub const USAGE: &str = "  usage: sabigoku <query> [--dub] [--quality <q>] [--de
 pub fn render_connect_result(result: &ConnectResult, auth_path: &Path, paste: bool) -> String {
     match result {
         ConnectResult::Ok { user_name } => {
-            format!(
-                "  ✓ signed in as {user_name}. Saved to {}.\n",
-                auth_path.display()
-            )
+            // AniList-supplied name reaches a raw CLI println with no ratatui
+            // backstop; strip terminal-hostile bytes before it prints.
+            let name = crate::domain::strip_controls(user_name.clone());
+            format!("  ✓ signed in as {name}. Saved to {}.\n", auth_path.display())
         }
         ConnectResult::NoToken if paste => {
             "  ✗ couldn't find an access_token in that; aborted.\n".into()
@@ -514,6 +523,38 @@ mod tests {
         let text = render_sync_summary(&s);
         assert!(text.contains("pull failed"), "{text}");
         assert!(text.contains("pushed 2 of 2"), "{text}");
+    }
+
+    #[test]
+    fn paste_line_accepts_a_complete_line_with_or_without_a_trailing_newline() {
+        const CAP: u64 = 8192;
+        // Empty EOF aborts.
+        assert!(!paste_line_usable(0, "", CAP));
+        // A complete line with a newline is usable.
+        assert!(paste_line_usable(10, "a-url-here\n", CAP));
+        // Ratified looser than zigoku: no trailing newline is still usable when
+        // the read is short of the cap (a genuine EOF-terminated line).
+        assert!(paste_line_usable(9, "a-url-her", CAP));
+        // A cap-length read with no newline is truncation: abort.
+        let maxed = "x".repeat(CAP as usize);
+        assert!(!paste_line_usable(CAP as usize, &maxed, CAP));
+        // A cap-length read that DID end in a newline is a real line at the edge.
+        let mut edge = "x".repeat((CAP - 1) as usize);
+        edge.push('\n');
+        assert!(paste_line_usable(CAP as usize, &edge, CAP));
+    }
+
+    #[test]
+    fn ok_result_strips_control_bytes_from_the_anilist_name() {
+        let hostile = ConnectResult::Ok {
+            user_name: "ro\u{1b}[31md\u{202e}".into(),
+        };
+        let text = render_connect_result(&hostile, Path::new("/tmp/auth.toml"), false);
+        // The ESC and the bidi override (the teeth) are gone; any inert literal
+        // residue is harmless without them.
+        assert!(text.contains("signed in as"), "{text}");
+        assert!(!text.contains('\u{1b}'), "escape leaked: {text:?}");
+        assert!(!text.contains('\u{202e}'), "bidi leaked: {text:?}");
     }
 
     #[test]

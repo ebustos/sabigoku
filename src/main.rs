@@ -179,18 +179,15 @@ fn paste_login(client: &sabigoku::anilist::AniList, auth_path: &Path, now: i64) 
     matches!(result, sabigoku::login::ConnectResult::Ok { .. })
 }
 
-/// One stdin line, capped. None on EOF, read error, or an overlong paste (a
-/// cap-length read with no newline can only be truncation).
+/// One stdin line, capped. None on EOF, read error, or an overlong paste;
+/// `cli::paste_line_usable` owns the accept/abort rule (08 §10 ratified).
 fn read_paste_line() -> Option<String> {
     use std::io::{BufRead, BufReader, Read};
     let mut line = String::new();
     let n = BufReader::new(std::io::stdin().lock().take(PASTE_CAP))
         .read_line(&mut line)
         .ok()?;
-    if n == 0 || (!line.ends_with('\n') && line.len() as u64 >= PASTE_CAP) {
-        return None;
-    }
-    Some(line)
+    cli::paste_line_usable(n, &line, PASTE_CAP).then_some(line)
 }
 
 fn flush_stdout() {

@@ -137,9 +137,16 @@ pub fn spawn_connect(
     now: i64,
 ) -> bool {
     drain.spawn("connect", move || {
+        // Warn once per worker, not per hit: a local page hammering the port
+        // with forged callbacks must not churn the rotating log sink (the
+        // serve loop keeps waiting through every one, by design).
+        let mut warned = false;
         let result = match AniList::new() {
             Ok(client) => loopback.serve(&client, &auth_path, now, || {
-                log::warn!("connect: ignoring a callback with a bad state");
+                if !warned {
+                    log::warn!("connect: ignoring callback(s) with a bad state");
+                    warned = true;
+                }
             }),
             Err(_) => ConnectResult::NetworkError,
         };

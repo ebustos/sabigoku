@@ -136,7 +136,12 @@ impl Loopback {
         auth_path: &Path,
         now: i64,
     ) -> Option<ConnectResult> {
-        let _ = stream.set_read_timeout(Some(READ_DEADLINE));
+        // The whole "no overall timeout" design (06 §4.4) leans on this
+        // per-connection deadline; if it cannot be set, drop the socket rather
+        // than risk a silent unbounded read wedging the single accept loop.
+        if stream.set_read_timeout(Some(READ_DEADLINE)).is_err() {
+            return None;
+        }
         let mut buf = [0u8; 8192];
         let n = stream.read(&mut buf).ok()?;
         let req = String::from_utf8_lossy(&buf[..n]);
@@ -321,6 +326,10 @@ mod tests {
             );
 
             let mut c2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            // If a regression made the forged callback terminal, serve() has
+            // already returned and this write/read finds nothing to service it;
+            // the deadline turns that into a fast failure, not a hung binary.
+            c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             c2.write_all(
                 format!("GET /callback?access_token={TOKEN}&state={nonce} HTTP/1.1\r\n\r\n")
                     .as_bytes(),
