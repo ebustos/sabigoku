@@ -417,6 +417,7 @@ impl StreamProvider for MegaPlay {
             );
             ProviderError::Decode("no data-id".into())
         })?;
+        log::debug!("megaplay resolve: ep {n} {tt:?} data-id={data_id}");
 
         let src_url = format!("{}/stream/getSources?id={data_id}", self.host);
         let raw = self.xhr_get(&src_url)?;
@@ -432,6 +433,10 @@ impl StreamProvider for MegaPlay {
             if candidates.len() >= 2
                 && let Some(best) = self.refine_subtitle_by_cues(&candidates, &baseline)
             {
+                log::debug!(
+                    "megaplay resolve: softsub upgraded to highest-cue track from {} candidate(s)",
+                    candidates.len()
+                );
                 sources.link.sub_url = Some(best);
             }
         }

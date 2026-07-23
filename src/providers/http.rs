@@ -42,6 +42,13 @@ pub struct Request<'a> {
     pub deadline: Option<Duration>,
 }
 
+/// Provider-controlled URLs are untrusted: strip control bytes so a forged
+/// CR/LF can't inject a fake log record. Query may carry ephemeral CDN params
+/// but never our AniList token (that client is a separate path).
+fn log_url(url: &str) -> String {
+    crate::domain::strip_controls(url.to_string())
+}
+
 pub struct HttpClient {
     http: reqwest::blocking::Client,
 }
@@ -74,7 +81,7 @@ impl HttpClient {
             builder = builder.timeout(deadline);
         }
         let resp = builder.send().map_err(|e| {
-            log::warn!("{:?} {}: transport {e}", req.method, req.url);
+            log::warn!("{:?} {}: transport {e}", req.method, log_url(req.url));
             ProviderError::Network
         })?;
         let status = resp.status().as_u16();
@@ -83,7 +90,7 @@ impl HttpClient {
             Accept::Any2xx => resp.status().is_success(),
         };
         if !ok {
-            log::warn!("{:?} {}: HTTP {status}", req.method, req.url);
+            log::warn!("{:?} {}: HTTP {status}", req.method, log_url(req.url));
             return Err(ProviderError::from_status(status));
         }
         let mut buf = Vec::new();
@@ -95,6 +102,12 @@ impl HttpClient {
                 "response exceeds the 4 MiB cap".into(),
             ));
         }
+        log::debug!(
+            "{:?} {}: HTTP {status} ({} bytes)",
+            req.method,
+            log_url(req.url),
+            buf.len()
+        );
         Ok(buf)
     }
 }
@@ -115,6 +128,16 @@ mod tests {
             accept,
             deadline: None,
         })
+    }
+
+    #[test]
+    fn log_url_strips_control_bytes_that_could_forge_a_record() {
+        // A CR/LF in a provider-supplied URL must not split the log line into a
+        // second, attacker-authored record.
+        let forged = "http://cdn.test/v.m3u8?sig=abc\r\n[2026] INFO forged";
+        let safe = log_url(forged);
+        assert!(!safe.contains('\r') && !safe.contains('\n'));
+        assert!(safe.starts_with("http://cdn.test/v.m3u8?sig=abc"));
     }
 
     #[test]
