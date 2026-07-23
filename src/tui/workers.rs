@@ -656,7 +656,7 @@ impl Drain {
                         .copied()
                         .or_else(|| cause.downcast_ref::<String>().map(String::as_str))
                         .unwrap_or("unknown panic payload");
-                    eprintln!("worker panicked: {msg}");
+                    log::error!("worker panicked: {msg}");
                 }
             })
             .is_ok()
