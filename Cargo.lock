@@ -2182,7 +2182,7 @@ dependencies = [
  "aes-gcm",
  "base64",
  "image",
- "libc",
+ "nix",
  "ratatui",
  "ratatui-image",
  "reqwest",

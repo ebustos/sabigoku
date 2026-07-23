@@ -178,9 +178,8 @@ mod tests {
     fn fifo_path_is_defaults_not_a_hang() {
         let path = tmp("fifo.toml");
         let _ = std::fs::remove_file(&path);
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        // SAFETY: mkfifo on a fresh path (removed just above).
-        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        use nix::sys::stat::Mode;
+        nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let p = path.clone();
         std::thread::spawn(move || {

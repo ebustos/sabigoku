@@ -248,9 +248,8 @@ mod tests {
     fn fifo_path_is_signed_out_not_a_hang() {
         let path = tmp("fifo.toml");
         let _ = std::fs::remove_file(&path);
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        // SAFETY: mkfifo on a fresh owner-only path (removed just above).
-        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        use nix::sys::stat::Mode;
+        nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         // Load off-thread with a deadline: a regressed guard would block on the
         // FIFO open forever, so a hang must fail the test rather than wedge it.
         let (tx, rx) = std::sync::mpsc::channel();
