@@ -626,6 +626,9 @@ impl StreamProvider for AllAnime {
         // the quality pref has nothing to pick. Unsafe match falls to long
         // tail.
         if let Some(sl) = fast4speed_pick(&sources) {
+            log::debug!(
+                "allanime resolve: fast4speed direct 1080p, quality={quality:?} not applicable"
+            );
             return Ok(sl);
         }
 
@@ -642,9 +645,16 @@ impl StreamProvider for AllAnime {
             let _ = self.follow_provider(hex, &mut variants);
         }
         // Sources existed but none playable: CDN failure, not hash rotation.
-        hls::select_variant(&variants, quality)
+        let n = variants.len();
+        let pick = hls::select_variant(&variants, quality)
             .cloned()
-            .ok_or_else(|| ProviderError::Decode("no playable variant".into()))
+            .ok_or_else(|| ProviderError::Decode("no playable variant".into()))?;
+        log::debug!(
+            "allanime resolve: quality={quality:?} picked {}p from {n} variant(s)",
+            pick.resolution
+                .map_or_else(|| "?".to_string(), |r| r.to_string())
+        );
+        Ok(pick)
     }
 
     /// Cover ref → fetch request (ROD-267). Absolute as-is; relative

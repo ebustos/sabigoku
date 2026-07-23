@@ -95,6 +95,14 @@ impl HttpClient {
                 "response exceeds the 4 MiB cap".into(),
             ));
         }
+        // Safe to log the full URL: provider requests never carry a token (the
+        // AniList client is a separate path).
+        log::debug!(
+            "{:?} {}: HTTP {status} ({} bytes)",
+            req.method,
+            req.url,
+            buf.len()
+        );
         Ok(buf)
     }
 }

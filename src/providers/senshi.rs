@@ -391,7 +391,14 @@ impl Senshi {
                 });
             }
         }
-        super::hls::select_variant(&links, quality).map(|l| l.url.clone())
+        let n = links.len();
+        let pick = super::hls::select_variant(&links, quality)?;
+        log::debug!(
+            "senshi resolve: quality={quality:?} picked {}p from {n} variant(s)",
+            pick.resolution
+                .map_or_else(|| "?".to_string(), |r| r.to_string())
+        );
+        Some(pick.url.clone())
     }
 
     /// Follow `serverFM` to a soft-sub .vtt, or None to play raw. Host URL:
