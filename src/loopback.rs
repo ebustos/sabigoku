@@ -102,8 +102,17 @@ impl Loopback {
     }
 
     /// Block until a callback completes login, the user cancels, or accept dies.
-    /// A relay hit is not terminal: keep waiting for the /callback.
-    pub fn serve<V: Verifier>(&self, verifier: &V, auth_path: &Path, now: i64) -> ConnectResult {
+    /// A relay hit is not terminal: keep waiting for the /callback. Neither is a
+    /// bad-state callback (zigoku ROD-283): a stray or forged local request must
+    /// not abort a login in flight, so it gets the fail page, `on_bad_state`
+    /// fires, and the wait continues.
+    pub fn serve<V: Verifier>(
+        &self,
+        verifier: &V,
+        auth_path: &Path,
+        now: i64,
+        mut on_bad_state: impl FnMut(),
+    ) -> ConnectResult {
         loop {
             let stream = match self.listener.accept() {
                 Ok((s, _)) => s,
@@ -112,8 +121,10 @@ impl Loopback {
             if self.cancel.load(Ordering::Acquire) {
                 return ConnectResult::Canceled;
             }
-            if let Some(result) = self.handle(stream, verifier, auth_path, now) {
-                return result;
+            match self.handle(stream, verifier, auth_path, now) {
+                Some(ConnectResult::BadState) => on_bad_state(),
+                Some(result) => return result,
+                None => {}
             }
         }
     }
@@ -125,7 +136,12 @@ impl Loopback {
         auth_path: &Path,
         now: i64,
     ) -> Option<ConnectResult> {
-        let _ = stream.set_read_timeout(Some(READ_DEADLINE));
+        // The whole "no overall timeout" design (06 §4.4) leans on this
+        // per-connection deadline; if it cannot be set, drop the socket rather
+        // than risk a silent unbounded read wedging the single accept loop.
+        if stream.set_read_timeout(Some(READ_DEADLINE)).is_err() {
+            return None;
+        }
         let mut buf = [0u8; 8192];
         let n = stream.read(&mut buf).ok()?;
         let req = String::from_utf8_lossy(&buf[..n]);
@@ -235,7 +251,7 @@ mod tests {
         let verifier = FakeV;
 
         let result = std::thread::scope(|s| {
-            let h = s.spawn(|| lp.serve(&verifier, &path, 1000));
+            let h = s.spawn(|| lp.serve(&verifier, &path, 1000, || {}));
 
             // First hit: any path -> relay HTML.
             let mut c1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -274,31 +290,57 @@ mod tests {
         assert_eq!(Auth::load(&path).anilist.bearer(), Some(TOKEN));
     }
 
+    // The forged callback must neither persist nor end the wait (zigoku
+    // ROD-283); the real callback afterward still completes the login.
     #[test]
-    fn callback_with_wrong_state_is_bad_state_and_writes_nothing() {
+    fn callback_with_wrong_state_warns_and_keeps_waiting() {
+        use std::sync::atomic::AtomicU32;
+
         let path = tmp("badstate.toml");
         let _ = std::fs::remove_file(&path);
         let lp = Loopback::bind_port(0).unwrap();
         let port = lp.port();
+        let url = lp.authorize_url();
+        let nonce = param(&url, "state").unwrap();
         let verifier = FakeV;
+        let bad_hits = AtomicU32::new(0);
 
         let result = std::thread::scope(|s| {
-            let h = s.spawn(|| lp.serve(&verifier, &path, 0));
+            let h = s.spawn(|| {
+                lp.serve(&verifier, &path, 0, || {
+                    bad_hits.fetch_add(1, Ordering::Relaxed);
+                })
+            });
+
             let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
             c.write_all(
                 format!("GET /callback?access_token={TOKEN}&state=forged HTTP/1.1\r\n\r\n")
                     .as_bytes(),
             )
             .unwrap();
-            let _ = read_response(c);
+            let forged = read_response(c);
+            assert!(forged.contains("sign-in didn't complete"), "{forged}");
+            assert!(
+                !path.exists(),
+                "a forged state must never verify or persist"
+            );
+
+            let mut c2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            // If a regression made the forged callback terminal, serve() has
+            // already returned and this write/read finds nothing to service it;
+            // the deadline turns that into a fast failure, not a hung binary.
+            c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c2.write_all(
+                format!("GET /callback?access_token={TOKEN}&state={nonce} HTTP/1.1\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            let _ = read_response(c2);
             h.join().unwrap()
         });
 
-        assert_eq!(result, ConnectResult::BadState);
-        assert!(
-            !path.exists(),
-            "a forged state must never verify or persist"
-        );
+        assert!(matches!(result, ConnectResult::Ok { .. }), "{result:?}");
+        assert_eq!(bad_hits.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -330,7 +372,7 @@ mod tests {
         let verifier = FakeV;
 
         let result = std::thread::scope(|s| {
-            let h = s.spawn(|| lp.serve(&verifier, &path, 0));
+            let h = s.spawn(|| lp.serve(&verifier, &path, 0, || {}));
             canceler.cancel();
             h.join().unwrap()
         });

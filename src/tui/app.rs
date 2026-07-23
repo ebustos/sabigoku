@@ -1309,7 +1309,7 @@ impl App {
             }
         };
         let url = loopback.authorize_url();
-        open_browser(&url);
+        crate::login::open_browser(&url);
         let canceler = loopback.canceler();
         let started = workers::spawn_connect(
             &self.sync_drain,
@@ -2127,21 +2127,6 @@ fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
-}
-
-/// Open a URL in the user's browser, best-effort: a failure just means the user
-/// falls back to the copy-link key. Detached so it never blocks the render path.
-fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    const OPEN_CMD: &str = "open";
-    #[cfg(not(target_os = "macos"))]
-    const OPEN_CMD: &str = "xdg-open";
-    let _ = std::process::Command::new(OPEN_CMD)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
 
 /// Copy `text` to the system clipboard via OSC 52. Terminal-mediated (works
