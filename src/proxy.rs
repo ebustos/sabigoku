@@ -7,12 +7,13 @@
 //! flag reaches the inner segment demuxer, so the bytes must be stripped before
 //! mpv sees them.
 //!
-//! Shape: mpv talks plaintext HTTP to `127.0.0.1:<ephemeral>/r.ts?u=<pct
-//! upstream>`. Each request fetches the upstream (TLS, referer + UA), then
-//! either:
-//!   - playlist (`#EXTM3U`): rewrite every URI to another `/r.ts?u=…` loopback
-//!     ref so variants and segments route back through here (relatives joined
-//!     via hls::join_url).
+//! Shape: mpv talks plaintext HTTP to `127.0.0.1:<ephemeral>/r.ts?t=<token>&u=
+//! <pct upstream>`. `t` is a random per-playback token (ROD-447): without it
+//! any local process that scans ephemeral ports gets a free SSRF-guarded relay.
+//! Each request fetches the upstream (TLS, referer + UA), then either:
+//!   - playlist (`#EXTM3U`): rewrite every URI to another tokened `/r.ts?t=…&u=…`
+//!     loopback ref so variants and segments route back through here (relatives
+//!     joined via hls::join_url).
 //!   - segment: strip the prefix to the first TS-sync triple, stream the rest.
 //!
 //! Content-sniffing avoids parsing STREAM-INF vs EXTINF; scanning for the sync
@@ -66,11 +67,15 @@ const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// and the connection closes.
 const MAX_HEAD_BYTES: u64 = 16 * 1024;
 
-/// Loopback request path + query prefix. The `.ts` suffix is deliberate: it sits
-/// in ffmpeg's default extension allowlist, so mpv never trips the HLS extension
-/// gate on our extensionless upstreams. `u` carries the fully pct-encoded
-/// upstream url (dots encoded too, so `.ts` is the only extension).
-const PATH_PREFIX: &str = "/r.ts?u=";
+/// Loopback request path + query head: `/r.ts?t=<token>&u=`. The `.ts` suffix is
+/// deliberate: it sits in ffmpeg's default extension allowlist, so mpv never
+/// trips the HLS extension gate on our extensionless upstreams; the hex token
+/// carries no dot, so `.ts` stays the only extension. A wrong or missing token
+/// 404s exactly like an unknown path: no oracle separates the two. `u` carries
+/// the fully pct-encoded upstream url.
+fn path_prefix(token: &str) -> String {
+    format!("/r.ts?t={token}&u=")
+}
 
 const STATUS_OK: &str = "200 OK";
 const STATUS_NOT_FOUND: &str = "404 Not Found";
@@ -114,7 +119,7 @@ pub fn engage(link: &StreamLink) -> Result<Decloak, ProxyStartError> {
         });
     }
     let proxy = Proxy::start(link)?;
-    let url = build_loopback_url(proxy.port, &link.url);
+    let url = build_loopback_url(proxy.port, &proxy.path_prefix, &link.url);
     Ok(Decloak {
         proxy: Some(proxy),
         url,
@@ -128,10 +133,16 @@ pub enum ProxyStartError {
 
     #[error("build http client: {0}")]
     Client(#[from] reqwest::Error),
+
+    #[error("mint playback token: {0}")]
+    Token(io::Error),
 }
 
 struct Proxy {
     port: u16,
+    /// This playback's tokened [`path_prefix`]; the prefix match in `serve` is
+    /// the auth gate (ROD-447).
+    path_prefix: String,
     listener: TcpListener,
     http: reqwest::blocking::Client,
     /// Duped from the link so handler threads never alias the caller's data.
@@ -147,6 +158,7 @@ impl Proxy {
     fn start(link: &StreamLink) -> Result<Arc<Proxy>, ProxyStartError> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
+        let token = crate::nonce::mint().map_err(ProxyStartError::Token)?;
         // identity + no redirect: bytes need no decompression before de-cloak,
         // and 3xx is handled by hand in fetch_upstream so every hop is guarded.
         let http = reqwest::blocking::Client::builder()
@@ -154,6 +166,7 @@ impl Proxy {
             .build()?;
         let proxy = Arc::new(Proxy {
             port,
+            path_prefix: path_prefix(&token),
             listener,
             http,
             referer: link.referer.clone(),
@@ -245,10 +258,11 @@ impl Proxy {
         }
     }
 
-    /// Serve one loopback request. Non-`/r.ts?u=` paths 404; any upstream/serve
-    /// failure is a 502. Both close the connection; a success keeps it alive.
+    /// Serve one loopback request. Off-prefix targets (path or token) 404; any
+    /// upstream failure is a 502. Both close the connection. The prefix compare
+    /// is not constant-time: accepted, loopback jitter drowns a timing probe.
     fn serve(&self, target: &str, writer: &mut impl Write) -> io::Result<KeepAlive> {
-        let Some(encoded) = target.strip_prefix(PATH_PREFIX) else {
+        let Some(encoded) = target.strip_prefix(self.path_prefix.as_str()) else {
             return close_with(writer, STATUS_NOT_FOUND);
         };
         let upstream = match percent_decode(encoded)
@@ -268,7 +282,13 @@ impl Proxy {
             Ok(fetched) => fetched,
             Err(_) => return close_with(writer, STATUS_BAD_GATEWAY),
         };
-        respond(writer, &fetched.body, &fetched.final_url, self.port)
+        respond(
+            writer,
+            &fetched.body,
+            &fetched.final_url,
+            self.port,
+            &self.path_prefix,
+        )
     }
 }
 
@@ -281,6 +301,7 @@ fn respond(
     body: &[u8],
     final_url: &str,
     port: u16,
+    prefix: &str,
 ) -> io::Result<KeepAlive> {
     if is_playlist(body) {
         // is_playlist already proved a text `#EXTM3U` head with no NUL; a body
@@ -288,7 +309,7 @@ fn respond(
         let Ok(text) = std::str::from_utf8(body) else {
             return close_with(writer, STATUS_BAD_GATEWAY);
         };
-        let rewritten = rewrite_playlist(text, final_url, port);
+        let rewritten = rewrite_playlist(text, final_url, port, prefix);
         write_response(
             writer,
             STATUS_OK,
@@ -514,7 +535,7 @@ fn url_bytes_clean(s: &str) -> bool {
 /// segments route back through the proxy. URI lines and `URI="…"` tag attributes
 /// (KEY/MEDIA/MAP) are joined against `base_url` and re-pointed; comments and
 /// blanks pass through.
-fn rewrite_playlist(text: &str, base_url: &str, port: u16) -> String {
+fn rewrite_playlist(text: &str, base_url: &str, port: u16, prefix: &str) -> String {
     let mut out = String::new();
     let mut first = true;
     for raw in text.split('\n') {
@@ -527,9 +548,9 @@ fn rewrite_playlist(text: &str, base_url: &str, port: u16) -> String {
             continue;
         }
         if line.starts_with('#') {
-            out.push_str(&rewrite_tag_uri(line, base_url, port));
+            out.push_str(&rewrite_tag_uri(line, base_url, port, prefix));
         } else if let Some(abs) = join_url(base_url, line) {
-            out.push_str(&build_loopback_url(port, &abs));
+            out.push_str(&build_loopback_url(port, prefix, &abs));
         } else {
             out.push_str(line);
         }
@@ -539,7 +560,7 @@ fn rewrite_playlist(text: &str, base_url: &str, port: u16) -> String {
 
 /// Re-point a `URI="…"` attribute inside a tag line; lines without one pass
 /// through unchanged.
-fn rewrite_tag_uri(line: &str, base_url: &str, port: u16) -> String {
+fn rewrite_tag_uri(line: &str, base_url: &str, port: u16, prefix: &str) -> String {
     let key = "URI=\"";
     let Some(at) = line.find(key) else {
         return line.to_string();
@@ -552,14 +573,15 @@ fn rewrite_tag_uri(line: &str, base_url: &str, port: u16) -> String {
     let Some(abs) = join_url(base_url, &line[vstart..vend]) else {
         return line.to_string();
     };
-    let loopback = build_loopback_url(port, &abs);
+    let loopback = build_loopback_url(port, prefix, &abs);
     format!("{}{}{}", &line[..vstart], loopback, &line[vend..])
 }
 
-/// `http://127.0.0.1:<port>/r.ts?u=<pct upstream>`.
-fn build_loopback_url(port: u16, upstream: &str) -> String {
+/// `http://127.0.0.1:<port><prefix><pct upstream>` where `prefix` is this
+/// playback's tokened [`path_prefix`].
+fn build_loopback_url(port: u16, prefix: &str, upstream: &str) -> String {
     format!(
-        "http://127.0.0.1:{port}{PATH_PREFIX}{}",
+        "http://127.0.0.1:{port}{prefix}{}",
         percent_encode(upstream)
     )
 }
@@ -746,11 +768,15 @@ mod tests {
     #[test]
     fn build_loopback_url_encodes_upstream_into_a_decodable_ref() {
         let up = "https://cdn.example/seg/000.ts?sig=xyz";
-        let lb = build_loopback_url(3210, up);
-        assert!(lb.starts_with("http://127.0.0.1:3210/r.ts?u="));
-        // Only the synthetic path extension; no literal dot from the upstream.
+        let prefix = path_prefix("0123abcd");
+        let lb = build_loopback_url(3210, &prefix, up);
+        assert!(lb.starts_with("http://127.0.0.1:3210/r.ts?t=0123abcd&u="));
+        // Only the synthetic path extension; no literal dot from the upstream
+        // (the hex token cannot carry one).
         assert_eq!(lb.matches(".ts").count(), 1);
-        let enc = lb.strip_prefix("http://127.0.0.1:3210/r.ts?u=").unwrap();
+        let enc = lb
+            .strip_prefix("http://127.0.0.1:3210/r.ts?t=0123abcd&u=")
+            .unwrap();
         assert_eq!(percent_decode(enc).unwrap(), up.as_bytes());
     }
 
@@ -763,20 +789,24 @@ mod tests {
             480/index.m3u8\n\
             #EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1920x1080\n\
             https://other.cdn/1080/index.m3u8\n";
-        let out = rewrite_playlist(master, base, 45678);
+        let prefix = path_prefix("feedc0de");
+        let out = rewrite_playlist(master, base, 45678, &prefix);
 
         assert!(out.starts_with("#EXTM3U\n"));
-        assert!(out.contains("http://127.0.0.1:45678/r.ts?u="));
+        // Every rewritten ref carries the playback token.
+        assert!(out.contains("http://127.0.0.1:45678/r.ts?t=feedc0de&u="));
         // The absolute variant is encoded (no bare https:// left on a URI line).
         assert!(!out.contains("\nhttps://other.cdn/1080"));
         // The audio rendition URI attribute was rewritten in place.
-        assert!(out.contains("#EXT-X-MEDIA:TYPE=AUDIO,URI=\"http://127.0.0.1:45678/r.ts?u="));
+        assert!(
+            out.contains("#EXT-X-MEDIA:TYPE=AUDIO,URI=\"http://127.0.0.1:45678/r.ts?t=feedc0de&u=")
+        );
         // Every rewritten target decodes back to a real upstream url.
         for line in out.split('\n') {
-            let Some(at) = line.find("/r.ts?u=") else {
+            let Some(at) = line.find("&u=") else {
                 continue;
             };
-            let mut enc = &line[at + "/r.ts?u=".len()..];
+            let mut enc = &line[at + "&u=".len()..];
             if let Some(q) = enc.find('"') {
                 enc = &enc[..q];
             }
@@ -820,6 +850,26 @@ mod tests {
         ));
     }
 
+    /// Split a live guard url into (host:port, tokened path prefix).
+    fn split_guard_url(url: &str) -> (String, String) {
+        let rest = url.strip_prefix("http://").unwrap();
+        let slash = rest.find('/').unwrap();
+        let host = rest[..slash].to_string();
+        let path = &rest[slash..];
+        let u_end = path.find("&u=").unwrap() + "&u=".len();
+        (host, path[..u_end].to_string())
+    }
+
+    /// One raw request over a fresh connection; the error paths under test all
+    /// close it, so read-to-EOF returns the full response.
+    fn roundtrip(host: &str, raw: &str) -> String {
+        let mut client = TcpStream::connect(host).unwrap();
+        client.write_all(raw.as_bytes()).unwrap();
+        let mut buf = String::new();
+        client.read_to_string(&mut buf).unwrap();
+        buf
+    }
+
     #[test]
     fn proxy_lifecycle_stop_wakes_accept_and_does_not_hang() {
         let link = StreamLink {
@@ -834,42 +884,69 @@ mod tests {
         // parse/response path with no upstream fetch (no network). A 404 closes
         // the connection. stop() (via Drop) must self-dial to unblock accept and
         // join; a regression here hangs under the test timeout.
-        let host = guard
-            .url()
-            .strip_prefix("http://")
-            .and_then(|r| r.split('/').next())
-            .unwrap()
-            .to_string();
-        let mut client = TcpStream::connect(&host).unwrap();
-        client
-            .write_all(b"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n")
-            .unwrap();
-        let mut buf = [0u8; 64];
-        let n = client.read(&mut buf).unwrap();
+        let (host, _) = split_guard_url(guard.url());
         assert!(
-            std::str::from_utf8(&buf[..n]).unwrap().contains("404"),
+            roundtrip(&host, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n").contains("404"),
             "expected a 404 on an unknown path"
         );
-        drop(client);
         drop(guard); // must return, not hang
+    }
+
+    #[test]
+    fn serve_gates_on_the_playback_token() {
+        let link = StreamLink {
+            url: "https://example.invalid/master.m3u8".into(),
+            decloak_segments: true,
+            ..Default::default()
+        };
+        let guard = engage(&link).unwrap();
+        let (host, prefix) = split_guard_url(guard.url());
+
+        // `u` points at loopback, which the SSRF guard rejects AFTER the token
+        // gate and BEFORE any network send. So with the real token the request
+        // must get past the gate and die at the guard (502); flipping one token
+        // nibble must die at the gate itself (404). Together they prove the
+        // gate exists AND sits in front of the fetch path, with zero network.
+        let blocked = percent_encode("http://127.0.0.1/x");
+        let good = format!("GET {prefix}{blocked} HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            roundtrip(&host, &good).contains("502"),
+            "real token must pass the gate and fail at the SSRF guard"
+        );
+
+        let tok_at = prefix.find("t=").unwrap() + 2;
+        let mut bad_prefix = prefix.clone();
+        let flipped = if &prefix[tok_at..tok_at + 1] == "0" {
+            "1"
+        } else {
+            "0"
+        };
+        bad_prefix.replace_range(tok_at..tok_at + 1, flipped);
+        let bad = format!("GET {bad_prefix}{blocked} HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            roundtrip(&host, &bad).contains("404"),
+            "wrong token must 404 like an unknown path"
+        );
     }
 
     #[test]
     fn respond_dispatches_playlist_to_rewrite_and_segment_to_decloak() {
         // Playlist: every URI re-pointed to loopback, m3u8 type, keep-alive.
+        let prefix = path_prefix("ba5eba11");
         let mut out = Vec::new();
         let ka = respond(
             &mut out,
             b"#EXTM3U\n480/index.m3u8\n",
             "https://cdn.example/hls/master.m3u8",
             4444,
+            &prefix,
         )
         .unwrap();
         assert!(matches!(ka, KeepAlive::Yes));
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("Content-Type: application/vnd.apple.mpegurl"));
         assert!(text.contains("Connection: keep-alive"));
-        assert!(text.contains("http://127.0.0.1:4444/r.ts?u="));
+        assert!(text.contains("http://127.0.0.1:4444/r.ts?t=ba5eba11&u="));
         assert!(!text.contains("\n480/index.m3u8")); // relative variant rewritten
 
         // Segment: decoy prefix stripped to the TS sync, mp2t type, exact length.
@@ -879,7 +956,14 @@ mod tests {
         seg[70 + TS_PACKET] = 0x47;
         seg[70 + 2 * TS_PACKET] = 0x47;
         let mut out2 = Vec::new();
-        respond(&mut out2, &seg, "https://cdn.example/seg/0.ts", 4444).unwrap();
+        respond(
+            &mut out2,
+            &seg,
+            "https://cdn.example/seg/0.ts",
+            4444,
+            &prefix,
+        )
+        .unwrap();
         let head_end = out2.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let (head, sent_body) = out2.split_at(head_end);
         let head = std::str::from_utf8(head).unwrap();

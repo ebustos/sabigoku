@@ -80,7 +80,7 @@ impl Loopback {
             .port();
         Ok(Loopback {
             listener,
-            nonce: mint_nonce()?,
+            nonce: crate::nonce::mint().map_err(|e| Error::io("/dev/urandom", e))?,
             port,
             cancel: Arc::new(AtomicBool::new(false)),
         })
@@ -189,22 +189,6 @@ fn scrubbed_page(headline: &str, sub: &str) -> String {
          <body><div class=\"card\"><div class=\"mark\">{WORDMARK}</div>\
          <p class=\"headline\">{headline}</p><p class=\"sub\">{sub}</p></div></body></html>"
     )
-}
-
-/// 128-bit CSRF nonce from the OS CSPRNG. Reading `/dev/urandom` keeps this
-/// std-only (sabigoku is Unix; Windows unsupported at freeze, 06 §1).
-fn mint_nonce() -> Result<String, Error> {
-    let mut bytes = [0u8; 16];
-    let mut f = std::fs::File::open("/dev/urandom").map_err(|e| Error::io("/dev/urandom", e))?;
-    f.read_exact(&mut bytes)
-        .map_err(|e| Error::io("/dev/urandom", e))?;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(32);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
