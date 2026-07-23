@@ -8,6 +8,7 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod fetchguard;
+pub mod logging;
 pub mod login;
 pub mod loopback;
 pub mod nonce;

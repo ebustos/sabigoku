@@ -410,8 +410,13 @@ impl StreamProvider for MegaPlay {
         let text = String::from_utf8_lossy(&html);
         // Past-end or missing track (the sub/dub fork lives here), not a
         // transport failure.
-        let data_id =
-            parse_data_id(&text).ok_or_else(|| ProviderError::Decode("no data-id".into()))?;
+        let data_id = parse_data_id(&text).ok_or_else(|| {
+            log::warn!(
+                "megaplay embed {embed}: no data-id in {} byte(s) of HTML",
+                html.len()
+            );
+            ProviderError::Decode("no data-id".into())
+        })?;
 
         let src_url = format!("{}/stream/getSources?id={data_id}", self.host);
         let raw = self.xhr_get(&src_url)?;

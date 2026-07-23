@@ -3,8 +3,6 @@
 //! Redirects are refused on every request: provider-supplied URLs must stay
 //! behind the fetchguard (03 §6.7, a followed 3xx would bypass it) and fixed
 //! API endpoints have no business redirecting (ROD-435 rationale).
-//! ROD-300 always-on failure diagnostics are not wired: no log sink exists
-//! until the TUI shell ticket.
 
 use std::io::Read;
 use std::time::Duration;
@@ -75,13 +73,17 @@ impl HttpClient {
         if let Some(deadline) = req.deadline {
             builder = builder.timeout(deadline);
         }
-        let resp = builder.send().map_err(|_| ProviderError::Network)?;
+        let resp = builder.send().map_err(|e| {
+            log::warn!("{:?} {}: transport {e}", req.method, req.url);
+            ProviderError::Network
+        })?;
         let status = resp.status().as_u16();
         let ok = match req.accept {
             Accept::OkOnly => status == 200,
             Accept::Any2xx => resp.status().is_success(),
         };
         if !ok {
+            log::warn!("{:?} {}: HTTP {status}", req.method, req.url);
             return Err(ProviderError::from_status(status));
         }
         let mut buf = Vec::new();

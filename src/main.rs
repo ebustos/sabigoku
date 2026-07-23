@@ -29,6 +29,16 @@ fn main() {
         return;
     }
 
+    // Failure is stderr-reportable here; once tui::run owns the terminal it
+    // would punch the frame. The handle's drop shuts the sink down.
+    let _log = match sabigoku::logging::init(&paths.data) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            eprintln!("sabigoku: log sink unavailable: {e}");
+            None
+        }
+    };
+
     if let Err(e) = sabigoku::tui::run(&paths, &config) {
         eprintln!("sabigoku: {e}");
         std::process::exit(1);

@@ -57,3 +57,8 @@ image = { version = "0.25.10", default-features = false, features = [
   "webp",
   "gif",
 ] }
+# log sink (ROD-450): `log` facade at call sites, flexi_logger owns the file
+# (timestamps + size rotation). No default features: colors/textfilter serve
+# stderr styling and runtime filtering we never do.
+log = "0.4"
+flexi_logger = { version = "0.31", default-features = false }

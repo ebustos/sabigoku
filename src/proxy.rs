@@ -517,11 +517,23 @@ fn decloak(body: &[u8]) -> &[u8] {
         i += 1;
     }
     // No sync in the window. Legit for fMP4; otherwise a segment whose decoy
-    // prefix outgrew MAX_PREFIX_SCAN, which silently un-fixes ROD-443. zigoku
-    // warns here (distinguishing fMP4 from an outgrown prefix via a box-type
-    // sniff); no log sink exists until the TUI shell ticket (ROD-439, see
-    // http.rs), so that diagnostic and its fMP4 check are owed there.
+    // prefix outgrew MAX_PREFIX_SCAN, which silently un-fixes ROD-443. Log so
+    // a prefix-size shift is visible instead of a mute black screen.
+    if body.len() >= 2 * stride && !looks_like_fmp4(body) {
+        log::warn!(
+            "decloak: no TS sync in first {}B of a {}B segment; decoy prefix may exceed the scan window",
+            limit,
+            body.len()
+        );
+    }
     body
+}
+
+/// ISO-BMFF (fMP4) starts with a box whose type at offset 4 is ftyp/styp/moof.
+/// Distinguishes a legitimately-not-TS segment from one whose TS sync sits
+/// past the scan window.
+fn looks_like_fmp4(body: &[u8]) -> bool {
+    body.len() >= 8 && matches!(&body[4..8], b"ftyp" | b"styp" | b"moof")
 }
 
 /// Printable ASCII only (0x21-0x7e): a url a real CDN serves. Rejects control
@@ -748,6 +760,16 @@ mod tests {
         buf[5000 + 2 * TS_PACKET] = 0x47;
         assert_eq!(decloak(&buf).len(), buf.len());
         assert_eq!(decloak(&buf)[0], 0x89);
+    }
+
+    #[test]
+    fn looks_like_fmp4_distinguishes_iso_bmff_from_a_cloak_that_outgrew_the_window() {
+        assert!(looks_like_fmp4(b"\x00\x00\x00\x18ftypmp42"));
+        assert!(looks_like_fmp4(b"\x00\x00\x00\x18styp...."));
+        assert!(looks_like_fmp4(b"\x00\x00\x00\x18moof...."));
+        assert!(!looks_like_fmp4(b"\x89PNG\r\n\x1a\n"));
+        // Too short to carry a box type; also the head of a real TS packet.
+        assert!(!looks_like_fmp4(b"\x47\x40\x00"));
     }
 
     #[test]
