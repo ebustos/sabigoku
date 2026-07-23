@@ -2472,11 +2472,13 @@ mod tests {
         app.syncing = true;
         let summary = sync::SyncSummary {
             outcome: sync::SyncOutcome::Completed,
+            pull_failed: false,
             pulled: crate::store::PullOutcome {
                 reconciled: 2,
                 imported: 4,
                 ..Default::default()
             },
+            dirty: 3,
             pushed: 3,
             push_failed: 0,
         };
