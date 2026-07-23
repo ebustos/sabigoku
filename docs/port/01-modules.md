@@ -102,6 +102,7 @@ this table is law:
 | **cover** | Fetch/decode pixels, caches | 04 §7.3–7.4 |
 | **update / updatecheck** | Release check / apply | 06 |
 | **log** | Structured debug/err | — |
+| **cli** | Arg parse + subcommand dispatch (zigoku: inline in main.zig) | 06 §7 |
 
 ### 3.1 TUI internal slices
 
