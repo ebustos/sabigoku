@@ -1,7 +1,9 @@
 //! Bootstrap order per 01 §2: paths -> config -> store -> registry -> tui::run.
 //! CLI dispatch (06 §7) runs before any of it; only the Tui and Paths arms
-//! touch disk. Exit law (06 §7.4): the play path owns the binary's only
-//! deliberate nonzero exit; boot failures (no HOME, tui::run error) stay 1.
+//! touch disk. Exit law (06 §7.4) governs command outcomes: login/sync/update/
+//! usage/version exit 0, the play path's interim stub exits 2 (ROD-473 makes
+//! it 1, the law's only nonzero). Boot failures (no HOME, tui::run error) are
+//! a separate pre-existing 1, outside that law.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -19,10 +21,7 @@ fn main() -> ExitCode {
             println!("sabigoku v{}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Command::Usage => {
-            print!("{}", cli::USAGE);
-            ExitCode::SUCCESS
-        }
+        Command::Paths => print_paths(),
         Command::Login { .. } => {
             sabigoku::logging::init_stderr(debug);
             println!("login isn't available yet");
@@ -38,12 +37,15 @@ fn main() -> ExitCode {
             println!("update isn't available yet");
             ExitCode::SUCCESS
         }
+        Command::Usage => {
+            print!("{}", cli::USAGE);
+            ExitCode::SUCCESS
+        }
         Command::Play(_) => {
             sabigoku::logging::init_stderr(debug);
             eprintln!("sabigoku: non-TUI play isn't supported yet");
             ExitCode::from(2)
         }
-        Command::Paths => print_paths(),
         Command::Tui => run_tui(debug),
     }
 }

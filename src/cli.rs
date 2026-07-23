@@ -219,9 +219,17 @@ mod tests {
     }
 
     #[test]
+    fn paths_flag_outranks_a_subcommand() {
+        assert_eq!(parse_of(&["login", "--paths"]), Command::Paths);
+        assert_eq!(parse_of(&["--paths", "sync"]), Command::Paths);
+    }
+
+    #[test]
     fn unknown_double_dash_flag_is_usage_but_single_dash_is_query_text() {
         assert_eq!(parse_of(&["--nope"]), Command::Usage);
         assert_eq!(parse_of(&["frieren", "--nope"]), Command::Usage);
+        // --paste is only login's flag; elsewhere it is an unknown flag.
+        assert_eq!(parse_of(&["--paste"]), Command::Usage);
         assert_eq!(
             parse_of(&["-x"]),
             Command::Play(PlayArgs {

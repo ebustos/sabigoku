@@ -1,5 +1,6 @@
-//! Log sink (06 §1): the TUI owns the terminal, so lines go to a rotating file
-//! under the data dir, never stderr. Call sites use the `log` facade macros;
+//! Log sinks (06 §1/§7): the TUI owns the terminal, so its lines go to a
+//! rotating file under the data dir; CLI paths log to stderr via
+//! `init_stderr`. Call sites use the `log` facade macros;
 //! before `init` runs they are no-ops. Debug is gated by SABIGOKU_DEBUG; info
 //! and up always emit. zigoku opened its log O_NOFOLLOW (planted-symlink
 //! defense); flexi_logger owns the open here, so that check is gone. The data
