@@ -441,6 +441,17 @@ mod tests {
         assert!(!text.contains("nothing to pull in"), "{text}");
     }
 
+    // zigoku suppresses up-to-date on conflicts only; imports postdate the
+    // freeze, so an import-only pull must suppress it too (08 §10, ROD-472).
+    #[test]
+    fn an_import_only_pull_suppresses_up_to_date_by_itself() {
+        let mut s = summary(SyncOutcome::Completed);
+        s.pulled.imported = 3;
+        let text = render_sync_summary(&s);
+        assert!(text.contains("imported 3 show(s)"), "{text}");
+        assert!(!text.contains("nothing to pull in"), "{text}");
+    }
+
     #[test]
     fn unmatched_listing_caps_at_twelve_and_counts_the_rest() {
         let mut s = summary(SyncOutcome::Completed);
