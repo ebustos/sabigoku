@@ -1,7 +1,8 @@
-//! Process-level exit-code contract (06 §7.4): the play path owns the only
-//! deliberate nonzero exit; every other CLI path exits 0. Parse rules live in
-//! cli.rs unit tests; here the real binary earns the table. No test spawns
-//! the bare binary: that arm launches the TUI.
+//! Process-level exit-code contract (06 §7.4): every non-play CLI path exits 0,
+//! proven here by spawning the real binary. The play path's own exit table (0
+//! on quit/no-results, 1 on failure) is unit-tested in main.rs::play_flow with
+//! a fake provider, needing no network or mpv. Parse rules live in cli.rs unit
+//! tests. No test spawns the bare binary: that arm launches the TUI.
 
 use std::process::{Command, Output};
 
@@ -135,24 +136,6 @@ fn sync_without_a_token_reports_not_connected_and_exits_zero() {
     assert!(text.contains("not connected"), "{text}");
     assert!(!text.contains("syncing with AniList"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn query_play_stub_exits_two() {
-    let out = run(&["frieren"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("isn't supported yet"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn subcommand_after_a_query_word_routes_to_the_play_path() {
-    // "login" demotes to search text, so the whole line is the play stub.
-    let out = run(&["frieren", "login"]);
-    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]

@@ -277,7 +277,6 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
     };
     paths.ensure_dirs();
     let config = Config::load(&paths.config_file());
-    let now = unix_now();
 
     // Translation is flag-only (zigoku parity): --dub/--sub decide it, config's
     // `translation` never reaches the query path. Don't "fix" this into reading
@@ -317,6 +316,31 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
     };
     let provider = registry.preferred(Some(config.preferred_provider.as_str()));
 
+    ExitCode::from(play_flow(
+        provider,
+        &mut |prompt: &str, max: usize| prompt_pick(prompt, max),
+        translation,
+        &config,
+        &paths,
+        store.as_ref(),
+        &args,
+    ))
+}
+
+/// The search -> pick -> episodes -> pick -> play flow, split from environment
+/// wiring (paths, config, store, registry) so the exit table (06 §7.4) is
+/// unit-testable with a fake provider and a scripted picker: no process spawn,
+/// no live search, no mpv. Returns the raw exit code; the caller wraps it.
+fn play_flow(
+    provider: &dyn StreamProvider,
+    pick: &mut dyn FnMut(&str, usize) -> Option<usize>,
+    translation: Translation,
+    config: &Config,
+    paths: &Paths,
+    store: Option<&Store>,
+    args: &PlayArgs,
+) -> u8 {
+    let now = unix_now();
     let hits = match provider.search(
         &args.query,
         &SearchOptions {
@@ -331,7 +355,7 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
                 "{}",
                 cli::fetch_error_line(FetchStage::Search, FetchClass::from(&e), provider.name())
             );
-            return ExitCode::from(1);
+            return 1;
         }
     };
     if hits.is_empty() {
@@ -341,13 +365,13 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
             "\n  no results for \"{}\". try a different spelling or romaji.",
             domain::strip_controls(args.query.clone())
         );
-        return ExitCode::SUCCESS;
+        return 0;
     }
 
     print!("{}", cli::render_search_hits(&hits, translation));
-    let Some(idx) = prompt_pick("\n  pick a show # (q to quit): ", hits.len()) else {
+    let Some(idx) = pick("\n  pick a show # (q to quit): ", hits.len()) else {
         println!("  bye.");
-        return ExitCode::SUCCESS;
+        return 0;
     };
     let hit = &hits[idx];
 
@@ -355,7 +379,7 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
     // one; allanime sometimes) => play-only: episodes fetch fresh, no bind, no
     // cache, and later no resume or history.
     let anilist_id = hit.anilist_id;
-    if let (Some(st), Some(id)) = (&store, anilist_id) {
+    if let (Some(st), Some(id)) = (store, anilist_id) {
         let enrichment = Enrichment {
             anilist_id: id,
             mal_id: hit.mal_id,
@@ -373,15 +397,14 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
         }
     }
 
-    let episodes = match load_episodes(store.as_ref(), anilist_id, provider, hit, translation, now)
-    {
+    let episodes = match load_episodes(store, anilist_id, provider, hit, translation, now) {
         Ok(eps) => eps,
         Err(e) => {
             print!(
                 "{}",
                 cli::fetch_error_line(FetchStage::Episodes, FetchClass::from(&e), provider.name())
             );
-            return ExitCode::from(1);
+            return 1;
         }
     };
     if episodes.is_empty() {
@@ -389,20 +412,20 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
             "\n  no {} episodes listed for this show.",
             translation.as_str()
         );
-        return ExitCode::SUCCESS;
+        return 0;
     }
 
     print!("{}", cli::render_episode_list(&episodes));
-    let Some(ep_idx) = prompt_pick("\n  pick an episode # (q to quit): ", episodes.len()) else {
+    let Some(ep_idx) = pick("\n  pick an episode # (q to quit): ", episodes.len()) else {
         println!("  bye.");
-        return ExitCode::SUCCESS;
+        return 0;
     };
     let episode = &episodes[ep_idx];
     let episode_index = (ep_idx + 1) as u32;
 
     // Resume start, gated on store+anilist_id. Computed caller-side per the
     // 03 §6.3.1 rewind rule; the player emits --start only when > 0.
-    let start_secs = match (&store, anilist_id) {
+    let start_secs = match (store, anilist_id) {
         (Some(st), Some(id)) => st
             .get_resume(id, translation, episode)
             .ok()
@@ -463,7 +486,7 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
             // A meaningful watch returns Ok with a position even when mpv then
             // exits badly; persist it. finish_playback shuts its own gate on a
             // None position, so an empty watch writes nothing.
-            if let (Some(st), Some(id)) = (&store, anilist_id)
+            if let (Some(st), Some(id)) = (store, anilist_id)
                 && let Err(e) = finish_playback(
                     st,
                     id,
@@ -478,7 +501,7 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
                 log::debug!("play: finish_playback failed: {e}");
             }
             println!("\n  ✓ done.");
-            ExitCode::SUCCESS
+            0
         }
         Err(e) => {
             // The one nonzero exit (06 §7.4): a play that never yielded a
@@ -487,7 +510,7 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
                 "{}",
                 cli::player_failure_line(play_failure(&e), provider.name())
             );
-            ExitCode::from(1)
+            1
         }
     }
 }
@@ -596,4 +619,167 @@ fn run_tui(debug: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sabigoku::domain::StreamLink;
+    use sabigoku::providers::CoverRequest;
+
+    // Provider whose search/episodes/resolve outcomes are scripted, so the play
+    // path reaches a chosen exit without network or mpv. fn-pointer fields, not
+    // closures: every case here is a fixed result, no captured state.
+    struct Fake {
+        search: fn(&str) -> Result<Vec<SearchHit>, ProviderError>,
+        episodes: fn() -> Result<Vec<String>, ProviderError>,
+        resolve: fn() -> Result<StreamLink, ProviderError>,
+    }
+
+    impl StreamProvider for Fake {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn display_name(&self) -> &'static str {
+            "Fake"
+        }
+        fn canonical_key(&self, _show: &Enrichment) -> Option<String> {
+            None
+        }
+        fn search(
+            &self,
+            query: &str,
+            _opts: &SearchOptions,
+        ) -> Result<Vec<SearchHit>, ProviderError> {
+            (self.search)(query)
+        }
+        fn episodes(
+            &self,
+            _provider_id: &str,
+            _translation: Translation,
+            _count_hint: Option<u32>,
+        ) -> Result<Vec<String>, ProviderError> {
+            (self.episodes)()
+        }
+        fn resolve(
+            &self,
+            _provider_id: &str,
+            _episode: &str,
+            _translation: Translation,
+            _quality: Quality,
+        ) -> Result<StreamLink, ProviderError> {
+            (self.resolve)()
+        }
+        fn cover_request(&self, _cover_ref: &str) -> Result<CoverRequest, ProviderError> {
+            Err(ProviderError::Unsupported)
+        }
+    }
+
+    fn fake(
+        search: fn(&str) -> Result<Vec<SearchHit>, ProviderError>,
+        episodes: fn() -> Result<Vec<String>, ProviderError>,
+        resolve: fn() -> Result<StreamLink, ProviderError>,
+    ) -> Fake {
+        Fake {
+            search,
+            episodes,
+            resolve,
+        }
+    }
+
+    // A hit with no anilist_id and no mal_id: skips every store hop and plays
+    // AniSkip-plain, so the store/paths passed to play_flow are never touched.
+    fn one_hit() -> SearchHit {
+        SearchHit {
+            provider_id: "id".into(),
+            title: "Frieren".into(),
+            title_english: None,
+            title_native: None,
+            anilist_id: None,
+            mal_id: None,
+            total_episodes: Some(1),
+            eps_sub: 1,
+            eps_dub: 1,
+            year: None,
+        }
+    }
+
+    fn args() -> PlayArgs {
+        PlayArgs {
+            query: "frieren".into(),
+            dub: false,
+            quality: None,
+        }
+    }
+
+    // No store, default config, throwaway paths: with one_hit()'s absent ids
+    // none of them are read on the way to the exit under test.
+    fn run(
+        provider: &dyn StreamProvider,
+        pick: &mut dyn FnMut(&str, usize) -> Option<usize>,
+    ) -> u8 {
+        let config = Config::default();
+        let base = std::env::temp_dir();
+        let paths = Paths {
+            config: base.clone(),
+            data: base.clone(),
+            cache: base.clone(),
+            runtime: base,
+        };
+        play_flow(
+            provider,
+            pick,
+            Translation::Sub,
+            &config,
+            &paths,
+            None,
+            &args(),
+        )
+    }
+
+    // Exit table (06 §7.4): the play path is the one nonzero exit (1); every
+    // early return (no results, quit, no episodes) is a clean 0. These pin the
+    // real contract; the superseded stub asserted "not supported yet", exit 2.
+
+    #[test]
+    fn no_results_exits_zero() {
+        let p = fake(
+            |_| Ok(vec![]),
+            || Ok(vec![]),
+            || Err(ProviderError::Network),
+        );
+        assert_eq!(run(&p, &mut |_, _| Some(0)), 0);
+    }
+
+    #[test]
+    fn search_failure_exits_one() {
+        let p = fake(
+            |_| Err(ProviderError::Network),
+            || Ok(vec![]),
+            || Err(ProviderError::Network),
+        );
+        assert_eq!(run(&p, &mut |_, _| Some(0)), 1);
+    }
+
+    #[test]
+    fn quitting_the_show_pick_exits_zero() {
+        let p = fake(
+            |_| Ok(vec![one_hit()]),
+            || Ok(vec!["1".into()]),
+            || Err(ProviderError::Network),
+        );
+        assert_eq!(run(&p, &mut |_, _| None), 0);
+    }
+
+    #[test]
+    fn resolve_failure_exits_one() {
+        // Auto-pick show then episode; resolve errors before mpv is ever built,
+        // so play() returns Err on the first attempt with no retry or backoff.
+        let p = fake(
+            |_| Ok(vec![one_hit()]),
+            || Ok(vec!["1".into()]),
+            || Err(ProviderError::Network),
+        );
+        assert_eq!(run(&p, &mut |_, _| Some(0)), 1);
+    }
 }
