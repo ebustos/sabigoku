@@ -277,7 +277,23 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
     };
     paths.ensure_dirs();
     let config = Config::load(&paths.config_file());
-    let now = unix_now();
+
+    // Translation is flag-only (zigoku parity): --dub/--sub decide it, config's
+    // `translation` never reaches the query path. Don't "fix" this into reading
+    // the config default; that would be a deviation, not a bug.
+    let translation = if args.dub {
+        Translation::Dub
+    } else {
+        Translation::Sub
+    };
+
+    // --quality is parsed but inert (06 §7): warn once on a non-default value so
+    // the flag never looks silently honored. default_quality drives resolve.
+    if cli::quality_note_needed(args.quality.as_deref()) {
+        println!(
+            "  (note: --quality isn't wired up yet; playback uses the highest direct stream available.)"
+        );
+    }
 
     // Store is best-effort: a library that won't open degrades to play-only (no
     // resume, episode cache, or history) and never blocks playback. Paired with
@@ -303,11 +319,11 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
     ExitCode::from(play_flow(
         provider,
         &mut |prompt: &str, max: usize| prompt_pick(prompt, max),
+        translation,
         &config,
         &paths,
         store.as_ref(),
         &args,
-        now,
     ))
 }
 
@@ -318,29 +334,13 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
 fn play_flow(
     provider: &dyn StreamProvider,
     pick: &mut dyn FnMut(&str, usize) -> Option<usize>,
+    translation: Translation,
     config: &Config,
     paths: &Paths,
     store: Option<&Store>,
     args: &PlayArgs,
-    now: i64,
 ) -> u8 {
-    // Translation is flag-only (zigoku parity): --dub/--sub decide it, config's
-    // `translation` never reaches the query path. Don't "fix" this into reading
-    // the config default; that would be a deviation, not a bug.
-    let translation = if args.dub {
-        Translation::Dub
-    } else {
-        Translation::Sub
-    };
-
-    // --quality is parsed but inert (06 §7): warn once on a non-default value so
-    // the flag never looks silently honored. default_quality drives resolve.
-    if cli::quality_note_needed(args.quality.as_deref()) {
-        println!(
-            "  (note: --quality isn't wired up yet; playback uses the highest direct stream available.)"
-        );
-    }
-
+    let now = unix_now();
     let hits = match provider.search(
         &args.query,
         &SearchOptions {
@@ -726,7 +726,15 @@ mod tests {
             cache: base.clone(),
             runtime: base,
         };
-        play_flow(provider, pick, &config, &paths, None, &args(), 0)
+        play_flow(
+            provider,
+            pick,
+            Translation::Sub,
+            &config,
+            &paths,
+            None,
+            &args(),
+        )
     }
 
     // Exit table (06 §7.4): the play path is the one nonzero exit (1); every
