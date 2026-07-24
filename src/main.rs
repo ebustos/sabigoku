@@ -258,6 +258,11 @@ fn run_sync_cli() -> ExitCode {
 /// garbage. Bounds the picker against an unbounded pipe.
 const PICK_CAP: u64 = 256;
 
+/// Reprompt ceiling: a human never fumbles a numbered pick this many times, but
+/// a stdin flood (endless garbage or a non-UTF-8 stream with no newline) would
+/// otherwise reprompt without end. Bounds the loop to abort instead.
+const MAX_PICK_ATTEMPTS: usize = 1000;
+
 /// `sabigoku <query>` (06 §7.3): the one command whose failure exits nonzero.
 /// A single preferred provider, no fallback walk (03 §3.2); interactive stdin
 /// picks; store is best-effort and degrades. This chunk covers search and the
@@ -528,7 +533,9 @@ fn prompt_pick(prompt: &str, max: usize) -> Option<usize> {
     use std::io::{BufRead, Read};
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
-    loop {
+    // Bounded, not `loop`: every non-exiting branch below (blank, bad number,
+    // decode error) reprompts, so an endless garbage stream must not spin here.
+    for _ in 0..MAX_PICK_ATTEMPTS {
         print!("{prompt}");
         flush_stdout();
         let mut line = String::new();
@@ -551,6 +558,8 @@ fn prompt_pick(prompt: &str, max: usize) -> Option<usize> {
             Err(_) => println!("  ? couldn't read that (bad input encoding); try again"),
         }
     }
+    // Ran out of patience: a flood, not a user. Abort like EOF.
+    None
 }
 
 fn unix_now() -> i64 {
