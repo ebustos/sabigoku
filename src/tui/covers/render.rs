@@ -161,7 +161,8 @@ impl ProtocolPool {
     /// Center cover-crop into the block (ROD-461, DESIGN 3.3): scale the source
     /// to cover the block and center the overflow crop, versus `render`'s
     /// top-left raw-pixel window. Needs cell geometry; without it (tmux, SSH,
-    /// halfblocks) it falls back to `render`. False = no slot for `key`.
+    /// halfblocks) it falls back to `render`, so drive-tui is the only cover for
+    /// the reshape path. False = no slot for `key`.
     pub fn render_cover(&mut self, frame: &mut Frame<'_>, area: Rect, key: &str) -> bool {
         let Some(cell) = self.cell else {
             return self.render(frame, area, key);
@@ -169,6 +170,10 @@ impl ProtocolPool {
         let Some(slot) = self.slots.get_mut(key) else {
             return false;
         };
+        debug_assert!(
+            slot.src.is_some(),
+            "render_cover slot must be seeded by set_cover"
+        );
         if slot.shaped_for != Some((area.width, area.height)) {
             let cropped = slot.src.as_ref().and_then(|src| {
                 cover_crop(
@@ -177,14 +182,13 @@ impl ProtocolPool {
                     area.height as u32 * cell.height as u32,
                 )
             });
-            // A rebuilt protocol resets its request-id counter; the reshape is
-            // gated on cell dims so the steady state rebuilds once. The only
-            // stale-response window is an active resize (ROD-475's concern).
+            // replace_protocol increments the shared request-id counter so a
+            // superseded crop's response is rejected; ThreadProtocol::new would
+            // reset it to 0 and let a stale response install the wrong poster
+            // (the ROD-417 header hazard).
             if let Some(cropped) = cropped {
-                let (req_tx, req_rx) = mpsc::channel();
-                slot.proto =
-                    ThreadProtocol::new(req_tx, Some(self.picker.new_resize_protocol(cropped)));
-                slot.req_rx = req_rx;
+                slot.proto
+                    .replace_protocol(self.picker.new_resize_protocol(cropped));
                 slot.shaped_for = Some((area.width, area.height));
             }
         }
@@ -228,12 +232,13 @@ impl ProtocolPool {
 
 /// Largest centered sub-rect of `src` whose aspect matches the block `tw:th`,
 /// at full source resolution. A cheap view copy; the filtered scale-to-fill
-/// runs later on the encode worker. `None` when either target dim is zero.
+/// runs later on the encode worker. `None` when any source or target dim is 0.
 fn cover_crop(src: &DynamicImage, tw: u32, th: u32) -> Option<DynamicImage> {
-    if tw == 0 || th == 0 {
+    let (sw, sh) = (src.width(), src.height());
+    // A zero source dim underflows the centering subtraction below.
+    if tw == 0 || th == 0 || sw == 0 || sh == 0 {
         return None;
     }
-    let (sw, sh) = (src.width(), src.height());
     let (sw64, sh64, tw64, th64) = (sw as u64, sh as u64, tw as u64, th as u64);
     let (cw, ch) = if sw64 * th64 > tw64 * sh64 {
         // Source wider than the block: keep full height, crop the width.
@@ -396,6 +401,17 @@ mod tests {
         let src = img();
         assert!(cover_crop(&src, 0, 10).is_none());
         assert!(cover_crop(&src, 10, 0).is_none());
+    }
+
+    #[test]
+    fn cover_crop_rejects_zero_source_dims() {
+        // A degenerate decode must not underflow the centering subtraction.
+        let zero = DynamicImage::ImageRgba8(image::RgbaImage::new(0, 0));
+        assert!(cover_crop(&zero, 10, 10).is_none());
+        let flat = DynamicImage::ImageRgba8(image::RgbaImage::new(20, 0));
+        assert!(cover_crop(&flat, 10, 10).is_none());
+        let thin = DynamicImage::ImageRgba8(image::RgbaImage::new(0, 20));
+        assert!(cover_crop(&thin, 10, 10).is_none());
     }
 
     #[test]
