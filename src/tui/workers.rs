@@ -577,7 +577,9 @@ pub fn spawn_play(
 
 /// `PlayError` → the POD classes the toast matrix keys on (DESIGN 4.10).
 /// Guard/proxy/wait failures land in `Internal`: residual, `playback failed`.
-fn play_failure(e: &PlayError) -> PlayFailure {
+/// Public so the CLI play path (main) reuses the same classification, including
+/// the Resolve downcast, rather than re-deriving it.
+pub fn play_failure(e: &PlayError) -> PlayFailure {
     match e {
         PlayError::Resolve(cause) => cause
             .downcast_ref::<ProviderError>()

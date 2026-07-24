@@ -185,6 +185,17 @@ impl ProviderRegistry {
     }
 }
 
+/// The live provider set. Construction order IS the default fallback order (03
+/// §3.1): megaplay, senshi, allanime. Building the clients is offline. Both the
+/// TUI boot and the CLI play path build from here so the lineup never forks.
+pub fn default_registry() -> Result<ProviderRegistry, ProviderError> {
+    Ok(ProviderRegistry::new(vec![
+        Box::new(megaplay::MegaPlay::new()?) as Box<dyn StreamProvider>,
+        Box::new(senshi::Senshi::new()?),
+        Box::new(allanime::AllAnime::new()?),
+    ]))
+}
+
 /// Discover ranking axes; variant order is the freeze enum order and the UI
 /// tab order (04 §7, DESIGN §3.8). Rank is positional per axis, never one
 /// shared list re-sorted.

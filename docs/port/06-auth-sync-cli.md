@@ -353,6 +353,20 @@ unmatched). Baseline fact at freeze: `login`/`sync`/`update`/usage always exit 0
 even on outcome failure; only the CLI play path exits nonzero (1). Making sync
 scriptable with real exit codes is a deliberate deviation (`OPEN`).
 
+**Play exit fold (ROD-473, deliberate divergence from zigoku).** sabigoku's
+`player::play` (shared with the TUI) folds a *meaningful watch that then ends in
+an mpv failure* into `Ok(position: Some)`; only a play with no meaningful
+position ever observed returns an error. So the CLI persists that watch and
+exits 0, where zigoku persisted and then re-raised (exit 1). Exit code reflects
+whether the user got a meaningful watch, not mpv's raw process exit; the cause
+lives in one place (`player::play`) for both surfaces. A future engineer diffing
+against zigoku must not "fix" this back to a reraise.
+
+**Accepted (ROD-473 red-team).** `config.mpv_path` is an arbitrary path handed to
+`Command::new`; a hostile binary there can fabricate a position and land a false
+"watched" row at exit 0. This is inherent to a user-writable `mpv_path` (config
+write already implies local control) and is accepted, not guarded.
+
 ---
 
 ## 8. Env vars

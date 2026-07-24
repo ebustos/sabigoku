@@ -7,8 +7,11 @@
 
 use std::path::Path;
 
+use crate::domain::{self, Translation};
 use crate::login::ConnectResult;
+use crate::providers::SearchHit;
 use crate::sync::{SyncOutcome, SyncSummary};
+use crate::tui::event::{FetchClass, PlayFailure};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -293,6 +296,164 @@ pub fn render_sync_summary(s: &SyncSummary) -> String {
         _ => {}
     }
     out
+}
+
+// ── play path: search + pick rendering ──────────────────────────────────────
+
+/// Which network call failed. The Data and Unsupported classes read per stage:
+/// a search miss is not a resolve miss, and the search-stage Unsupported is the
+/// default-provider trap (megaplay cannot search), not a dead episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStage {
+    Search,
+    Episodes,
+    Resolve,
+}
+
+/// Numbered search results, zigoku's three-branch count line: per-track when
+/// the chosen track is stocked, else the catalog total, else bare. Titles are
+/// provider claims with no framework backstop; strip terminal-hostile bytes
+/// before they reach stdout.
+pub fn render_search_hits(hits: &[SearchHit], translation: Translation) -> String {
+    use std::fmt::Write;
+    let mut out = format!("\n  {} result(s):\n\n", hits.len());
+    for (i, h) in hits.iter().enumerate() {
+        let title = domain::strip_controls(h.title.clone());
+        let per_track = match translation {
+            Translation::Sub => h.eps_sub,
+            Translation::Dub => h.eps_dub,
+        };
+        if per_track > 0 {
+            let _ = writeln!(
+                out,
+                "  {:>2}. {title}  ·  {per_track} {} eps",
+                i + 1,
+                translation.as_str()
+            );
+        } else if let Some(t) = h.total_episodes {
+            let _ = writeln!(out, "  {:>2}. {title}  ·  {t} eps", i + 1);
+        } else {
+            let _ = writeln!(out, "  {:>2}. {title}", i + 1);
+        }
+    }
+    out
+}
+
+/// Numbered episode list, zigoku's width-3 `ep <label>` rows. Labels are
+/// provider claims with no framework backstop; strip terminal-hostile bytes
+/// before they reach stdout.
+pub fn render_episode_list(labels: &[String]) -> String {
+    use std::fmt::Write;
+    let mut out = format!("\n  {} episode(s):\n\n", labels.len());
+    for (i, label) in labels.iter().enumerate() {
+        let label = domain::strip_controls(label.clone());
+        let _ = writeln!(out, "  {:>3}. ep {label}", i + 1);
+    }
+    out
+}
+
+/// One resolved pick from a numbered prompt. `Reprompt` is a blank line (retry,
+/// no coaching); the two error kinds carry their own, formatted against `max`
+/// in the IO loop. EOF and an overlong read are the caller's abort and never
+/// reach here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickInput {
+    Abort,
+    Reprompt,
+    NotNumber,
+    OutOfRange,
+    Pick(usize),
+}
+
+/// zigoku `promptChoice`, IO-free: trim, `q` aborts, blank reprompts, a
+/// non-number and an out-of-`[1, max]` each reprompt, else the 0-based index.
+pub fn classify_pick(line: &str, max: usize) -> PickInput {
+    let t = line.trim();
+    if t.is_empty() {
+        return PickInput::Reprompt;
+    }
+    if t.eq_ignore_ascii_case("q") {
+        return PickInput::Abort;
+    }
+    match t.parse::<usize>() {
+        Ok(n) if (1..=max).contains(&n) => PickInput::Pick(n - 1),
+        Ok(_) => PickInput::OutOfRange,
+        Err(_) => PickInput::NotNumber,
+    }
+}
+
+/// Provider-failure copy in the CLI's sentence register (the TUI's terse toast
+/// rows are separate, app.rs). The search-stage Unsupported is the fresh-install
+/// trap: the default preferred provider is megaplay, which cannot search, so
+/// steer to the fix rather than parrot "unsupported".
+pub fn fetch_error_line(stage: FetchStage, class: FetchClass, provider: &str) -> String {
+    match class {
+        FetchClass::Network => {
+            format!("  ✗ can't reach {provider}: check your network, then try again.\n")
+        }
+        FetchClass::Blocked => format!(
+            "  ✗ {provider} is blocking the request (403/451); a VPN may get you through.\n"
+        ),
+        FetchClass::Down => {
+            format!("  ✗ {provider}'s servers are down (5xx); wait a bit and retry.\n")
+        }
+        FetchClass::Http => format!(
+            "  ✗ {provider} rejected the request; the site may be down or its recipe drifted.\n"
+        ),
+        FetchClass::Data => match stage {
+            FetchStage::Search => format!(
+                "  ✗ couldn't parse {provider}'s search results; its format may have shifted.\n"
+            ),
+            FetchStage::Episodes => format!(
+                "  ✗ couldn't read {provider}'s episode list; its format may have shifted.\n"
+            ),
+            FetchStage::Resolve => format!(
+                "  ✗ {provider} returned an unexpected stream payload; the protocol may have shifted.\n"
+            ),
+        },
+        FetchClass::Unsupported => match stage {
+            FetchStage::Search => format!(
+                "  ✗ {provider} can't search directly.\n     \
+                 set preferred_provider to \"senshi\" or \"allanime\" in config, or use the TUI.\n"
+            ),
+            FetchStage::Episodes => {
+                format!("  ✗ {provider} can't list episodes for this show.\n")
+            }
+            FetchStage::Resolve => {
+                format!("  ✗ {provider} can't provide a playable stream for this episode.\n")
+            }
+        },
+    }
+}
+
+/// Whether the inert `--quality` heads-up fires (06 §7 parity): only when a
+/// non-default value was passed. No flag, or an explicit `best`, stays silent.
+/// The flag is parsed but never wired to resolve; `default_quality` drives it.
+pub fn quality_note_needed(quality: Option<&str>) -> bool {
+    matches!(quality, Some(q) if !q.eq_ignore_ascii_case("best"))
+}
+
+/// Play-failure copy in the CLI's sentence register. A resolve failure is a
+/// fetch failure at the resolve stage, so it delegates to `fetch_error_line`;
+/// the mpv/stream classes get their own copy; `Internal` (guard/proxy/wait, the
+/// sabigoku-only hardening errors) reads as a safe stop, no zigoku analog.
+pub fn player_failure_line(failure: PlayFailure, provider: &str) -> String {
+    match failure {
+        PlayFailure::MpvNotFound => {
+            "  ✗ mpv isn't on your PATH; install mpv and try again.\n".into()
+        }
+        PlayFailure::MpvFailed => {
+            "  ✗ mpv exited badly (it closed early or couldn't play the stream).\n".into()
+        }
+        PlayFailure::OpenFailed => {
+            "  ✗ couldn't open the stream (the CDN may have blocked it); try again in a moment.\n"
+                .into()
+        }
+        PlayFailure::Resolve(class) => fetch_error_line(FetchStage::Resolve, class, provider),
+        PlayFailure::Internal => {
+            "  ✗ playback couldn't start safely; try again or pick a different episode.\n".into()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +753,129 @@ mod tests {
             assert!(text.contains(needle), "{result:?} paste={paste}: {text}");
             assert_eq!(text.lines().count(), 1, "{result:?}: {text}");
         }
+    }
+
+    fn hit(title: &str, eps_sub: u32, eps_dub: u32, total: Option<u32>) -> SearchHit {
+        SearchHit {
+            title: title.into(),
+            eps_sub,
+            eps_dub,
+            total_episodes: total,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn search_hits_pick_per_track_then_total_then_bare() {
+        let hits = [
+            hit("Frieren", 28, 0, Some(28)),
+            hit("Cowboy Bebop", 0, 26, Some(26)),
+            hit("Mystery", 0, 0, None),
+        ];
+        let sub = render_search_hits(&hits, Translation::Sub);
+        assert!(sub.contains("3 result(s):"), "{sub}");
+        // Per-track for the stocked sub track.
+        assert!(sub.contains(" 1. Frieren  ·  28 sub eps"), "{sub}");
+        // No sub track: falls to the catalog total, unlabeled.
+        assert!(sub.contains(" 2. Cowboy Bebop  ·  26 eps"), "{sub}");
+        // Neither: bare title.
+        assert!(sub.contains(" 3. Mystery\n"), "{sub}");
+
+        // Dub mode reads the dub track count.
+        let dub = render_search_hits(&hits, Translation::Dub);
+        assert!(dub.contains(" 2. Cowboy Bebop  ·  26 dub eps"), "{dub}");
+    }
+
+    #[test]
+    fn search_hits_strip_control_bytes_from_the_title() {
+        let hits = [hit("ro\u{1b}[31md\u{202e}", 1, 0, None)];
+        let out = render_search_hits(&hits, Translation::Sub);
+        assert!(!out.contains('\u{1b}'), "escape leaked: {out:?}");
+        assert!(!out.contains('\u{202e}'), "bidi leaked: {out:?}");
+    }
+
+    #[test]
+    fn episode_list_numbers_and_strips_labels() {
+        let labels = vec!["1".to_string(), "2".to_string(), "OVA\u{202e}".to_string()];
+        let out = render_episode_list(&labels);
+        assert!(out.contains("3 episode(s):"), "{out}");
+        assert!(out.contains("  1. ep 1"), "{out}");
+        assert!(out.contains("  3. ep OVA"), "{out}");
+        assert!(!out.contains('\u{202e}'), "bidi leaked: {out:?}");
+    }
+
+    #[test]
+    fn pick_classifies_abort_reprompt_and_range() {
+        assert_eq!(classify_pick("2\n", 5), PickInput::Pick(1));
+        assert_eq!(classify_pick("  3 \n", 5), PickInput::Pick(2));
+        assert_eq!(classify_pick("q\n", 5), PickInput::Abort);
+        assert_eq!(classify_pick("Q", 5), PickInput::Abort);
+        // Blank reprompts, never aborts (zigoku: empty line continues).
+        assert_eq!(classify_pick("\n", 5), PickInput::Reprompt);
+        assert_eq!(classify_pick("   ", 5), PickInput::Reprompt);
+        assert_eq!(classify_pick("x", 5), PickInput::NotNumber);
+        assert_eq!(classify_pick("0", 5), PickInput::OutOfRange);
+        assert_eq!(classify_pick("6", 5), PickInput::OutOfRange);
+        assert_eq!(classify_pick("5", 5), PickInput::Pick(4));
+    }
+
+    #[test]
+    fn search_unsupported_steers_to_the_fix_not_a_bare_word() {
+        let line = fetch_error_line(FetchStage::Search, FetchClass::Unsupported, "megaplay");
+        assert!(line.contains("can't search directly"), "{line}");
+        assert!(line.contains("preferred_provider"), "{line}");
+        // Episodes/resolve stages read as a dead operation, not a config nudge.
+        let ep = fetch_error_line(FetchStage::Episodes, FetchClass::Unsupported, "megaplay");
+        assert!(!ep.contains("preferred_provider"), "{ep}");
+    }
+
+    #[test]
+    fn fetch_error_rows_name_the_provider_and_render_one_block() {
+        for class in [
+            FetchClass::Network,
+            FetchClass::Blocked,
+            FetchClass::Down,
+            FetchClass::Http,
+        ] {
+            let line = fetch_error_line(FetchStage::Search, class, "senshi");
+            assert!(line.contains("senshi"), "{class:?}: {line}");
+            assert!(line.ends_with('\n'), "{class:?}: {line}");
+        }
+        // Data reads differently per stage.
+        let s = fetch_error_line(FetchStage::Search, FetchClass::Data, "senshi");
+        let r = fetch_error_line(FetchStage::Resolve, FetchClass::Data, "senshi");
+        assert!(s.contains("search results"), "{s}");
+        assert!(r.contains("stream payload"), "{r}");
+    }
+
+    #[test]
+    fn quality_note_only_for_a_non_default_value() {
+        assert!(!quality_note_needed(None));
+        assert!(!quality_note_needed(Some("best")));
+        assert!(!quality_note_needed(Some("Best")));
+        assert!(quality_note_needed(Some("1080")));
+    }
+
+    #[test]
+    fn player_failures_read_per_class_and_resolve_reuses_the_fetch_copy() {
+        assert!(
+            player_failure_line(PlayFailure::MpvNotFound, "senshi")
+                .contains("mpv isn't on your PATH")
+        );
+        assert!(
+            player_failure_line(PlayFailure::OpenFailed, "senshi")
+                .contains("couldn't open the stream")
+        );
+        assert!(
+            player_failure_line(PlayFailure::Internal, "senshi").contains("couldn't start safely")
+        );
+        // A resolve HTTP class routes through the resolve-stage fetch copy.
+        let net = player_failure_line(PlayFailure::Resolve(FetchClass::Network), "senshi");
+        assert_eq!(
+            net,
+            fetch_error_line(FetchStage::Resolve, FetchClass::Network, "senshi")
+        );
+        assert!(net.contains("senshi"), "{net}");
     }
 
     #[test]
