@@ -430,7 +430,7 @@ pub fn fetch_error_line(stage: FetchStage, class: FetchClass, provider: &str) ->
 /// non-default value was passed. No flag, or an explicit `best`, stays silent.
 /// The flag is parsed but never wired to resolve; `default_quality` drives it.
 pub fn quality_note_needed(quality: Option<&str>) -> bool {
-    matches!(quality, Some(q) if q != "best")
+    matches!(quality, Some(q) if !q.eq_ignore_ascii_case("best"))
 }
 
 /// Play-failure copy in the CLI's sentence register. A resolve failure is a
@@ -852,6 +852,7 @@ mod tests {
     fn quality_note_only_for_a_non_default_value() {
         assert!(!quality_note_needed(None));
         assert!(!quality_note_needed(Some("best")));
+        assert!(!quality_note_needed(Some("Best")));
         assert!(quality_note_needed(Some("1080")));
     }
 

@@ -9,14 +9,9 @@ use std::process::ExitCode;
 
 use sabigoku::aniskip;
 use sabigoku::cli::{self, Command, FetchStage, PlayArgs};
-use sabigoku::domain::{Enrichment, Quality, Translation};
+use sabigoku::domain::{self, Enrichment, Quality, Translation};
 use sabigoku::player::{self, PlayOpts, PlayerEvent};
-use sabigoku::providers::allanime::AllAnime;
-use sabigoku::providers::megaplay::MegaPlay;
-use sabigoku::providers::senshi::Senshi;
-use sabigoku::providers::{
-    ProviderError, ProviderRegistry, SearchHit, SearchOptions, StreamProvider,
-};
+use sabigoku::providers::{ProviderError, SearchHit, SearchOptions, StreamProvider};
 use sabigoku::store::Store;
 use sabigoku::tui::event::FetchClass;
 use sabigoku::tui::workers::{finish_playback, play_failure};
@@ -308,10 +303,10 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
         }
     };
 
-    let registry = match build_registry() {
+    let registry = match sabigoku::providers::default_registry() {
         Ok(r) => r,
-        Err((name, e)) => {
-            println!("  ✗ couldn't set up the {name} client ({e}).");
+        Err(e) => {
+            println!("  ✗ couldn't set up a provider client ({e}).");
             return ExitCode::from(1);
         }
     };
@@ -335,9 +330,11 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
         }
     };
     if hits.is_empty() {
+        // Echoes raw argv; strip terminal-hostile bytes like every other
+        // provider/user string reaching stdout on this path.
         println!(
             "\n  no results for \"{}\". try a different spelling or romaji.",
-            args.query
+            domain::strip_controls(args.query.clone())
         );
         return ExitCode::SUCCESS;
     }
@@ -357,7 +354,10 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
         let enrichment = Enrichment {
             anilist_id: id,
             mal_id: hit.mal_id,
-            title_romaji: hit.title.clone(),
+            // Provider-supplied title persists into a store row that every TUI
+            // render trusts as pre-scrubbed (anilist ingestion strips on write;
+            // this path must too, or it plants a replay-on-render injection).
+            title_romaji: domain::strip_controls(hit.title.clone()),
             total_episodes: hit.total_episodes,
             ..Default::default()
         };
@@ -418,7 +418,7 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
         &paths.cache,
     );
 
-    let title = sabigoku::domain::strip_controls(format!("{} · ep {episode}", hit.title));
+    let title = domain::strip_controls(format!("{} · ep {episode}", hit.title));
     let opts = PlayOpts {
         mpv_path: &config.mpv_path,
         socket_dir: &paths.runtime,
@@ -431,7 +431,8 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
     let quality = Quality::parse(&config.default_quality);
 
     println!(
-        "\n  ▶ resolving ep {episode} ({}) and launching mpv…",
+        "\n  ▶ resolving ep {} ({}) and launching mpv…",
+        domain::strip_controls(episode.clone()),
         translation.as_str()
     );
     flush_stdout();
@@ -498,7 +499,7 @@ fn load_episodes(
     translation: Translation,
     now: i64,
 ) -> Result<Vec<String>, ProviderError> {
-    let title = sabigoku::domain::strip_controls(hit.title.clone());
+    let title = domain::strip_controls(hit.title.clone());
     if let (Some(st), Some(id)) = (store, anilist_id)
         && let Ok(Some(cached)) = st.get_cached_episodes(id, provider.name(), translation, now)
     {
@@ -519,20 +520,9 @@ fn load_episodes(
     Ok(episodes)
 }
 
-/// The live provider set, construction order = default fallback order (03 §3.1),
-/// mirroring the TUI boot (tui::run). Building the clients is offline; an error
-/// names the provider that failed so the play-flow mapper can report it.
-fn build_registry() -> Result<ProviderRegistry, (&'static str, ProviderError)> {
-    Ok(ProviderRegistry::new(vec![
-        Box::new(MegaPlay::new().map_err(|e| ("megaplay", e))?) as Box<dyn StreamProvider>,
-        Box::new(Senshi::new().map_err(|e| ("senshi", e))?),
-        Box::new(AllAnime::new().map_err(|e| ("allanime", e))?),
-    ]))
-}
-
 /// Numbered stdin pick loop: prints the prompt, reads one capped line, and lets
 /// `cli::classify_pick` own the accept/reprompt/abort rule. `None` on `q`, EOF,
-/// or an overlong read. One locked reader spans the loop so buffered bytes
+/// or an overlong line. One locked reader spans the loop so buffered bytes
 /// survive between reprompts.
 fn prompt_pick(prompt: &str, max: usize) -> Option<usize> {
     use std::io::{BufRead, Read};
@@ -542,16 +532,23 @@ fn prompt_pick(prompt: &str, max: usize) -> Option<usize> {
         print!("{prompt}");
         flush_stdout();
         let mut line = String::new();
-        let n = (&mut reader).take(PICK_CAP).read_line(&mut line).ok()?;
-        if n == 0 {
-            return None;
-        }
-        match cli::classify_pick(&line, max) {
-            cli::PickInput::Pick(i) => return Some(i),
-            cli::PickInput::Abort => return None,
-            cli::PickInput::Reprompt => {}
-            cli::PickInput::NotNumber => println!("  ? enter a number 1-{max} (or q)"),
-            cli::PickInput::OutOfRange => println!("  ? out of range: pick 1-{max}"),
+        match (&mut reader).take(PICK_CAP).read_line(&mut line) {
+            // EOF: same as an explicit `q`.
+            Ok(0) => return None,
+            // A cap-length read with no newline is a truncated flood, not a
+            // pick (a real choice is a few bytes); abort, matching zigoku
+            // promptChoice's StreamTooLong -> quit.
+            Ok(n) if n as u64 == PICK_CAP && !line.ends_with('\n') => return None,
+            Ok(_) => match cli::classify_pick(&line, max) {
+                cli::PickInput::Pick(i) => return Some(i),
+                cli::PickInput::Abort => return None,
+                cli::PickInput::Reprompt => {}
+                cli::PickInput::NotNumber => println!("  ? enter a number 1-{max} (or q)"),
+                cli::PickInput::OutOfRange => println!("  ? out of range: pick 1-{max}"),
+            },
+            // A decode error (non-UTF-8 bytes) is not EOF; the read still
+            // advanced past them, so reprompt rather than silently quitting.
+            Err(_) => println!("  ? couldn't read that (bad input encoding); try again"),
         }
     }
 }
