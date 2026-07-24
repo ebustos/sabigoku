@@ -292,7 +292,7 @@ impl DetailState {
         self.started = None;
         if self.cover.on_done(for_id) {
             if self.shown.as_ref().map(|e| e.anilist_id) == Some(for_id) {
-                pool.set(DETAIL_KEY, img);
+                pool.set_cover(DETAIL_KEY, img);
             } else {
                 self.cover.clear();
             }
@@ -958,7 +958,7 @@ fn draw_cover_block(
     now: Instant,
     pool: &mut ProtocolPool,
 ) {
-    if state.cover.has_pixels() && pool.render(frame, cover, DETAIL_KEY) {
+    if state.cover.has_pixels() && pool.render_cover(frame, cover, DETAIL_KEY) {
         return;
     }
     frame.render_widget(Block::new().style(Style::new().bg(palette.surface)), cover);
