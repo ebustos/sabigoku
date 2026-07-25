@@ -29,8 +29,9 @@ Licensed GPL-3.0-or-later.
   flow, all in one ratatui interface. Four palettes: `terminal_ghost` (default),
   `phosphor`, `nord`, `tokyonight`.
 - **Search, resolve, and play**: several streaming sources are tried in order,
-  with the next one picked up automatically if one fails. Playback runs through
-  `mpv`, with resume positions tracked live over its IPC socket.
+  with the next one picked up automatically if one fails. Sub or dub is a saved
+  preference, overridable per run with `--dub`. Playback runs through `mpv`,
+  with resume positions tracked live over its IPC socket.
 - **AniList sync**: connect your account and sync your list. A sync always pulls
   before it pushes, so a show that was never synced locally cannot get wiped by
   an outgoing push.
@@ -46,8 +47,8 @@ Licensed GPL-3.0-or-later.
   the shell.
 - **Diagnostics**: `--debug` (or `SABIGOKU_DEBUG=1`) turns on verbose logging, to
   stderr in CLI mode and to a rotating log file in the TUI.
-- **XDG-compliant paths**: config, data, and cache each live in their own
-  standard directory; `sabigoku --paths` prints exactly where.
+- **XDG-compliant paths**: config, data, cache and runtime state each live in
+  their own standard directory; `sabigoku --paths` prints exactly where.
 - **Static release binaries**: linux x86_64 and aarch64 builds need nothing
   installed, not even CA certificates. macOS arm64 and x86_64 builds are also
   provided. `mpv` is the one runtime dependency, needed for playback.

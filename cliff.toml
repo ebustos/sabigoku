@@ -9,6 +9,11 @@
 # Deliberately NOT wired into CI. release.yml EXTRACTS the curated `## [X.Y.Z]`
 # section from the committed CHANGELOG.md; it never regenerates it. A generated
 # changelog reads like a commit log, which is the thing this flow exists to avoid.
+#
+# Drafts name streaming sources, because commit scopes and subjects do. Scrub
+# them before a bullet reaches [Unreleased]: nothing user-facing names a source
+# or says how playback gets past its protections. Never paste a draft bullet
+# through unread.
 
 [changelog]
 # CHANGELOG.md owns the header, and --unreleased to stdout omits it anyway.
