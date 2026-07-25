@@ -26,10 +26,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # ratatui-image (chafa-dyn) pkg-config links system libchafa at build time; runners lack it.
-      # chafa.pc requires glib-2.0, so its dev package is needed for pkg-config to resolve.
-      - name: install libchafa
-        run: sudo apt-get update && sudo apt-get install -y libchafa-dev libglib2.0-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -64,7 +60,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: install chafa
-        run: brew install chafa
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --bin sabigoku

@@ -42,6 +42,10 @@ base64 = "0.22"
 # cover CDNs serve jpeg/png/webp/gif; every extra default codec is reachable
 # attack surface via magic-byte sniffing, so do not reopen `image/default`
 # (ratatui-image's default features would, hence the explicit list there too).
+# Never enable `chafa-dyn` or `chafa-static` (ROD-489): both pkg-config link
+# system libchafa + glib at build time, so the release binary stops running on
+# a machine that lacks them. They only swap the halfblocks encoder; the Kitty
+# path does not use chafa.
 # toasts (ROD-439): the 36-col copy budget is display-column and grapheme
 # aware (DESIGN 4.7); both crates are already in-tree transitively via ratatui.
 unicode-width = "0.2"
@@ -49,7 +53,6 @@ unicode-segmentation = "1"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.0.6", default-features = false, features = [
   "crossterm",
-  "chafa-dyn",
 ] }
 image = { version = "0.25.10", default-features = false, features = [
   "jpeg",
