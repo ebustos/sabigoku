@@ -52,9 +52,9 @@ everywhere else.
 ## License
 
 [GPL-3.0-or-later](LICENSE), the same as zigoku. This is a port of a GPL
-project, and the lineage runs back one step further: zigoku learned the
-AllAnime protocol by studying [anipy-cli](https://github.com/sdaqo/anipy-cli)
-(GPL-3.0) and reimplemented the wire protocol from observed behavior rather
-than copying code. The license keeps that unambiguous.
+project, and the lineage runs back one step further: zigoku's original
+streaming support followed a trail first opened by
+[anipy-cli](https://github.com/sdaqo/anipy-cli) (GPL-3.0), reimplemented rather
+than copied. The license keeps that lineage unambiguous.
 
 Catalogue metadata and cover art come from [AniList](https://anilist.co/).

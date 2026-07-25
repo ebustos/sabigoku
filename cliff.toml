@@ -1,0 +1,70 @@
+# git-cliff: DRAFT generator for CHANGELOG.md.
+#
+# An authoring aid, never a source of truth. Run it locally to draft the changes
+# since the last tag, then hand-merge what is worth keeping into the curated
+# `## [Unreleased]` section and edit it for voice:
+#
+#     git cliff --unreleased            # grouped draft to stdout, copy by hand
+#
+# Deliberately NOT wired into CI. release.yml EXTRACTS the curated `## [X.Y.Z]`
+# section from the committed CHANGELOG.md; it never regenerates it. A generated
+# changelog reads like a commit log, which is the thing this flow exists to avoid.
+#
+# Drafts name streaming sources, because commit scopes and subjects do. Scrub
+# them before a bullet reaches [Unreleased]: nothing user-facing names a source
+# or says how playback gets past its protections. Never paste a draft bullet
+# through unread.
+
+[changelog]
+# CHANGELOG.md owns the header, and --unreleased to stdout omits it anyway.
+header = ""
+body = """
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## [Unreleased]
+{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = true   # drops merge commits and anything not type(scope): ...
+split_commits = false
+protect_breaking_commits = false
+filter_commits = false
+tag_pattern = "v[0-9]*"
+topo_order = false
+sort_commits = "oldest"
+
+# Strip the trailing Plane ref, (ROD-489) or (ROD-486 review), which is private
+# to the workspace and adds nothing for a reader of the release.
+commit_preprocessors = [
+  { pattern = '\s*\(ROD-\d+[^)]*\)', replace = "" },
+]
+
+# Conventional type to Keep a Changelog group. The catch-all drops anything
+# unmapped, so an unrecognised type stays out of a draft rather than sneaking in.
+commit_parsers = [
+  { message = "^Merge",     skip = true },
+  { message = "^feat",      group = "Added" },
+  { message = "^fix",       group = "Fixed" },
+  { message = "^perf",      group = "Changed" },
+  { message = "^refactor",  group = "Changed" },
+  { message = "^harden",    group = "Changed" },
+  { message = "^revert",    group = "Removed" },
+  { message = "^docs",      skip = true },
+  { message = "^test",      skip = true },
+  { message = "^ci",        skip = true },
+  { message = "^build",     skip = true },
+  { message = "^chore",     skip = true },
+  { message = "^style",     skip = true },
+  { message = ".*",         skip = true },
+]
