@@ -39,8 +39,9 @@ sabigoku sync                # sync the watchlist
 sabigoku --paths             # where config, data and cache live
 ```
 
-Cover art uses the Kitty graphics protocol where the terminal speaks it (kitty,
-ghostty, WezTerm) and halfblock cells everywhere else.
+Cover art renders as real images in terminals that answer the graphics
+capability query (kitty, ghostty, WezTerm, iTerm2) and as halfblock cells
+everywhere else.
 
 ## Docs
 
