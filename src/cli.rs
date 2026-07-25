@@ -435,6 +435,20 @@ pub fn quality_note_needed(quality: Option<&str>) -> bool {
     matches!(quality, Some(q) if !q.eq_ignore_ascii_case("best"))
 }
 
+/// Heads-up when the configured source was walked past because it cannot
+/// search (ROD-491). `None` when nothing was overridden: no preference set, or
+/// the preference is the source the run is using. Tuples are (name, display):
+/// identity compares on the stable name, the copy shows the display one.
+pub fn provider_override_note(asked: Option<(&str, &str)>, chosen: (&str, &str)) -> Option<String> {
+    let (asked_name, asked_display) = asked?;
+    (asked_name != chosen.0).then(|| {
+        format!(
+            "  (note: {asked_display} can't search, so this run uses {}.)",
+            chosen.1
+        )
+    })
+}
+
 /// Play-failure copy in the CLI's sentence register. A resolve failure is a
 /// fetch failure at the resolve stage, so it delegates to `fetch_error_line`;
 /// the mpv/stream classes get their own copy; `Internal` (guard/proxy/wait, the
@@ -819,6 +833,34 @@ mod tests {
         assert_eq!(classify_pick("0", 5), PickInput::OutOfRange);
         assert_eq!(classify_pick("6", 5), PickInput::OutOfRange);
         assert_eq!(classify_pick("5", 5), PickInput::Pick(4));
+    }
+
+    /// The three states the note distinguishes. Silence on a stock config is
+    /// the one that matters: nothing was overridden, so nothing is explained.
+    #[test]
+    fn override_note_fires_only_when_a_preference_was_walked_past() {
+        let senshi = ("senshi", "Senshi");
+        assert_eq!(provider_override_note(None, senshi), None);
+        assert_eq!(
+            provider_override_note(Some(("senshi", "Senshi")), senshi),
+            None
+        );
+        let note = provider_override_note(Some(("megaplay", "MegaPlay")), senshi)
+            .expect("an incapable preference is explained");
+        assert!(note.contains("MegaPlay"), "{note}");
+        assert!(note.contains("Senshi"), "{note}");
+        assert!(note.contains("can't search"), "{note}");
+    }
+
+    /// Identity is the stable name, never the display string; two sources are
+    /// free to share a display name without the note misfiring.
+    #[test]
+    fn override_note_compares_names_not_display_strings() {
+        assert_eq!(
+            provider_override_note(Some(("senshi", "Same Label")), ("senshi", "Same Label")),
+            None
+        );
+        assert!(provider_override_note(Some(("a", "Same Label")), ("b", "Same Label")).is_some());
     }
 
     /// ROD-491 retired the config nudge here. The run only ever binds to a

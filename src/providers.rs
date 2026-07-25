@@ -164,6 +164,10 @@ impl ProviderRegistry {
     }
 
     /// Named, or `primary()` when empty/unknown (03 §3.2).
+    ///
+    /// No production caller since ROD-491 moved the CLI to
+    /// `preferred_searchable`. Kept because 03 §3.2 lists it as a registry
+    /// view; retiring it is a bible change, not a cleanup.
     pub fn preferred(&self, name: Option<&str>) -> &dyn StreamProvider {
         name.filter(|n| !n.is_empty())
             .and_then(|n| self.by_name(n))

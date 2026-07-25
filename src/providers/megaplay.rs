@@ -755,6 +755,10 @@ mod tests {
             },
         );
         assert!(matches!(got, Err(ProviderError::Unsupported)));
+        // The pair is the contract: `supports_search` lets callers skip this
+        // provider without calling it, so a `search` that started answering
+        // while the flag stayed false would strand a working source.
+        assert!(!p.supports_search());
     }
 
     #[test]

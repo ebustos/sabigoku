@@ -324,14 +324,11 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if let Some(asked) = registry.by_name(pref)
-        && asked.name() != provider.name()
-    {
-        println!(
-            "  (note: {} can't search, so this run uses {}.)",
-            asked.display_name(),
-            provider.display_name()
-        );
+    if let Some(note) = cli::provider_override_note(
+        registry.by_name(pref).map(|p| (p.name(), p.display_name())),
+        (provider.name(), provider.display_name()),
+    ) {
+        println!("{note}");
     }
 
     ExitCode::from(play_flow(
