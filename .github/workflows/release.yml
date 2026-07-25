@@ -182,10 +182,10 @@ jobs:
           sha256sum sabigoku-v*.tar.gz > sha256sums.txt
           cat sha256sums.txt
 
-      # Publishes live on tag push (ROD-492, after v0.1.0 proved the path). There
-      # is no human gate left: the version guard, the changelog guard, the smoke
-      # tests and the artifact count are the only things between a bad tag and
-      # the internet. Weigh that before weakening any of them.
+      # Publishes live on tag push (ROD-492). There is no human gate left: the
+      # version guard, the changelog guard, the smoke tests and the artifact
+      # count are the only things between a bad tag and the internet. Weigh that
+      # before weakening any of them.
       # A tag carrying a suffix (v0.2.0-rc1) publishes as a prerelease, so it
       # never becomes the release an installer resolves as latest.
       - name: publish release
@@ -193,12 +193,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          args=(--notes-file notes.md --title "sabigoku ${GITHUB_REF_NAME}")
+          extra=()
           case "${GITHUB_REF_NAME}" in
-            *-*) args+=(--prerelease); echo "suffixed tag, publishing as a prerelease" ;;
+            *-*) extra+=(--prerelease); echo "suffixed tag, publishing as a prerelease" ;;
           esac
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
-            "${args[@]}" \
+            --notes-file notes.md \
+            --title "sabigoku ${GITHUB_REF_NAME}" \
+            "${extra[@]}" \
             artifacts/sabigoku-v*.tar.gz \
             artifacts/sha256sums.txt
