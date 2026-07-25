@@ -362,6 +362,10 @@ impl StreamProvider for MegaPlay {
         Err(ProviderError::Unsupported)
     }
 
+    fn supports_search(&self) -> bool {
+        false
+    }
+
     /// Listing-less: probe ep 1 (sub, track-agnostic) for existence, then mint
     /// "1".."N" from `count_hint`. `tt` does not filter here; a missing dub
     /// surfaces at resolve, and a dub-mode probe must not read a sub-only show

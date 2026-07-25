@@ -412,10 +412,12 @@ pub fn fetch_error_line(stage: FetchStage, class: FetchClass, provider: &str) ->
             ),
         },
         FetchClass::Unsupported => match stage {
-            FetchStage::Search => format!(
-                "  ✗ {provider} can't search directly.\n     \
-                 set preferred_provider to \"senshi\" or \"allanime\" in config, or use the TUI.\n"
-            ),
+            // Unreachable in practice since ROD-491: the run only ever binds to
+            // a provider that reports `supports_search`. Kept total, and worded
+            // without the old config advice, which no longer applies.
+            FetchStage::Search => {
+                format!("  ✗ {provider} can't search directly; try again or use the TUI.\n")
+            }
             FetchStage::Episodes => {
                 format!("  ✗ {provider} can't list episodes for this show.\n")
             }
@@ -819,14 +821,22 @@ mod tests {
         assert_eq!(classify_pick("5", 5), PickInput::Pick(4));
     }
 
+    /// ROD-491 retired the config nudge here. The run only ever binds to a
+    /// provider reporting `supports_search`, so pointing at `preferred_provider`
+    /// would prescribe a fix for a state the user cannot reach. Every
+    /// Unsupported stage now reads as a dead operation.
     #[test]
-    fn search_unsupported_steers_to_the_fix_not_a_bare_word() {
+    fn search_unsupported_no_longer_nudges_at_config() {
+        for stage in [
+            FetchStage::Search,
+            FetchStage::Episodes,
+            FetchStage::Resolve,
+        ] {
+            let line = fetch_error_line(stage, FetchClass::Unsupported, "megaplay");
+            assert!(!line.contains("preferred_provider"), "{line}");
+        }
         let line = fetch_error_line(FetchStage::Search, FetchClass::Unsupported, "megaplay");
         assert!(line.contains("can't search directly"), "{line}");
-        assert!(line.contains("preferred_provider"), "{line}");
-        // Episodes/resolve stages read as a dead operation, not a config nudge.
-        let ep = fetch_error_line(FetchStage::Episodes, FetchClass::Unsupported, "megaplay");
-        assert!(!ep.contains("preferred_provider"), "{ep}");
     }
 
     #[test]

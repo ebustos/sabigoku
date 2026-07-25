@@ -264,9 +264,9 @@ const PICK_CAP: u64 = 256;
 const MAX_PICK_ATTEMPTS: usize = 1000;
 
 /// `sabigoku <query>` (06 §7.3): the one command whose failure exits nonzero.
-/// A single preferred provider, no fallback walk (03 §3.2); interactive stdin
-/// picks; store is best-effort and degrades. This chunk covers search and the
-/// show pick; episodes and playback land in the following chunks.
+/// One provider for the whole run, chosen for search capability rather than
+/// preference alone (ROD-491 deviation); interactive stdin picks; store is
+/// best-effort and degrades.
 fn run_play_cli(args: PlayArgs) -> ExitCode {
     let paths = match Paths::resolve() {
         Ok(p) => p,
@@ -314,7 +314,25 @@ fn run_play_cli(args: PlayArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let provider = registry.preferred(Some(config.preferred_provider.as_str()));
+    // Search-capable, not merely preferred (ROD-491 deviation, see
+    // `preferred_searchable`). Whichever one answers here owns the whole run.
+    let pref = config.preferred_provider.as_str();
+    let provider = match registry.preferred_searchable(Some(pref)) {
+        Some(p) => p,
+        None => {
+            println!("  ✗ no configured source can search.");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(asked) = registry.by_name(pref)
+        && asked.name() != provider.name()
+    {
+        println!(
+            "  (note: {} can't search, so this run uses {}.)",
+            asked.display_name(),
+            provider.display_name()
+        );
+    }
 
     ExitCode::from(play_flow(
         provider,

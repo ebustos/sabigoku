@@ -17,6 +17,14 @@ publishes that section verbatim as the release body.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`sabigoku <query>` works on a stock install**: the CLI used to bind to
+  whichever source was configured and give up if that one could not search,
+  which on a fresh install it never could. It now picks the first source that
+  can search. Setting a source explicitly is still honoured whenever it can
+  search, and you get a one-line note when it cannot.
+
 ## [0.1.0] - 2026-07-25
 
 First tagged release, a terminal anime browser and player written in Rust.
