@@ -1769,8 +1769,9 @@ struct Reconciled {
 }
 
 /// The reconcile matrix (06 §5.4). `base` is the snapshot, `None` on first
-/// contact (treated as Planning). Progress is `max(local, remote)`; the
-/// snapshot re-baselines to the raw remote pair when remote differs from base.
+/// contact (Planning / 0). Status and progress run the same three-way matrix
+/// against their own half of the base; the snapshot re-baselines to the raw
+/// remote pair when remote differs from base.
 fn reconcile(
     base: Option<(ListStatus, u32)>,
     local: (ListStatus, u32),
@@ -1791,10 +1792,23 @@ fn reconcile(
     };
     Reconciled {
         status,
-        progress: local.1.max(remote.1),
+        progress: merge_progress(base.map_or(0, |(_, p)| p), local.1, remote.1),
         snapshot_status: snapshot.0,
         snapshot_progress: snapshot.1,
         conflict,
+    }
+}
+
+/// Progress half of the 06 §5.4 matrix (ROD-497). A remote-only move is adopted
+/// whole, downward included: a raise-only rule cannot represent a corrected
+/// entry, and re-baselining the snapshot to the lower remote would then queue
+/// the stale local value for push and overwrite the correction. Both-moved
+/// still takes the max, so a genuine race loses no watched episodes.
+fn merge_progress(base: u32, local: u32, remote: u32) -> u32 {
+    match (local != base, remote != base) {
+        (false, true) => remote,
+        (true, false) => local,
+        _ => local.max(remote),
     }
 }
 
@@ -3424,7 +3438,7 @@ mod tests {
 
     #[test]
     fn reconcile_matrix_covers_every_cell() {
-        // no/no: unchanged status, progress still maxes.
+        // no/no status, remote-only progress bump: adopted.
         let r = reconcile(
             Some((ListStatus::Watching, 5)),
             (ListStatus::Watching, 5),
@@ -3506,6 +3520,63 @@ mod tests {
             (r.snapshot_status, r.snapshot_progress),
             (ListStatus::Watching, 2)
         );
+    }
+
+    #[test]
+    fn reconcile_adopts_a_remote_only_progress_correction_downward() {
+        // ROD-497: the entry carried an impossible progress (14 of a season
+        // with 4 aired) and the user fixed it on AniList. Local never moved off
+        // the snapshot, so the correction is the only edit in play.
+        let r = reconcile(
+            Some((ListStatus::Watching, 14)),
+            (ListStatus::Watching, 14),
+            (ListStatus::Watching, 4),
+        );
+        assert_eq!(
+            (r.status, r.progress, r.conflict),
+            (ListStatus::Watching, 4, false)
+        );
+        // Both halves agree, so nothing is left dirty to push back.
+        assert_eq!(
+            (r.snapshot_status, r.snapshot_progress),
+            (ListStatus::Watching, 4)
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_local_progress_when_only_local_moved() {
+        // The raise-only rule's real job, unchanged: a local watch that has not
+        // reached AniList yet survives a pull that carries the stale value.
+        let r = reconcile(
+            Some((ListStatus::Watching, 4)),
+            (ListStatus::Watching, 7),
+            (ListStatus::Watching, 4),
+        );
+        assert_eq!(r.progress, 7);
+    }
+
+    #[test]
+    fn pull_does_not_push_a_remote_progress_correction_back() {
+        // The whole ROD-497 failure in one pass: before the fix the merge kept
+        // 14, re-baselined the snapshot to 4, and the mismatch queued the row
+        // to shove 14 back onto the corrected entry.
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            97,
+            ListStatus::Watching,
+            14,
+            Some((ListStatus::Watching, 14)),
+        );
+        let out = store
+            .reconcile_pull(&[remote(97, ListStatus::Watching, 4)], 0)
+            .unwrap();
+        assert_eq!(out.reconciled, 1);
+        assert_eq!(
+            state(&store, 97),
+            (ListStatus::Watching, 4, Some(ListStatus::Watching), Some(4))
+        );
+        assert!(store.list_dirty_for_sync().unwrap().is_empty());
     }
 
     #[test]

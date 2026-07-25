@@ -848,11 +848,22 @@ Format: `[████████░░░░░░░░]  8 / 28 eps`
 - Filled cells: **selection-aware** (see below); `state.focus` only on the cursor
   bar, otherwise the per-status color.
 - Empty cells: `border.hair`.
-- `█` for filled, `░` for empty.
+- `█` for filled, `░` for empty, `·` for not-yet-aired (`border.hair`).
 - Bar width: 16 chars minimum, scales to available space with a max of 24 chars.
 - Episode fraction text: `text.muted` on the cursor bar, else `text.dim`.
 - Resume point: a `◐` injected at the resume position within the bar, e.g.
   `[████◐░░░░░░░░░░░]` where `◐` is at episode 5 of 28.
+- **Aired tail.** On an airing show the cells past the aired count (§4.6's
+  `aired_count`, `nextAiringEpisode - 1`) render `·` instead of `░`, so the bar
+  separates "not watched" from "does not exist yet": `[███·············]  3 / 14 eps`
+  is three of the three episodes out, not three of fourteen. The fill is capped
+  at that same count, so it can never claim more episodes than have aired. The
+  cap binds only on progress the season cannot support, which is impossible data
+  but reachable: a first-contact sync adopts the remote entry whole, and before
+  ROD-497 the merge could not lower it again. Without the cap such a row paints a
+  full bar and reads as complete while the detail pane beside it counts down to
+  the next episode. The fraction text is untouched and still reports stored
+  progress over the season total; the bar is what stops implying they agree.
 
 The fill color is **selection-aware**: `state.focus` means "the focused cursor row"
 (the same cyan as the `▸`/title, §4.1), so the bar earns it ONLY when the row is

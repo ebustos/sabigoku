@@ -416,22 +416,26 @@ fn draw_bar_row(
         frame.render_widget(Block::new().style(Style::new().bg(palette.surface)), row);
     }
     let width = bar_width(area.width);
-    let (filled, resume_cell) = bar_geometry(
+    let bar = bar_geometry(
         show.progress,
         show.enrichment.total_episodes,
+        super::detail::aired_count(&show.enrichment),
         state.resume.get(ix).copied().flatten(),
         width,
     );
     let fill_style = render::bar_fill_color(palette, show.list_status, selected, focused);
     let frac_style = render::bar_frac_color(palette, show.list_status, selected, focused);
-    let mut spans = vec![Span::styled("[", Style::new().fg(palette.chrome))];
+    let chrome = Style::new().fg(palette.chrome);
+    let mut spans = vec![Span::styled("[", chrome)];
     for i in 0..width {
-        let (glyph, style) = if Some(i) == resume_cell {
+        let (glyph, style) = if Some(i) == bar.resume {
             ("◐", fill_style)
-        } else if i < filled {
+        } else if i < bar.filled {
             ("█", fill_style)
+        } else if bar.unaired.is_some_and(|u| i >= u) {
+            ("·", chrome)
         } else {
-            ("░", Style::new().fg(palette.chrome))
+            ("░", chrome)
         };
         spans.push(Span::styled(glyph, style));
     }
@@ -452,24 +456,46 @@ fn bar_width(avail: u16) -> u16 {
     avail.saturating_sub(30).clamp(BAR_MIN, BAR_MAX)
 }
 
-/// Filled cells + the `◐` resume cell (DESIGN 4.5, 8.1): a null total fills
-/// a third of the bar as a non-zero signal and carries no resume marker.
+/// Cell geometry for one bar (DESIGN 4.5, 8.1).
+struct BarGeometry {
+    filled: u16,
+    /// The `◐` resume cell; outranks every other glyph, being a real watch.
+    resume: Option<u16>,
+    /// First cell of the not-yet-aired tail. None means everything the total
+    /// claims is already out, which is every settled show.
+    unaired: Option<u16>,
+}
+
+/// A null total fills a third of the bar as a non-zero signal and carries
+/// neither resume marker nor aired tail: no denominator, nothing to scale.
+///
+/// Fill is capped at the aired count so it can never claim more episodes than
+/// exist (ROD-497). Progress above what has aired is impossible but reachable,
+/// since a first-contact pull adopts the remote entry whole.
 fn bar_geometry(
     progress: u32,
     total: Option<u32>,
+    aired: Option<u32>,
     resume_ep: Option<u32>,
     width: u16,
-) -> (u16, Option<u16>) {
+) -> BarGeometry {
     let width_u32 = u32::from(width);
     match total {
         Some(t) if t > 0 => {
-            let filled = (progress.min(t) * width_u32 / t) as u16;
-            let resume = resume_ep
-                .filter(|ep| *ep >= 1)
-                .map(|ep| ((ep - 1).min(t - 1) * width_u32 / t) as u16);
-            (filled, resume)
+            let reached = aired.map_or(progress, |a| progress.min(a));
+            BarGeometry {
+                filled: (reached.min(t) * width_u32 / t) as u16,
+                resume: resume_ep
+                    .filter(|ep| *ep >= 1)
+                    .map(|ep| ((ep - 1).min(t - 1) * width_u32 / t) as u16),
+                unaired: aired.filter(|a| *a < t).map(|a| (a * width_u32 / t) as u16),
+            }
         }
-        _ => (if progress > 0 { width / 3 } else { 0 }, None),
+        _ => BarGeometry {
+            filled: if progress > 0 { width / 3 } else { 0 },
+            resume: None,
+            unaired: None,
+        },
     }
 }
 
@@ -672,16 +698,41 @@ mod tests {
 
     #[test]
     fn bar_geometry_fills_marks_and_degrades() {
+        let g = |p, t, aired, ep| {
+            let b = bar_geometry(p, t, aired, ep, 16);
+            (b.filled, b.resume, b.unaired)
+        };
         // 6/12 in a 16-wide bar: half filled.
-        assert_eq!(bar_geometry(6, Some(12), None, 16), (8, None));
+        assert_eq!(g(6, Some(12), None, None), (8, None, None));
         // Resume at episode 7: marker on the cell after the fill.
-        assert_eq!(bar_geometry(6, Some(12), Some(7), 16), (8, Some(8)));
+        assert_eq!(g(6, Some(12), None, Some(7)), (8, Some(8), None));
         // Overshoot clamps; marker clamps to the last cell.
-        assert_eq!(bar_geometry(20, Some(12), Some(99), 16), (16, Some(14)));
+        assert_eq!(g(20, Some(12), None, Some(99)), (16, Some(14), None));
         // Null total: one-third signal when engaged, empty when not (8.1).
-        assert_eq!(bar_geometry(3, None, Some(2), 16), (5, None));
-        assert_eq!(bar_geometry(0, None, None, 16), (0, None));
-        assert_eq!(bar_geometry(0, Some(12), Some(1), 16), (0, Some(0)));
+        assert_eq!(g(3, None, None, Some(2)), (5, None, None));
+        assert_eq!(g(0, None, None, None), (0, None, None));
+        assert_eq!(g(0, Some(12), None, Some(1)), (0, Some(0), None));
+    }
+
+    #[test]
+    fn bar_geometry_never_fills_past_the_aired_count() {
+        let g = |p, t, aired| {
+            let b = bar_geometry(p, t, aired, None, 16);
+            (b.filled, b.unaired)
+        };
+        // ROD-497: 14/14 on a season with 4 aired stops at the aired edge
+        // instead of painting a full bar that reads as complete.
+        assert_eq!(g(14, Some(14), Some(4)), (4, Some(4)));
+        // Caught up on what exists renders identically to the same progress
+        // with no aired data: the cap only ever binds on impossible progress.
+        assert_eq!(g(4, Some(14), Some(4)), (4, Some(4)));
+        assert_eq!(g(4, Some(14), None).0, 4);
+        // Aired but unwatched keeps its own register between fill and tail.
+        assert_eq!(g(0, Some(14), Some(4)), (0, Some(4)));
+        // Nothing aired: the whole bar is tail.
+        assert_eq!(g(0, Some(14), Some(0)), (0, Some(0)));
+        // An aired count at or past the total leaves no tail to mark.
+        assert_eq!(g(14, Some(14), Some(14)), (16, None));
     }
 
     #[test]

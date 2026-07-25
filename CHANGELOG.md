@@ -19,6 +19,15 @@ publishes that section verbatim as the release body.
 
 ### Fixed
 
+- **Correcting an episode count on AniList sticks**: sync only ever raised
+  progress, so lowering a wrong count on AniList did not survive. The next sync
+  kept the old higher number and pushed it back over the correction. Corrections
+  now land, and a local watch that has not reached AniList yet is still safe.
+- **Airing shows no longer read as finished**: the progress bar fills only as far
+  as the episodes that have actually aired, and marks the rest of the season with
+  a lighter track. A show whose tracked count ran ahead of the broadcast used to
+  paint a full bar while the detail pane counted down to the next episode.
+
 - **`sabigoku <query>` works on a stock install**: the CLI used to bind to
   whichever source was configured and give up if that one could not search,
   which on a fresh install it never could. It now picks the first source that

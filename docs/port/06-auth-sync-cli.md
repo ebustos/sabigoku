@@ -248,8 +248,24 @@ local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
 | yes | yes, same target | keep local (converged) | no |
 | yes | yes, different | **keep local** | **yes** (stays dirty for push) |
 
-- **progress** = `max(local, remote)` in every cell, unconditionally.
-- `REPEATING` is folded to `watching` at ingest, before the merge; progress still maxes.
+- **progress** runs the same matrix against the snapshot's progress half
+  (`0` on first contact), independently of the status outcome:
+
+| local_moved | remote_moved | progress outcome |
+|---|---|---|
+| no | no | unchanged |
+| no | yes | **adopt remote, downward included** |
+| yes | no | keep local |
+| yes | yes | `max(local, remote)` |
+
+  Deviation from zigoku, which maxes in every cell unconditionally (ROD-497; see
+  the backport ledger). A raise-only rule cannot represent a corrected entry: the
+  merge keeps the stale high local value, the snapshot re-baselines to the lower
+  remote, and the resulting mismatch queues the row to push the stale value back
+  over the correction. `max` survives only where it earns its keep, the
+  both-moved race, so no watched episode is lost.
+- `REPEATING` is folded to `watching` at ingest, before the merge; the progress
+  matrix runs the same either way.
 
 After merge write:
 
