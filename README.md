@@ -48,3 +48,13 @@ everywhere else.
 - [`PORT.md`](PORT.md) and [`docs/port/`](docs/port/): what zigoku does, and how each piece maps to Rust
 - [`DESIGN.md`](DESIGN.md): the design system, layout grammar and UI contracts
 - [`SPIKES.md`](SPIKES.md): the Rust-versus-Zig ledger from the M0 spikes
+
+## License
+
+[GPL-3.0-or-later](LICENSE), the same as zigoku. This is a port of a GPL
+project, and the lineage runs back one step further: zigoku learned the
+AllAnime protocol by studying [anipy-cli](https://github.com/sdaqo/anipy-cli)
+(GPL-3.0) and reimplemented the wire protocol from observed behavior rather
+than copying code. The license keeps that unambiguous.
+
+Catalogue metadata and cover art come from [AniList](https://anilist.co/).
