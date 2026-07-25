@@ -22,9 +22,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      # A tag that disagrees with the manifest ships a binary whose --version
-      # lies, and ROD-465's update-check compares against exactly that string.
-      # Fail here, before four artifacts get built against a bad number.
+      # A tag disagreeing with the manifest ships a binary whose --version lies,
+      # and ROD-465's update-check compares against that string.
+      # Keep the version line bare: this parser does not strip inline comments.
       - id: version
         shell: bash
         run: |
@@ -68,9 +68,8 @@ jobs:
             runner: macos-latest
             musl: false
             smoke: true
-          # Cross-built on the arm runner because macos-13 (the last Intel
-          # image) is on GitHub's deprecation path. An arm runner cannot exec
-          # an x86_64 binary, so this is the one artifact that ships unsmoked.
+          # Cross-built: macos-13, the last Intel image, is being retired. An
+          # arm runner cannot exec x86_64, so this artifact ships unsmoked.
           - target: x86_64-apple-darwin
             runner: macos-latest
             musl: false
@@ -102,9 +101,8 @@ jobs:
           fi
           echo "$got"
 
-      # Flat layout: extraction drops the binary straight where the installer
-      # and the manual instructions expect it. LICENSE rides along because
-      # GPL-3 section 4 requires it accompany a conveyed binary.
+      # Flat layout: ROD-463's installer expects the binary at the archive root.
+      # LICENSE ships because GPL-3 section 4 requires it accompany a binary.
       - name: package
         shell: bash
         run: |
@@ -148,8 +146,7 @@ jobs:
           sha256sum sabigoku-v*.tar.gz > sha256sums.txt
           cat sha256sums.txt
 
-      # Draft while the pipeline is unproven; flip to a published release once
-      # a tag has gone through end to end (ROD-487).
+      # Draft until a tag has gone through end to end; ROD-492 removes it.
       - name: create draft release
         env:
           GH_TOKEN: ${{ github.token }}
