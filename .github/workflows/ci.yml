@@ -6,10 +6,21 @@ on:
   pull_request:
     branches: [master]
 
+# Least privilege: this workflow only reads the checkout. Keeps a future edit
+# (or the org default flipping) from silently granting it write scope.
+permissions:
+  contents: read
+
+# One run per ref; a fresh push cancels the superseded run instead of piling up.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-test:
     name: lint + test (linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,13 +35,24 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       # No --ignored / --include-ignored here, ever: the _live tests hit the network.
       - run: cargo test
+      # Assert each live target runs zero tests (all #[ignore]d). Semantic, not a
+      # grep of #[ignore]: a commented-out attribute, #[tokio::test], or a rename
+      # all fool text counting, but a test that actually runs cannot hide here.
       - name: live tests must stay ignored
+        shell: bash
         run: |
-          for f in tests/*_live.rs; do
-            n=$(grep -c '#\[test\]' "$f")
-            i=$(grep -c '#\[ignore' "$f")
-            if [ "$n" != "$i" ]; then
-              echo "::error file=$f::live test file has an un-ignored test ($n tests, $i ignored)"
+          shopt -s nullglob
+          targets=(tests/*_live.rs)
+          if [ ${#targets[@]} -eq 0 ]; then
+            echo "::error::no tests/*_live.rs found; the live-test guard is watching nothing"
+            exit 1
+          fi
+          for f in "${targets[@]}"; do
+            name=$(basename "$f" .rs)
+            out=$(cargo test --test "$name" 2>&1 || true)
+            if ! grep -qE 'test result: ok\. 0 passed; 0 failed' <<<"$out"; then
+              echo "::error file=$f::$name ran a live test unignored; every _live test must be #[ignore]d"
+              grep 'test result:' <<<"$out" || true
               exit 1
             fi
           done
@@ -38,6 +60,7 @@ jobs:
   macos-build:
     name: build (macos)
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
