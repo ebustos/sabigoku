@@ -139,7 +139,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: draft release
+    name: publish release
     needs: [guard, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -182,15 +182,25 @@ jobs:
           sha256sum sabigoku-v*.tar.gz > sha256sums.txt
           cat sha256sums.txt
 
-      # Draft until a tag has gone through end to end; ROD-492 removes it.
-      - name: create draft release
+      # Publishes live on tag push (ROD-492). There is no human gate left: the
+      # version guard, the changelog guard, the smoke tests and the artifact
+      # count are the only things between a bad tag and the internet. Weigh that
+      # before weakening any of them.
+      # A tag carrying a suffix (v0.2.0-rc1) publishes as a prerelease, so it
+      # never becomes the release an installer resolves as latest.
+      - name: publish release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          extra=()
+          case "${GITHUB_REF_NAME}" in
+            *-*) extra+=(--prerelease); echo "suffixed tag, publishing as a prerelease" ;;
+          esac
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --draft \
             --notes-file notes.md \
             --title "sabigoku ${GITHUB_REF_NAME}" \
+            "${extra[@]}" \
             artifacts/sabigoku-v*.tar.gz \
             artifacts/sha256sums.txt
