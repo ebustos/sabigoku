@@ -297,10 +297,18 @@ local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
   both-moved race, so no watched episode is lost.
 - **No status special-case, `completed` included.** The two halves merge
   independently, so a kept-local `completed` can pair with a progress adopted
-  from behind it. That pair is **accepted**: it is legal on AniList, and every
-  rule tried for "correcting" it reduced to overriding the one cell where local
-  progress did not move and the remote lowered it, which is precisely the
-  correction this section exists to let through (ROD-497, four review rounds).
+  from behind it. That pair is **accepted**: every rule tried for "correcting" it
+  reduced to overriding the one cell where local progress did not move and the
+  remote lowered it, which is precisely the correction this section exists to let
+  through (ROD-497).
+
+  `OPEN`: this assumes `SaveMediaListEntry` stores a `completed` entry at the
+  progress we send rather than coercing it up to the episode count. Unverified
+  against the live API. If it coerces, the push succeeds, the snapshot records
+  what we sent, and the next pull adopts the server's raised value through the
+  adopt-remote cell with no conflict raised. Not destructive, but it would make
+  the correction fail to stick on completed rows; worth one captured round trip
+  to settle.
 
   In particular the merge must never snap progress to `total_episodes`. That is
   what `setListStatus` does (02 §4b), but `setListStatus` is a deliberate user

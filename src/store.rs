@@ -1815,6 +1815,16 @@ fn reconcile(
 
 /// Progress half of the 06 §5.4 matrix. `max` only in the both-moved cell:
 /// anywhere else it would re-raise a correction.
+///
+/// INVARIANT the `(false, true)` cell rests on: the snapshot never leads the
+/// server. `local == base` is read as "local never edited progress", which is
+/// only sound while `base` holds a value the server confirmed. Two things keep
+/// it true and both must stay true: `mark_synced` fires only after `save_entry`
+/// returns Ok (no optimistic stamp), and the born-clean seeds that snapshot from
+/// LOCAL progress (`record_engagement`, `adopt_orphaned_progress`) are gated on
+/// `library_added_at IS NULL`, which every writer that can raise progress above
+/// zero stamps in the same statement. Break either and this cell silently
+/// discards a real local watch.
 fn merge_progress(base: u32, local: u32, remote: u32) -> u32 {
     match (local != base, remote != base) {
         (false, true) => remote,
@@ -3600,10 +3610,10 @@ mod tests {
 
     #[test]
     fn a_remote_that_completed_at_its_own_progress_is_adopted_whole() {
-        // Both sides moved to completed, so the remote HELD this pair: there is
-        // no synthesis to correct and the floor must stay out of it. Local
-        // reaching completed independently is not a licence to overwrite the
-        // progress the remote completed at.
+        // Both sides converged on completed and only the remote moved progress,
+        // so the progress half adopts it whole. Local reaching completed
+        // independently is not a licence to overwrite the progress the remote
+        // completed at.
         let r = reconcile(
             Some((ListStatus::Watching, 20)),
             (ListStatus::Completed, 20),
@@ -3631,10 +3641,10 @@ mod tests {
 
     #[test]
     fn a_settled_completed_row_still_takes_a_downward_correction() {
-        // The ticket's headline case on a completed show. Nothing local moved,
-        // so there is no synthesis and the floor must not engage: guarding on
-        // `local.0 == Completed` alone reverts this silently, with conflict
-        // false, and pushes the stale value back.
+        // The ticket's headline case on a completed show: nothing local moved,
+        // so the remote correction is the only edit in play and it lands. Any
+        // status special-case here reverts it silently, with conflict false,
+        // and pushes the stale value back.
         let r = reconcile(
             Some((ListStatus::Completed, 24)),
             (ListStatus::Completed, 24),
@@ -3665,8 +3675,7 @@ mod tests {
         // A local status move to completed must NOT override the progress half.
         // The user pressed `c` on the device and lowered progress on the server;
         // both edits survive, and the resulting pair is legal on AniList. Every
-        // floor tried here reduced to overriding exactly this cell, the one the
-        // ticket exists to preserve.
+        // status special-case tried here reduced to overriding this one cell.
         let r = reconcile(
             Some((ListStatus::Watching, 24)),
             (ListStatus::Completed, 24),
@@ -3682,6 +3691,38 @@ mod tests {
             (ListStatus::Planning, 4),
         );
         assert_eq!((r.status, r.progress), (ListStatus::Watching, 4));
+
+        // 06 §5.4 promises the local status edit still reaches the server. It
+        // survives the merge and leaves the row dirty, so the push carries it.
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            91,
+            ListStatus::Completed,
+            24,
+            Some((ListStatus::Watching, 24)),
+        );
+        store
+            .reconcile_pull(&[remote(91, ListStatus::Watching, 4)], 900)
+            .unwrap();
+        assert_eq!(
+            state(&store, 91),
+            (
+                ListStatus::Completed,
+                4,
+                Some(ListStatus::Watching),
+                Some(4)
+            )
+        );
+        let dirty = store.list_dirty_for_sync().unwrap();
+        assert_eq!(
+            dirty
+                .iter()
+                .find(|r| r.anilist_id == 91)
+                .map(|r| (r.list_status, r.progress)),
+            Some((ListStatus::Completed, 4)),
+            "the local completion pushes, carrying the corrected progress"
+        );
     }
 
     #[test]
