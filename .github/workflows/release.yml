@@ -471,6 +471,20 @@ jobs:
           ruby -c "$f"
           cat "$f"
 
+      # ruby -c proves the file parses; only brew proves it is a formula.
+      # Audit wants the file inside a tap, hence the throwaway local skeleton.
+      # The ubuntu image ships linuxbrew off PATH.
+      - name: brew audit the rendered formula
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap-new --no-git vantroy/sabigoku
+          cp packaging/homebrew/sabigoku.rb \
+            "$(brew --repository vantroy/sabigoku)/Formula/sabigoku.rb"
+          brew audit --strict --formula vantroy/sabigoku/sabigoku
+
       - name: push to the tap
         shell: bash
         env:

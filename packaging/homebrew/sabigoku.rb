@@ -11,11 +11,11 @@ class Sabigoku < Formula
   license "GPL-3.0-or-later"
 
   # Binary formula over the release tarball, arm64-only since ROD-496 cut the
-  # Intel macOS artifact. Intel Macs and Linux are served by cargo install, the
-  # installer and the AUR package; this formula must never claim an arch the
+  # Intel macOS artifact. Intel Macs have cargo install only (install.sh
+  # refuses them and says so); this formula must never claim an arch the
   # release does not ship.
-  depends_on :macos
   depends_on arch: :arm64
+  depends_on :macos
   # Playback shells out to mpv at runtime; nothing links it.
   depends_on "mpv"
 
@@ -25,6 +25,6 @@ class Sabigoku < Formula
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/sabigoku --version")
+    assert_match "sabigoku v#{version}", shell_output("#{bin}/sabigoku --version")
   end
 end

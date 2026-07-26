@@ -6,9 +6,10 @@
 `brew install vantroy/sabigoku/sabigoku`.
 
 It is a binary formula over the published macOS arm64 tarball, the mac mirror
-of the AUR package. Intel Macs and Linux are covered by `cargo install
-sabigoku`, the installer and the AUR; the formula refuses those hosts rather
-than promising an artifact the release does not ship.
+of the AUR package. The formula refuses other hosts rather than promising an
+artifact the release does not ship: Linux has the installer, the AUR and
+`cargo install sabigoku`; an Intel Mac has `cargo install` only, and
+`install.sh` tells it so.
 
 ## What the release job rewrites
 
