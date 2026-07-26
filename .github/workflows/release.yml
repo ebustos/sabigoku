@@ -361,6 +361,10 @@ jobs:
           path: |
             packaging/aur/PKGBUILD
             packaging/aur/.SRCINFO
+          # .SRCINFO is a dotfile and this action excludes hidden files by
+          # default. Without this the artifact carries only the PKGBUILD, and
+          # if-no-files-found cannot see the difference.
+          include-hidden-files: true
           if-no-files-found: error
 
   aur-publish:
