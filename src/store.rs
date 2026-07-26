@@ -1529,12 +1529,13 @@ impl Store {
         &self,
         remote: &[crate::anilist::RemoteEntry],
     ) -> Result<ReconcilePlan, Error> {
-        // Collapse duplicate ids across custom lists (06 §5.4) by (updatedAt,
-        // progress), never by progress alone: a correction is the smaller
-        // number, so magnitude would re-raise it. Recency decides; progress only
-        // breaks a tie, which keeps the fold order-independent even when the
-        // whole group is unstamped (AniList nulls updatedAt on entries untouched
-        // since the field landed, and null maps to 0).
+        // Collapse duplicate ids across groups (06 §5.4) by (updatedAt,
+        // progress): recency decides, magnitude only breaks a tie. Defensive;
+        // real copies are views of one record and agree. Collapsing by
+        // progress first would re-raise the correction the merge exists to land.
+        // An entirely unstamped group (AniList nulls updatedAt on rows untouched
+        // since the field landed, and null maps to 0) falls back to plain max,
+        // which is order-independent but carries that same upward bias.
         // Seeds are per-media; the first non-empty one per id wins (O3).
         let mut remote_map: HashMap<i64, (ListStatus, u32, i64)> = HashMap::new();
         let mut seeds: HashMap<i64, Enrichment> = HashMap::new();
@@ -1658,9 +1659,9 @@ impl Store {
         for r in imports {
             let tx = immediate_tx(&self.conn)?;
             add_to_library_on(&tx, &r.seed, now)?;
-            // Same rise-only clause as the merge apply below. Equivalent here,
-            // since the CAS pins the pre-mint progress at 0, but kept identical
-            // so the two never read as an intentional divergence.
+            // The CAS pins the pre-mint progress at 0, so rise-only and
+            // any-change are equivalent here; kept in the rise-only form the
+            // merge apply below requires.
             let changed = tx.execute(
                 "UPDATE show SET
                     list_status = :status,
@@ -1803,13 +1804,15 @@ fn reconcile(
     let merged = merge_progress(base.map_or(0, |(_, p)| p), local.1, remote.1);
     Reconciled {
         status,
-        // Cross-half synthesis guard: the halves merge independently, so a
-        // kept-local `completed` can pair with an adopted-remote progress
-        // behind it, a pair neither side held. Hold local's own progress there.
-        // The guard is on the synthesis, never on the status alone: raising to
-        // the total instead would mint watch data on any completed row whose
-        // cached total drifted up, then push it, and re-raise it every pull.
-        progress: if status == ListStatus::Completed && local.0 == ListStatus::Completed {
+        // Cross-half synthesis floor: only where the status half KEPT a local
+        // move to completed while the progress half adopted a remote value
+        // behind it, a pair neither side held. Every clause earns its place;
+        // drop `local_moved` and this fires on settled completed rows, where it
+        // reverts the correction the ticket exists to land (06 §5.4).
+        progress: if local_moved
+            && status == ListStatus::Completed
+            && local.0 == ListStatus::Completed
+        {
             merged.max(local.1)
         } else {
             merged
@@ -3606,7 +3609,38 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_local_completed_holds_its_own_progress() {
+    fn a_settled_completed_row_still_takes_a_downward_correction() {
+        // The ticket's headline case on a completed show. Nothing local moved,
+        // so there is no synthesis and the floor must not engage: guarding on
+        // `local.0 == Completed` alone reverts this silently, with conflict
+        // false, and pushes the stale value back.
+        let r = reconcile(
+            Some((ListStatus::Completed, 24)),
+            (ListStatus::Completed, 24),
+            (ListStatus::Completed, 12),
+        );
+        assert_eq!((r.status, r.progress), (ListStatus::Completed, 12));
+
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            93,
+            ListStatus::Completed,
+            24,
+            Some((ListStatus::Completed, 24)),
+        );
+        store
+            .reconcile_pull(&[remote(93, ListStatus::Completed, 12)], 700)
+            .unwrap();
+        assert_eq!(state(&store, 93).1, 12, "correction landed");
+        assert!(
+            store.list_dirty_for_sync().unwrap().is_empty(),
+            "nothing queued to push the stale value back"
+        );
+    }
+
+    #[test]
+    fn a_kept_local_completed_floors_progress_at_its_own() {
         // Cross-half synthesis: status keeps local Completed while progress
         // adopts a remote value behind it, a pair neither side held.
         let r = reconcile(

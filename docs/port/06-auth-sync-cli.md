@@ -236,10 +236,18 @@ park user state on a show the user never engaged (02 §3.7). The O3 auto-import
 WATCHING/REPEATING entry: it promotes an existing identity row rather than
 merging it.
 
-**Duplicate collapse, before the merge.** `MediaListCollection` returns one
-entry per custom list a media is tagged in, so the flat list can hold several
-rows for one id. They collapse to one pair per id by **`(updatedAt, progress)`**:
-recency decides, and progress only breaks a tie. Recency, not magnitude:
+**Duplicate collapse, before the merge.** `MediaListCollection` groups entries,
+and a media in custom lists appears once per group it belongs to, so the flat
+list can hold several rows for one id. Those rows are views of a single
+`MediaList` record, so in practice their progress and `updatedAt` agree; a
+capture of an account with custom lists would be needed to show otherwise, and
+none exists here. The collapse rule below is therefore **defensive**, not a fix
+for an observed divergence: it decides what happens if copies ever disagree,
+whether through an API change, a partial response, or a tampered one. They collapse to one pair per id by **`(updatedAt, progress)`**:
+recency decides, and progress only breaks a tie. When a whole group is
+unstamped the tiebreak is all that is left, so the fold degenerates to plain
+max-progress there: order-independent, but carrying the same upward bias this
+chapter rejects above. That is the floor of the guarantee, not the intent. Recency, not magnitude:
 collapsing by progress would re-raise exactly what the merge below exists to
 lower, since a correction is by definition the smaller number, and a stale copy
 in any custom list would silently pin the old value forever.
@@ -247,8 +255,10 @@ in any custom list would silently pin the old value forever.
 Ties are ordinary. One edit fans across custom lists at a single stamp, and
 AniList nulls `updatedAt` on entries untouched since the field landed, which maps
 to `0` and can leave a whole group unstamped. The progress tiebreak keeps the
-fold order-independent in both cases rather than adopting whichever group the
-server happened to serialize first.
+fold order-independent **for progress** in both cases rather than adopting
+whichever group the server happened to serialize first. Two copies alike in both
+stamp and progress but differing in status still resolve by wire order; no
+signal exists to separate them, and no evidence says AniList emits that shape.
 
 Deviation from zigoku, which dedupes at ingest by **unconditional last-wins wire
 order** (`anilist.zig:605-611`) and never requested `updatedAt`
@@ -289,7 +299,8 @@ local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
 - **Cross-half synthesis guard.** Because the two matrices run independently they
   can land on `completed` with a progress adopted from behind it, a pair neither
   side held. When the status outcome is `completed` **and local's own status was
-  already `completed`**, progress holds at local's value.
+  already `completed`**, progress takes local's value as a **floor**
+  (`max(merged, local)`), not as a hold: a remote advance above it still wins.
 
   The guard is deliberately on the synthesis, not on the merged status alone,
   and it holds a value **local already had** rather than reaching for the

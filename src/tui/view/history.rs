@@ -480,10 +480,11 @@ struct BarGeometry {
 /// 4.5): `next_airing_episode` is cached enrichment and goes stale for a full
 /// TTL, so a cap would hide an episode the user watched hours after it aired.
 ///
-/// Edge and fill share one rounding mode. Mixing them puts the edge a cell
-/// ahead of a fill that reaches the same episode, so a viewer caught up on
-/// everything broadcast gets a phantom "aired but unwatched" cell. The
-/// aired-episode-exists case is handled by the floor of 1, not by rounding up.
+/// Edge and fill share BOTH their rounding mode (floor) and their floor of one
+/// cell. Asymmetry either way puts the edge ahead of a fill reaching the same
+/// episode, which paints a phantom "aired but unwatched" cell for a viewer who
+/// is caught up. The floor is what gives a lone aired or watched episode a cell
+/// of its own on a long season, where the quotient truncates to zero.
 fn bar_geometry(
     progress: u32,
     total: Option<u32>,
@@ -497,7 +498,7 @@ fn bar_geometry(
     let cell = |eps: u32, t: u32| (u64::from(eps) * width_u64 / u64::from(t)) as u16;
     match total {
         Some(t) if t > 0 => BarGeometry {
-            filled: cell(progress.min(t), t),
+            filled: cell(progress.min(t), t).max(u16::from(progress > 0)),
             resume: resume_ep
                 .filter(|ep| *ep >= 1)
                 .map(|ep| cell((ep - 1).min(t - 1), t)),
@@ -738,14 +739,20 @@ mod tests {
         // so nothing is hidden; the edge at 4 is what says the rest is not out.
         assert_eq!(g(14, Some(14), Some(4)), (16, Some(4)));
         // Caught up on everything broadcast: no cell may read as aired and
-        // unwatched, so the edge sits exactly where the fill stops.
-        for (t, a) in [(14u32, 4u32), (24, 5), (13, 7), (12, 1)] {
-            let (filled, edge) = g(a, Some(t), Some(a));
-            assert_eq!(
-                filled,
-                edge.unwrap(),
-                "caught up {a}/{t}: phantom unwatched cell"
-            );
+        // unwatched. Swept, not sampled. Four hand-picked shapes passed this
+        // while 192 others failed, because the counterexamples cluster where
+        // the quotient truncates to zero.
+        for width in [16u16, 20, 24] {
+            for t in 1..=60u32 {
+                for a in 0..=t {
+                    let b = bar_geometry(a, Some(t), Some(a), None, width);
+                    let edge = b.aired.unwrap_or(b.filled);
+                    assert_eq!(
+                        b.filled, edge,
+                        "w{width} caught up {a}/{t}: phantom unwatched cell"
+                    );
+                }
+            }
         }
         // The stale-enrichment case the cap used to eat: next_airing_episode is
         // a day old and the user has watched the episode it does not know aired.
@@ -757,9 +764,12 @@ mod tests {
         assert_eq!(g(0, Some(14), Some(0)), (0, Some(0)));
         // An aired count at or past the total leaves no edge to mark.
         assert_eq!(g(14, Some(14), Some(14)), (16, None));
-        // One episode out of many still owns its cell: a floor here would mark
-        // the whole bar unaired while episode 1 is streaming.
-        assert_eq!(g(1, Some(20), Some(1)), (0, Some(1)));
+        // One episode out of many owns a cell on BOTH sides: the quotient
+        // truncates to zero, so without the floor the bar would read as
+        // nothing-aired while episode 1 is streaming, and without the SAME
+        // floor on the fill it would read as watched-nothing once seen.
+        assert_eq!(g(1, Some(20), Some(1)), (1, Some(1)));
+        assert_eq!(g(0, Some(20), Some(1)), (0, Some(1)));
     }
 
     /// The glyph precedence in `draw_bar_row` is the only place the three
@@ -768,26 +778,68 @@ mod tests {
     fn bar_row_renders_watched_claimed_and_unaired_registers() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let mut s = show(1, "Airing", ListStatus::Watching, 14);
-        s.enrichment.total_episodes = Some(14);
-        s.enrichment.status = Some("RELEASING".into());
-        s.enrichment.next_airing_episode = Some(5); // 4 aired
-        let mut st = state(vec![s]);
-        st.resume = vec![Some(4)];
-        let pal = &crate::tui::theme::TERMINAL_GHOST;
         let w = 60u16;
-        let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
-        term.draw(|f| draw_bar_row(f, Rect::new(0, 0, w, 1), 0, pal, &st, 0, true))
-            .unwrap();
-        let buf = term.backend().buffer();
-        let row: String = (0..w).map(|x| buf[(x, 0)].symbol()).collect();
-        assert!(row.contains("14 / 14 eps"), "fraction text intact: {row:?}");
-        assert!(row.contains('█'), "watched-and-aired register: {row:?}");
-        assert!(
-            row.contains('▓'),
-            "claimed-past-broadcast register: {row:?}"
+        let pal = &crate::tui::theme::TERMINAL_GHOST;
+        // 4 aired of 14. `progress` picks which registers coexist: 8 leaves an
+        // unaired tail past the claim, 14 is the ticket's own row.
+        let render = |progress: u32| {
+            let mut s = show(1, "Airing", ListStatus::Watching, progress);
+            s.enrichment.total_episodes = Some(14);
+            s.enrichment.status = Some("RELEASING".into());
+            s.enrichment.next_airing_episode = Some(5);
+            let mut st = state(vec![s]);
+            st.resume = vec![Some(4)];
+            let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
+            term.draw(|f| draw_bar_row(f, Rect::new(0, 0, w, 1), 0, pal, &st, 0, true))
+                .unwrap();
+            let buf = term.backend().buffer();
+            let row: String = (0..w).map(|x| buf[(x, 0)].symbol()).collect();
+            let fg: Vec<_> = (0..w).map(|x| buf[(x, 0)].fg).collect();
+            (row, fg)
+        };
+
+        let (row, fg) = render(8);
+        assert!(row.contains("8 / 14 eps"), "fraction text intact: {row:?}");
+        for g in ['█', '▓', '·', '◐'] {
+            assert!(row.contains(g), "missing {g} register: {row:?}");
+        }
+        // Glyph alone is nearly invisible at one-cell scale: a claim past the
+        // broadcast must be UNLIT, or the row still scans as a full bar and the
+        // ticket's symptom stands. Style, not just shape.
+        let fg_of = |row: &str, fg: &[ratatui::style::Color], g: char| {
+            row.chars()
+                .position(|c| c == g)
+                .map(|i| fg[i])
+                .unwrap_or_else(|| panic!("no {g} cell in {row:?}"))
+        };
+        assert_eq!(
+            fg_of(&row, &fg, '▓'),
+            fg_of(&row, &fg, '·'),
+            "claimed-past-broadcast must be as unlit as the unaired tail"
         );
-        assert!(row.contains('◐'), "resume marker survives: {row:?}");
+        assert_ne!(
+            fg_of(&row, &fg, '▓'),
+            fg_of(&row, &fg, '█'),
+            "claimed-past-broadcast must not wear the fill colour"
+        );
+
+        // The ticket's row: a claim spanning the whole season must still leave
+        // the lit run stopping at the broadcast edge.
+        let (row, fg) = render(14);
+        let cells: Vec<char> = row.chars().collect();
+        let lit = fg_of(&row, &fg, '█');
+        let last_lit = cells
+            .iter()
+            .enumerate()
+            .filter(|&(i, &c)| c == '█' && fg[i] == lit)
+            .map(|(i, _)| i)
+            .next_back()
+            .expect("some lit cell");
+        let first_claim = cells.iter().position(|&c| c == '▓').expect("claim shown");
+        assert!(
+            last_lit < first_claim,
+            "lit run must end before the claim begins: {row:?}"
+        );
         // The claimed span sits after the aired span, never before it.
         let first_claimed = row.find('▓').unwrap();
         assert!(
