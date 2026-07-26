@@ -47,7 +47,7 @@ jobs:
           echo "version=${tag}" >> "$GITHUB_OUTPUT"
 
       # The release body is the curated CHANGELOG section, never generated from
-      # commits. Catch a missing or empty one here, not after four builds.
+      # commits. Catch a missing or empty one here, not after the builds.
       - name: changelog has a non-empty section for this version
         shell: bash
         run: |
@@ -76,24 +76,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Every target builds and runs on its own architecture. Intel macOS is
+          # deliberately absent: macos-13 is retired, so it could only be
+          # cross-built, and nothing here could execute what it produced.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             musl: true
-            smoke: true
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             musl: true
-            smoke: true
           - target: aarch64-apple-darwin
             runner: macos-latest
             musl: false
-            smoke: true
-          # Cross-built: macos-13, the last Intel image, is being retired. An
-          # arm runner cannot exec x86_64, so this artifact ships unsmoked.
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            musl: false
-            smoke: false
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -109,8 +103,15 @@ jobs:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }} --bin sabigoku
 
+      # Rosetta leaves the smoke test below arch-blind: an x86_64 binary would
+      # execute on this runner and print the right version. The other two
+      # targets need no such check, since a wrong arch simply will not exec.
+      - name: verify architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: file -b target/${{ matrix.target }}/release/sabigoku | grep '^Mach-O 64-bit.*arm64'
+
       - name: smoke test the artifact
-        if: matrix.smoke
         shell: bash
         run: |
           got=$(./target/${{ matrix.target }}/release/sabigoku --version)
@@ -175,8 +176,8 @@ jobs:
         run: |
           shopt -s nullglob
           set -- sabigoku-v*.tar.gz
-          if [ "$#" -ne 4 ]; then
-            echo "::error::expected 4 artifacts, found $#: $*"
+          if [ "$#" -ne 3 ]; then
+            echo "::error::expected 3 artifacts, found $#: $*"
             exit 1
           fi
           sha256sum sabigoku-v*.tar.gz > sha256sums.txt
@@ -188,6 +189,8 @@ jobs:
       # before weakening any of them.
       # A tag carrying a suffix (v0.2.0-rc1) publishes as a prerelease, so it
       # never becomes the release an installer resolves as latest.
+      # --verify-tag stops gh from minting a tag off HEAD. On a tags: trigger
+      # the tag exists by construction, so it only ever fires on a broken one.
       - name: publish release
         shell: bash
         env:
@@ -199,6 +202,7 @@ jobs:
           esac
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
             --notes-file notes.md \
             --title "sabigoku ${GITHUB_REF_NAME}" \
             "${extra[@]}" \

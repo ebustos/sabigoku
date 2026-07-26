@@ -17,6 +17,13 @@ publishes that section verbatim as the release body.
 
 ## [Unreleased]
 
+### Removed
+
+- **Intel macOS builds are no longer published**: a release now carries linux
+  x86_64, linux aarch64, and macOS arm64. The Intel mac binary could no longer
+  be built on Intel hardware or run before it shipped, so it is withdrawn
+  rather than published unverified. Intel Macs can still build from source.
+
 ### Fixed
 
 - **Correcting an episode count on AniList sticks**: sync only ever raised
