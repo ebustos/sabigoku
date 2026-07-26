@@ -1,0 +1,8 @@
+# makepkg runs in place here, so everything it produces is scratch: src/, pkg/,
+# the downloaded tarball, the built package, the generated .SRCINFO.
+# Whitelist rather than blacklist, so a new source can never leak a checkout
+# into a commit.
+*
+!.gitignore
+!PKGBUILD
+!README.md
