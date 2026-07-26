@@ -1,0 +1,52 @@
+# stills.kbeats: populated-watchlist + themes tour. Cycles the palette in
+# Settings to re-theme a cover detail, then lands on the re-themed view
+# (ROD-464, ported from zigoku ROD-255).
+#
+# SAFE: config is ISOLATED by the runner (XDG_CONFIG_HOME → a throwaway), so the
+# palette save on leaving Settings never touches your real ~/.config/sabigoku.
+# READ-ONLY on the watchlist; no mutating keys (the runner lints them out).
+# Settings swallows letter keys, so the exit is F2 (dispatched before Settings
+# sees it); F2 also triggers the save + "settings saved" toast.
+#
+# TUNABLE: the `j` count reaches the palette row (interactive row 8; the cursor
+# skips headers and read-only rows). If settings.png isn't focused on palette,
+# recount against src/tui/view/settings.rs.
+#
+# Run:  ./docs/media/capture-kitty.sh docs/media/stills.kbeats
+
+sleep 2
+key shift+h
+sleep 1500ms
+key j                           # wiggle the selection: the detail pane paints per
+key k                           # selection change, and boot alone leaves it empty
+sleep 1200ms
+grab watchlist.png              # populated watchlist, grouped status + progress bars
+
+key shift+s
+sleep 1500ms
+key j j j j j j j j             # down to the palette row (Interface section)
+sleep 600ms
+resize 1280x800                 # narrow: good for the settings still AND the tour gif
+                                # (can't resize mid-record, so record the whole tour here)
+grab settings.png               # settings, palette row focused
+sleep 500ms
+
+record stills.gif fps=15 width=960
+sleep 700ms
+key l                           # cycle palette forward: terminal_ghost → phosphor
+sleep 1300ms
+key l                           # → nord
+sleep 1300ms
+key l                           # → tokyonight
+sleep 1300ms
+key F2                          # back to the re-themed watchlist (SAVES → toast fires)
+# Hold past the toast's 2.5s auto-dismiss so the re-themed frames are clean:
+# the "settings saved" toast otherwise overlaps the footer.
+sleep 2800ms
+key l                           # enter the detail pane (re-themed cover), toast now gone
+sleep 1400ms
+endrecord                       # gif ends on the clean re-themed detail
+
+resize 1596x996                 # back to wide for the two-pane re-themed detail still
+sleep 800ms
+grab detail-themed.png          # two-pane detail, re-themed to tokyonight, toast-free
