@@ -30,6 +30,7 @@ pub enum RowId {
     TitleLanguage,
     Connect,
     Sync,
+    CheckUpdates,
 }
 
 /// `Action` is the one Enter-fires-a-side-effect kind (the ROD-448 connect
@@ -58,9 +59,9 @@ const fn row(id: RowId, label: &'static str, kind: RowKind, hint: &'static str) 
     }
 }
 
-/// Interactive rows only; the read-only rows (two Catalog, one AniList Sync)
-/// render separately and are skipped by navigation (DESIGN 5.5).
-pub const ROWS: [Row; 13] = [
+/// Interactive rows only; the read-only rows (two Catalog, one AniList Sync,
+/// one Updates) render separately and are skipped by navigation (DESIGN 5.5).
+pub const ROWS: [Row; 14] = [
     row(RowId::MpvPath, "mpv path", RowKind::Text, "enter to edit"),
     row(
         RowId::Quality,
@@ -119,19 +120,27 @@ pub const ROWS: [Row; 13] = [
         "enter to connect",
     ),
     row(RowId::Sync, "sync", RowKind::Toggle, "space to toggle"),
+    row(
+        RowId::CheckUpdates,
+        "check for updates",
+        RowKind::Toggle,
+        "space to toggle",
+    ),
 ];
 
 // Section boundaries (DESIGN 5.5): Player 0..5, Catalog 5..6, Interface
-// 6..11, AniList Sync 11..13. A row insertion that shifts a boundary must
-// break the build, never silently misattribute a row to the wrong header.
+// 6..11, AniList Sync 11..13, Updates 13..14. A row insertion that shifts a
+// boundary must break the build, never silently misattribute a row to the
+// wrong header.
 const _: () = {
-    assert!(ROWS.len() == 13);
+    assert!(ROWS.len() == 14);
     assert!(matches!(ROWS[4].id, RowId::SkipMode)); // last Player
     assert!(matches!(ROWS[5].id, RowId::Provider)); // the lone Catalog row
     assert!(matches!(ROWS[6].id, RowId::CoverArt)); // first Interface
     assert!(matches!(ROWS[10].id, RowId::TitleLanguage)); // last Interface
     assert!(matches!(ROWS[11].id, RowId::Connect)); // first AniList Sync
     assert!(matches!(ROWS[12].id, RowId::Sync)); // last AniList Sync
+    assert!(matches!(ROWS[13].id, RowId::CheckUpdates)); // the lone Updates row
 };
 
 const QUALITY_PRESETS: [&str; 5] = ["worst", "480", "720", "1080", "best"];
@@ -322,6 +331,7 @@ fn toggle(config: &mut Config, id: RowId) {
         RowId::CoverArt => config.cover_art = !config.cover_art,
         RowId::KanjiChips => config.kanji_chips = !config.kanji_chips,
         RowId::Sync => config.anilist_sync_enabled = !config.anilist_sync_enabled,
+        RowId::CheckUpdates => config.check_for_updates = !config.check_for_updates,
         _ => {}
     }
 }
@@ -352,6 +362,7 @@ fn value(config: &Config, id: RowId, providers: &[&str]) -> String {
         RowId::TitleLanguage => config.title_language.clone(),
         RowId::Sync => onoff(config.anilist_sync_enabled),
         RowId::Connect => String::new(),
+        RowId::CheckUpdates => onoff(config.check_for_updates),
     }
 }
 
@@ -369,6 +380,9 @@ pub struct SettingsEnv<'a> {
     pub covers_dir: &'a str,
     /// Account row copy (DESIGN 5.5): user name, reconnect prompt, or not connected.
     pub account: &'a str,
+    /// Version row copy (DESIGN 5.5): built-in version, tagged with the newer
+    /// release when the boot check found one.
+    pub version: &'a str,
 }
 
 const LABEL_X: u16 = 4;
@@ -408,6 +422,10 @@ fn layout(env: &SettingsEnv) -> Vec<Li> {
     section(&mut lines, "AniList Sync");
     lines.push(Li::Inert("account", env.account.to_string()));
     (11..13).for_each(|i| lines.push(Li::Row(i)));
+    lines.push(Li::Blank);
+    section(&mut lines, "Updates");
+    lines.push(Li::Inert("version", env.version.to_string()));
+    lines.push(Li::Row(13));
     lines
 }
 
@@ -732,6 +750,21 @@ mod tests {
             KeyOutcome::ConnectRequested
         );
         assert!(!s.dirty, "the action row never dirties the tab");
+    }
+
+    #[test]
+    fn check_updates_row_toggles_the_boot_gate() {
+        let (mut s, mut c) = state();
+        for _ in 0..13 {
+            press(&mut s, &mut c, &[KeyCode::Char('j')]);
+        }
+        assert_eq!(ROWS[s.cursor].id, RowId::CheckUpdates);
+        assert_eq!(
+            press(&mut s, &mut c, &[KeyCode::Char(' ')]),
+            KeyOutcome::ConfigChanged
+        );
+        assert!(!c.check_for_updates);
+        assert!(s.dirty, "the toggle must persist on leave");
     }
 
     #[test]

@@ -19,10 +19,12 @@ pub mod providers;
 pub mod proxy;
 pub mod resolve;
 pub mod resolver;
+pub mod semver;
 pub mod store;
 pub mod sync;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod tui;
+pub mod updatecheck;
 
 pub use error::Error;

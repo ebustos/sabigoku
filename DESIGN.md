@@ -1083,6 +1083,7 @@ state.now` escalation.
 | `add_to_watchlist` | P on a browse result (upsert failed) | error | `couldn't add to watchlist` | no |
 | `sync_flushed` | pull reconciled remote changes (`reconciled > 0`) | info | `↓ N from AniList` | no |
 | `sync_flushed` | push landed (`pushed > 0`) | info | `↑ N to AniList` | no |
+| `update_available` | boot check found a strictly newer release (06 §6.1) | info | `update available: vX.Y.Z` | no |
 | Provider fallback hop | the resolve walk moves to the next registry provider | warn | `trying {provider}…` (or `{prev} failed, trying {provider}…`) | no |
 | Provider pin: hop | pinning a different provider than the one serving the grid re-routes it through a one-provider fallback walk (reuses the hop toast) | warn | `trying {provider}…` (or `{prev} failed, trying {provider}…`) | no |
 | Provider pin: set, no hop needed | `v` pins the provider already serving the grid | success | `pinned to {provider}` | no |
@@ -1732,16 +1733,22 @@ Live-editable. Full width. No cover art.
     connect                                                         enter to connect
     sync                          [████ on ████]                     space to toggle
 
+  Updates
+  ─────────────────────────────────────────────────────────────────────────────────
+    version                       v0.1.1                              [dim + italic]
+    check for updates             [████ on ████]                     space to toggle
+
   ▌  hjkl navigate · space toggle · enter edit · q save+quit
 ```
 
-Four sections (Player · Catalog · Interface · AniList Sync): thirteen interactive
-rows plus three read-only rows (two Catalog, one AniList Sync). The interactive-row
-split is Player `0..5`, Catalog `5..6` (the lone `provider` row, below the two
-inert status rows), Interface `6..11`, AniList Sync `11..13`, pinned by a
-compile-time assertion in `src/tui/settings_state.rs` so a future row insertion
-that shifts a boundary breaks the build instead of silently misattributing a row to
-the wrong section header.
+Five sections (Player · Catalog · Interface · AniList Sync · Updates): fourteen
+interactive rows plus four read-only rows (two Catalog, one AniList Sync, one
+Updates). The interactive-row split is Player `0..5`, Catalog `5..6` (the lone
+`provider` row, below the two inert status rows), Interface `6..11`, AniList
+Sync `11..13`, Updates `13..14`, pinned by a compile-time assertion in
+`src/tui/settings_state.rs` so a future row insertion that shifts a boundary
+breaks the build instead of silently misattributing a row to the wrong section
+header.
 
 Notes:
 - Focused row: `palette.focus` + bold label over a `palette.bg_surface` row fill.
@@ -1821,6 +1828,14 @@ Notes:
   (the mock's default state) is a real, expected combination: the switch is
   honoured, it just has nothing to gate yet. Flipping it off makes the rail inert
   without touching the stored token; flip it back on and sync resumes.
+- **version** is read-only, `draw_inert_row` styling like `account`. The
+  built-in version (`v0.1.1`), extended to `v0.1.1 (v0.1.2 available)` for the
+  rest of the session once the boot check finds a newer release. It never
+  claims "up to date": a silent check is indistinguishable from a failed one
+  by design (06 §6.1), and this row must not pretend otherwise.
+- **check for updates** toggles `config.check_for_updates`, default **on**:
+  the gate on the boot check (06 §6.1). Purely a boot gate; flipping it on
+  mid-session does not fire a check, the next launch does.
 
 ### 5.5a AniList Connect
 

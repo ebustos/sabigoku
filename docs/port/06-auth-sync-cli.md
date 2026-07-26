@@ -423,7 +423,7 @@ on `show`** (02). Sync join key is already AniList id; simpler and correct.
 | Gate | `check_for_updates` |
 | Compare | Built-in version vs GitHub `releases/latest` tag |
 | Cache | `{cacheDir}/update_check` two-line body: `checked_at\ntag` |
-| TTL | **6 hours**; future-dated cache treated stale |
+| TTL | **1 hour**; future-dated cache treated stale |
 | Failure | Silent null (offline, 403, bad body) |
 | Fetch deadline | ~3s |
 | User-Agent | Required (GitHub rejects empty) |
