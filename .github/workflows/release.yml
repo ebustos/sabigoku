@@ -237,11 +237,23 @@ jobs:
           # Sparse-index layout for a crate name of four or more characters.
           url="https://index.crates.io/${name:0:2}/${name:2:2}/${name}"
           v="${{ needs.guard.outputs.version }}"
-          if curl -sfS "$url" | grep -q "\"vers\":\"${v}\""; then
+          body=$(mktemp)
+          # Only 404 means unpublished. An outage, a 5xx or a rate-limit answers
+          # nothing about what is on the registry, and treating that silence as
+          # "not published" walks into a publish attempt blind.
+          code=$(curl -sS -o "$body" -w '%{http_code}' --retry 3 --retry-all-errors "$url") || code=000
+          case "$code" in
+            200) ;;
+            404) echo "skip=false" >> "$GITHUB_OUTPUT"
+                 echo "crate ${name} is not on the index yet; this is its first publish"
+                 exit 0 ;;
+            *)   echo "::error::crates.io index returned ${code} for ${name}; cannot tell whether ${v} is published"
+                 exit 1 ;;
+          esac
+          if grep -q "\"vers\":\"${v}\"" "$body"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "${v} is already on crates.io; nothing to publish"
           else
-            # A 404 here is the first-ever publish, not a failure.
             echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "${v} is not on crates.io yet; publishing"
           fi
@@ -253,6 +265,9 @@ jobs:
         if: steps.published.outputs.skip == 'false'
         shell: bash
         env:
+          # Keep this token scoped to publish-update. The crate name was created
+          # by a manual publish-new; a runner that can also yank or transfer
+          # ownership is a strictly worse trade for the same capability.
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
