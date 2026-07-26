@@ -127,12 +127,22 @@ fn write_cache(cache_dir: &Path, now: i64, latest: &str) {
 /// an arbitrarily large allocation inside the fetch deadline.
 const BODY_CAP: u64 = 64 * 1024;
 
+/// Test seam, compiled in ONLY under the `test-seams` feature (tests/cli.rs,
+/// never any distributed binary): lets the suite redirect the fetch and the
+/// installer at a local fixture. Without it a `cargo test` would reach GitHub,
+/// and `update` would run the real installer over the binary under test.
+#[cfg(feature = "test-seams")]
+pub(crate) fn url_override(var: &str) -> Option<String> {
+    std::env::var(var).ok()
+}
+#[cfg(not(feature = "test-seams"))]
+pub(crate) fn url_override(_var: &str) -> Option<String> {
+    None
+}
+
 fn fetch_latest() -> Option<String> {
     use std::io::Read;
-    // Test seam (tests/cli.rs): the default suite must never reach GitHub,
-    // and `update` falling through to the installer mid-suite would overwrite
-    // the binary under test.
-    let url = std::env::var("SABIGOKU_UPDATE_URL").unwrap_or_else(|_| LATEST_URL.to_string());
+    let url = url_override("SABIGOKU_UPDATE_URL").unwrap_or_else(|| LATEST_URL.to_string());
     let client = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .user_agent(USER_AGENT)

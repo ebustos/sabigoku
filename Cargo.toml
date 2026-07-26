@@ -16,6 +16,14 @@ categories = ["command-line-utilities", "multimedia::video"]
 exclude = ["/.github/", "/.githooks/", "/cliff.toml", "/docs/audit/"]
 default-run = "sabigoku"
 
+[features]
+# The update-check and self-update env-var overrides (SABIGOKU_UPDATE_URL,
+# SABIGOKU_INSTALL_URL) exist only so tests/cli.rs can drive the real binary
+# against a local fixture. Off by default: no distributed binary reads them.
+# NOT cfg(debug_assertions), because the AUR PKGBUILD runs `cargo test
+# --release`, which would strip the seam mid-package-build.
+test-seams = []
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

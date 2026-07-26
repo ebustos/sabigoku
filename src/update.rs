@@ -6,11 +6,18 @@
 //! expected condition (offline, packaged, root-owned) is an outcome, not an
 //! error, and a failed install leaves the existing binary untouched.
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 use crate::semver;
 use crate::updatecheck;
+
+/// Wall-clock bound on the installer child. A stalled fetch to a black-holed
+/// host would otherwise wedge `update` with no progress and no way to tell
+/// working from dead; install.sh stages then renames, so a kill is safe.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 const REPO: &str = "vantroy/sabigoku";
 
@@ -54,44 +61,54 @@ pub fn run(current_version: &str, cache_dir: &Path, now: i64) {
     let bindir = exe.parent().unwrap_or(&exe).to_path_buf();
 
     // Fresh check, not the 1h cache: acting on an hour-old answer could
-    // reinstall the version already running. Offline still continues by
-    // install method; the tag is kept so the installer pins the compared
-    // release. Arrives pre-sanitized (updatecheck::sanitize_tag).
-    let mut latest_tag = None;
-    match updatecheck::latest_fresh(cache_dir, now) {
-        Some(latest) => {
-            if !semver::is_newer(&latest, current_version) {
-                println!("sabigoku v{current_version} is already the latest release.");
-                return;
-            }
+    // reinstall the running version. The tag is pre-sanitized
+    // (updatecheck::sanitize_tag).
+    let confirmed = match updatecheck::latest_fresh(cache_dir, now) {
+        Some(latest) if semver::is_newer(&latest, current_version) => {
             println!("update available: v{current_version} -> {latest}\n");
-            latest_tag = Some(latest);
+            Some(latest)
         }
-        None => println!("couldn't reach GitHub to check the latest release; continuing anyway.\n"),
-    }
+        Some(_) => {
+            println!("sabigoku v{current_version} is already the latest release.");
+            return;
+        }
+        None => {
+            println!("couldn't reach GitHub to check the latest release.\n");
+            None
+        }
+    };
 
-    let method = detect_method(&exe);
-    match decide(method, &bindir, dir_writable(&bindir)) {
-        Action::PackageDirections(m) => print_package_directions(m),
-        Action::RefuseUnwritable => print_refusal(&bindir),
-        Action::SelfUpdate(dir) => perform_update(&dir, latest_tag.as_deref()),
+    match decide(detect_method(&exe), &bindir, dir_writable(&bindir)) {
+        // Package-manager directions are inert text, safe to print even when
+        // the check failed: the manager resolves latest itself.
+        Action::PackageDirections(m) => print!("{}", package_directions(m)),
+        Action::RefuseUnwritable => print!("{}", refusal(&bindir)),
+        // Never run the installer without a confirmed-newer tag. A failed
+        // freshness check (GitHub's 60/hr limit is easy to hit behind a NAT)
+        // must not curl|sh a blind, unpinned reinstall over a current binary.
+        Action::SelfUpdate(dir) => match confirmed {
+            Some(tag) => perform_update(&dir, &tag),
+            None => println!("couldn't confirm a newer release; not self-updating."),
+        },
     }
 }
 
 /// Drive install.sh in place: BINDIR + SABIGOKU_VERSION pin where and what;
 /// staging, checksum verification and the rename are the installer's job.
-fn perform_update(bindir: &Path, latest_tag: Option<&str>) {
-    // Pin install.sh itself to the release tag, not master, so a compromised
-    // master cannot ignore the version pin. Env only, never shell-interpolated.
-    let git_ref = match latest_tag {
-        Some(t) if safe_ref(t) => t,
-        _ => "master",
-    };
-    // Test seam (tests/cli.rs): lets the suite exercise this whole path
-    // against a file:// installer instead of executing the real one.
-    let url = std::env::var("SABIGOKU_INSTALL_URL").unwrap_or_else(|_| {
-        format!("https://raw.githubusercontent.com/{REPO}/{git_ref}/install.sh")
-    });
+/// `tag` is a confirmed-newer release from `run`.
+fn perform_update(bindir: &Path, tag: &str) {
+    // safe_ref gates BOTH the URL ref and SABIGOKU_VERSION: a forged tag that
+    // clears sanitize_tag (printable ASCII) but carries shell metacharacters
+    // is refused here, in this layer, not delegated to install.sh's own
+    // charset gate (a separate, editable file). Real vX.Y.Z tags always pass.
+    if !safe_ref(tag) {
+        println!(
+            "the latest release tag is malformed; update by hand from https://github.com/{REPO}/releases"
+        );
+        return;
+    }
+    let url = updatecheck::url_override("SABIGOKU_INSTALL_URL")
+        .unwrap_or_else(|| format!("https://raw.githubusercontent.com/{REPO}/{tag}/install.sh"));
 
     println!("updating in place at {} ...\n", bindir.display());
 
@@ -108,26 +125,51 @@ sh "$f""#;
         .arg(SNIPPET)
         .env("BINDIR", bindir)
         .env("INSTALL_URL", &url)
+        .env("SABIGOKU_VERSION", tag)
         .stdin(std::process::Stdio::null());
-    if let Some(tag) = latest_tag {
-        cmd.env("SABIGOKU_VERSION", tag);
-    }
-    let status = match cmd.status() {
-        Ok(s) => s,
-        Err(e) => {
-            println!("couldn't launch the installer: {e}");
-            return;
+    match run_grouped_with_timeout(&mut cmd, INSTALL_TIMEOUT) {
+        Ok(Some(status)) if status.success() => {
+            println!("\nupdated. restart sabigoku to run the new version.")
         }
-    };
-    if status.success() {
-        println!("\nupdated. restart sabigoku to run the new version.");
-    } else {
-        match status.code() {
+        Ok(Some(status)) => match status.code() {
             Some(code) => println!(
                 "\nupdate failed (installer exited {code}); your existing binary is untouched."
             ),
             None => println!("\nupdate interrupted; your existing binary is untouched."),
+        },
+        Ok(None) => println!("\nupdate timed out; your existing binary is untouched."),
+        Err(e) => println!("couldn't run the installer: {e}"),
+    }
+}
+
+/// Run `cmd` in its own process group and, if it outlives `timeout`, kill the
+/// WHOLE group, not just the direct child: install.sh is `sh -c` wrapping a
+/// second `sh` that downloads and installs, and killing only the wrapper
+/// leaves that subtree orphaned to init, still running after we report the
+/// binary untouched. A distinct group also means the signal never reaches our
+/// own process. kill(1), not libc: this crate ships no unsafe.
+/// `Ok(None)` is a timeout; `Ok(Some(status))` is a real exit.
+fn run_grouped_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Option<ExitStatus>> {
+    cmd.process_group(0);
+    let mut child = cmd.spawn()?;
+    let pgid = child.id();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
         }
+        if Instant::now() >= deadline {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{pgid}"))
+                .status();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -142,6 +184,9 @@ fn safe_ref(tag: &str) -> bool {
 }
 
 /// Package-manager ownership. A missing tool falls through to standalone.
+/// The pacman/brew probes trust PATH order: a shadowing stub can mis-route
+/// detection. Accepted, not a hole, misdetection only changes which advice
+/// prints or, at worst, refuses a self-update; it never mints a bad install.
 fn detect_method(exe: &Path) -> InstallMethod {
     #[cfg(target_os = "linux")]
     if command_succeeds("pacman", &["-Qo".as_ref(), exe.as_os_str()]) {
@@ -168,6 +213,7 @@ fn detect_method(exe: &Path) -> InstallMethod {
     }
     if is_cargo_bin(
         exe,
+        std::env::var("CARGO_INSTALL_ROOT").ok().as_deref(),
         std::env::var("CARGO_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
     ) {
@@ -176,13 +222,24 @@ fn detect_method(exe: &Path) -> InstallMethod {
     InstallMethod::Standalone
 }
 
-/// A binary under `$CARGO_HOME/bin` (or `~/.cargo/bin`) belongs to cargo.
-/// Path-based, unlike the pacman/brew probes: cargo has no ownership query.
-fn is_cargo_bin(exe: &Path, cargo_home: Option<&str>, home: Option<&str>) -> bool {
-    let bin = match (cargo_home, home) {
-        (Some(ch), _) if !ch.is_empty() => PathBuf::from(ch).join("bin"),
-        (_, Some(h)) if !h.is_empty() => PathBuf::from(h).join(".cargo/bin"),
-        _ => return false,
+/// A binary under cargo's install bin dir belongs to cargo. Path-based, unlike
+/// the pacman/brew probes: cargo has no ownership query. Precedence follows
+/// cargo's own: CARGO_INSTALL_ROOT, then CARGO_HOME, then ~/.cargo. The
+/// `install.root` config-file key is not read (08 ledger: a documented gap).
+fn is_cargo_bin(
+    exe: &Path,
+    install_root: Option<&str>,
+    cargo_home: Option<&str>,
+    home: Option<&str>,
+) -> bool {
+    let bin = if let Some(r) = install_root.filter(|s| !s.is_empty()) {
+        PathBuf::from(r).join("bin")
+    } else if let Some(ch) = cargo_home.filter(|s| !s.is_empty()) {
+        PathBuf::from(ch).join("bin")
+    } else if let Some(h) = home.filter(|s| !s.is_empty()) {
+        PathBuf::from(h).join(".cargo/bin")
+    } else {
+        return false;
     };
     has_prefix_dir(exe, &bin)
 }
@@ -244,30 +301,32 @@ fn dir_writable(dir: &Path) -> bool {
     }
 }
 
-fn print_package_directions(method: InstallMethod) {
+/// Returned, not printed, so the copy is unit-testable without capturing
+/// stdout. `run` prints it.
+fn package_directions(method: InstallMethod) -> &'static str {
     match method {
-        InstallMethod::Pacman => println!(
-            "sabigoku was installed via the AUR. Update it with your AUR helper:\n  paru -S sabigoku\n  # or: yay -S sabigoku"
-        ),
-        InstallMethod::Brew => println!(
-            "sabigoku was installed via Homebrew. Update it with:\n  brew upgrade sabigoku"
-        ),
+        InstallMethod::Pacman => {
+            "sabigoku was installed via the AUR. Update it with your AUR helper:\n  paru -S sabigoku\n  # or: yay -S sabigoku\n"
+        }
+        InstallMethod::Brew => {
+            "sabigoku was installed via Homebrew. Update it with:\n  brew upgrade sabigoku\n"
+        }
         InstallMethod::Cargo => {
-            println!("sabigoku was installed via cargo. Update it with:\n  cargo install sabigoku")
+            "sabigoku was installed via cargo. Update it with:\n  cargo install sabigoku\n"
         }
         InstallMethod::Standalone => unreachable!(),
     }
 }
 
-fn print_refusal(bindir: &Path) {
-    println!(
+fn refusal(bindir: &Path) -> String {
+    format!(
         "sabigoku lives in {}, which needs elevated permissions to write.\n\
          Refusing to self-update a root-owned install. Either:\n\
          \x20 - re-run the installer with sudo, or\n\
          \x20 - reinstall to a writable dir via BINDIR, e.g.:\n\
-         \x20     curl -fsSL https://raw.githubusercontent.com/{REPO}/master/install.sh | BINDIR=$HOME/.local/bin sh",
+         \x20     curl -fsSL https://raw.githubusercontent.com/{REPO}/master/install.sh | BINDIR=$HOME/.local/bin sh\n",
         bindir.display()
-    );
+    )
 }
 
 #[cfg(test)]
@@ -338,23 +397,51 @@ mod tests {
     }
 
     #[test]
-    fn is_cargo_bin_prefers_cargo_home_falls_back_to_home() {
-        let exe = Path::new("/home/u/.cargo/bin/sabigoku");
-        assert!(is_cargo_bin(exe, None, Some("/home/u")));
+    fn is_cargo_bin_follows_install_root_then_cargo_home_then_home() {
+        let home_exe = Path::new("/home/u/.cargo/bin/sabigoku");
+        assert!(is_cargo_bin(home_exe, None, None, Some("/home/u")));
         assert!(is_cargo_bin(
             Path::new("/custom/cargo/bin/sabigoku"),
+            None,
+            Some("/custom/cargo"),
+            Some("/home/u")
+        ));
+        // CARGO_INSTALL_ROOT outranks CARGO_HOME outranks ~/.cargo.
+        assert!(is_cargo_bin(
+            Path::new("/root-install/bin/sabigoku"),
+            Some("/root-install"),
             Some("/custom/cargo"),
             Some("/home/u")
         ));
         // CARGO_HOME set means ~/.cargo is NOT the cargo bin dir.
-        assert!(!is_cargo_bin(exe, Some("/custom/cargo"), Some("/home/u")));
+        assert!(!is_cargo_bin(
+            home_exe,
+            None,
+            Some("/custom/cargo"),
+            Some("/home/u")
+        ));
         assert!(!is_cargo_bin(
             Path::new("/usr/bin/sabigoku"),
             None,
+            None,
             Some("/home/u")
         ));
-        assert!(!is_cargo_bin(exe, None, None));
-        assert!(!is_cargo_bin(exe, Some(""), None));
+        assert!(!is_cargo_bin(home_exe, None, None, None));
+        assert!(!is_cargo_bin(home_exe, Some(""), Some(""), None));
+    }
+
+    #[test]
+    fn package_directions_name_the_right_channel() {
+        assert!(package_directions(InstallMethod::Pacman).contains("paru -S sabigoku"));
+        assert!(package_directions(InstallMethod::Brew).contains("brew upgrade sabigoku"));
+        assert!(package_directions(InstallMethod::Cargo).contains("cargo install sabigoku"));
+    }
+
+    #[test]
+    fn refusal_names_the_dir_and_the_bindir_escape_hatch() {
+        let text = refusal(Path::new("/usr/bin"));
+        assert!(text.contains("/usr/bin"));
+        assert!(text.contains("BINDIR=$HOME/.local/bin sh"));
     }
 
     #[test]
@@ -380,6 +467,52 @@ mod tests {
         );
         assert!(!dir_writable(Path::new("/definitely/not/a/real/dir/zzz")));
         assert!(!dir_writable(Path::new("relative/path")));
+    }
+
+    #[test]
+    fn run_grouped_with_timeout_kills_the_whole_install_tree() {
+        // The leader backgrounds a long sleep into its own group (the exact
+        // shape that outlived the old child.kill()), records its pid, then
+        // blocks. On timeout the whole group must die, grandchild included.
+        let marker = std::env::temp_dir().join(format!("sabigoku-pgkill-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 60 & echo $! > \"$MARKER\"; sleep 60")
+            .env("MARKER", &marker)
+            .stdin(std::process::Stdio::null());
+
+        let outcome = run_grouped_with_timeout(&mut cmd, Duration::from_millis(300));
+        assert!(matches!(outcome, Ok(None)), "must report a timeout");
+
+        std::thread::sleep(Duration::from_millis(200));
+        let pid = std::fs::read_to_string(&marker)
+            .expect("leader recorded the grandchild pid")
+            .trim()
+            .to_string();
+        // kill -0 succeeds only for a live process: the backgrounded sleep
+        // must be gone, not orphaned to init.
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .is_ok_and(|s| s.success());
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !alive,
+            "the backgrounded grandchild (pid {pid}) must be killed with the group"
+        );
+    }
+
+    #[test]
+    fn run_grouped_with_timeout_returns_a_clean_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("exit 7")
+            .stdin(std::process::Stdio::null());
+        match run_grouped_with_timeout(&mut cmd, Duration::from_secs(5)) {
+            Ok(Some(status)) => assert_eq!(status.code(), Some(7)),
+            other => panic!("expected a clean exit 7, got {other:?}"),
+        }
     }
 
     #[test]
