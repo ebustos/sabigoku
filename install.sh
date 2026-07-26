@@ -77,9 +77,8 @@ esac
 # Rosetta 2 reports x86_64 on Apple Silicon, so uname alone cannot tell an
 # emulated Apple Silicon Mac from a real Intel one. The former gets the native
 # build; the latter gets nothing, because no Intel binary is published. Decide
-# this from the target list and never from whether an asset exists: releases cut
-# before that target was withdrawn still carry an Intel tarball that was only
-# ever cross-built, never run.
+# this from the target list and never from whether an asset exists: a stale
+# release may still carry an Intel tarball.
 if [ "$os" = "Darwin" ] && [ "$cpu" = "x86_64" ]; then
   if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" = "1" ]; then
     cpu="aarch64"
@@ -195,8 +194,8 @@ esac
 shadow=$(command -v "$BIN" 2>/dev/null || true)
 if [ -n "$shadow" ] && [ "$shadow" != "$bindir/${BIN}" ]; then
   say ""
-  say "note: '${shadow}' comes first on your PATH and will shadow this install."
-  say "  remove it, or put ${bindir} ahead of it."
+  say "note: another ${BIN} at '${shadow}' will run instead of this one."
+  say "  remove it, or put ${bindir} ahead of it on your PATH."
 fi
 
 if ! have mpv; then
