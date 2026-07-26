@@ -9,7 +9,7 @@
 //! free: the `move` closure transfers ownership, so a worker cannot touch memory
 //! another thread owns.
 //!
-//! Run: cargo run --bin spike_concurrency -- <ignored, queries are fixed>
+//! Run: cargo run --example spike_concurrency -- <ignored, queries are fixed>
 
 use serde::Deserialize;
 use std::sync::mpsc;

@@ -13,9 +13,9 @@
 //!   4. tmux survival: no crash, no escape garbage (verify via --probe in tmux)
 //!   5. decode+encode on worker threads (ThreadProtocol); render never blocks
 //!
-//! Run:  cargo run --bin spike_cover                    # interactive
-//!       cargo run --bin spike_cover -- --halfblocks    # force fallback path
-//!       cargo run --bin spike_cover -- --probe 3       # auto-quit, print report
+//! Run:  cargo run --example spike_cover                    # interactive
+//!       cargo run --example spike_cover -- --halfblocks    # force fallback path
+//!       cargo run --example spike_cover -- --probe 3       # auto-quit, print report
 //! Keys: q quit · arrows/hjkl select · enter/d detail overlay · p cycle protocol
 //!       r hard redraw
 

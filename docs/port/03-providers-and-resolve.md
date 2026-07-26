@@ -454,7 +454,7 @@ Detail protocols stay in provider modules + golden tests. This section is the ma
 - Stream blob: AES-256-GCM `tobeparsed`. Key = `sha256(GCM_SEED)` where the seed
   is a **hardcoded constant** (not derived from any response). Layout after
   base64-decode: 1-byte prefix (discard) + 12-byte nonce + ciphertext + 16-byte
-  tag, empty AAD. **Normative artifact:** sabigoku `src/bin/spike_stream.rs`
+  tag, empty AAD. **Normative artifact:** sabigoku `examples/spike_stream.rs`
   carries the seed and a byte-identical golden vector from zigoku's test fixture;
   golden test is the contract.
 - Has real search + episodes + resolve; trailing in registry order.

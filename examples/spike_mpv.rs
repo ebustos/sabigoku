@@ -8,8 +8,8 @@
 //! probe decodes one real frame and exits 0, which is the actual proof: the
 //! resolved stream plays.
 //!
-//! Run:  cargo run --bin spike_mpv -- frieren                                # window
-//!       cargo run --bin spike_mpv -- frieren --frames=1 --vo=null --no-audio # probe
+//! Run:  cargo run --example spike_mpv -- frieren                                # window
+//!       cargo run --example spike_mpv -- frieren --frames=1 --vo=null --no-audio # probe
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};

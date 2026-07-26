@@ -17,6 +17,13 @@ publishes that section verbatim as the release body.
 
 ## [Unreleased]
 
+### Added
+
+- **`cargo install sabigoku`**: sabigoku is published on crates.io, so anyone
+  with a Rust toolchain has a complete install path without downloading a
+  release artifact. This is also the install route for platforms that ship no
+  prebuilt binary, Intel macOS among them.
+
 ### Removed
 
 - **Intel macOS builds are no longer published**: a release now carries linux

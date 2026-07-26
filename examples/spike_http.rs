@@ -5,7 +5,7 @@
 //! of the response. This was the original go/no-go: if the network layer
 //! didn't work, nothing else mattered.
 //!
-//! Run: cargo run --bin spike_http -- frieren
+//! Run: cargo run --example spike_http -- frieren
 
 use serde::{Deserialize, Serialize};
 

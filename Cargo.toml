@@ -10,6 +10,10 @@ license = "GPL-3.0-or-later"
 readme = "README.md"
 keywords = ["anime", "tui", "terminal", "anilist", "mpv"]
 categories = ["command-line-utilities", "multimedia::video"]
+# Repo plumbing and one-off capture dumps; everything else in the tree is source
+# a consumer can build or read. A published version is permanent (yank hides, it
+# does not delete), so this list ships as-is forever.
+exclude = ["/.github/", "/.githooks/", "/cliff.toml", "/docs/audit/"]
 default-run = "sabigoku"
 
 [profile.release]

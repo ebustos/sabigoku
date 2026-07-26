@@ -4,9 +4,9 @@
 //! landing in History. Thread shape mirrors 439: play on a worker, events and
 //! store writes on the main thread. In-memory store; nothing durable touched.
 //!
-//! Run:  cargo run --bin play_e2e -- frieren
-//!       cargo run --bin play_e2e -- --provider megaplay --episode 3 "one piece"
-//!       cargo run --bin play_e2e -- --translation dub frieren
+//! Run:  cargo run --example play_e2e -- frieren
+//!       cargo run --example play_e2e -- --provider megaplay --episode 3 "one piece"
+//!       cargo run --example play_e2e -- --translation dub frieren
 
 use std::process::ExitCode;
 use std::sync::mpsc;

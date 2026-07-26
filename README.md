@@ -6,21 +6,29 @@ play episodes in `mpv`, with cover art and AniList sync.
 錆獄 ("rust hell") is a from-scratch Rust port of
 [zigoku](https://github.com/vantroy/zigoku), built as a controlled comparison:
 rebuild the same app's riskiest pieces in Rust and measure what the language and
-its ecosystem actually change. [`SPIKES.md`](SPIKES.md) is that ledger.
+its ecosystem actually change.
+[`SPIKES.md`](https://github.com/vantroy/sabigoku/blob/master/SPIKES.md) is that
+ledger.
 
 ## Status
 
-In development. No tagged release yet, so the only way in is a source build.
-Working today: browse and search, detail view, a Discover feed, the watchlist,
-playback with exact resume, AniList login and two-way sync, and settings with
-four palettes.
+Released and in active development. Working today: browse and search, detail
+view, a Discover feed, the watchlist, playback with exact resume, AniList login
+and two-way sync, and settings with four palettes.
 
-Packaged installs (prebuilt binaries, `curl | sh`, AUR, Homebrew) arrive with
-the first release, and this file grows an Install section when they do.
+## Install
 
-## Build
+Needs `mpv` on `PATH` to play anything.
 
-Needs Rust (edition 2024), and `mpv` on `PATH` to play anything.
+```sh
+cargo install sabigoku
+```
+
+Prebuilt binaries for Linux (x86_64, aarch64) and macOS (arm64) are attached to
+each [release](https://github.com/vantroy/sabigoku/releases). A `curl | sh`
+installer, AUR and Homebrew are on the way.
+
+From source, with Rust (edition 2024):
 
 ```sh
 git clone https://github.com/vantroy/sabigoku.git
@@ -45,14 +53,15 @@ everywhere else.
 
 ## Docs
 
-- [`PORT.md`](PORT.md) and [`docs/port/`](docs/port/): what zigoku does, and how each piece maps to Rust
-- [`DESIGN.md`](DESIGN.md): the design system, layout grammar and UI contracts
-- [`SPIKES.md`](SPIKES.md): the Rust-versus-Zig ledger from the M0 spikes
+- [`PORT.md`](https://github.com/vantroy/sabigoku/blob/master/PORT.md) and [`docs/port/`](https://github.com/vantroy/sabigoku/tree/master/docs/port): what zigoku does, and how each piece maps to Rust
+- [`DESIGN.md`](https://github.com/vantroy/sabigoku/blob/master/DESIGN.md): the design system, layout grammar and UI contracts
+- [`SPIKES.md`](https://github.com/vantroy/sabigoku/blob/master/SPIKES.md): the Rust-versus-Zig ledger from the M0 spikes
 
 ## License
 
-[GPL-3.0-or-later](LICENSE), the same as zigoku. This is a port of a GPL
-project, and the lineage runs back one step further: zigoku's original
+[GPL-3.0-or-later](https://github.com/vantroy/sabigoku/blob/master/LICENSE), the
+same as zigoku. This is a port of a GPL project, and the lineage runs back one
+step further: zigoku's original
 streaming support followed a trail first opened by
 [anipy-cli](https://github.com/sdaqo/anipy-cli) (GPL-3.0), reimplemented rather
 than copied. The license keeps that lineage unambiguous.

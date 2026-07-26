@@ -7,7 +7,7 @@
 //! the part that's actually RISKY: the crypto. It runs the two golden vectors
 //! zigoku pins as offline fixtures, so it's reproducible with zero network.
 //!
-//! Run: cargo run --bin spike_stream
+//! Run: cargo run --example spike_stream
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};

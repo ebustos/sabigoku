@@ -6,7 +6,7 @@
 //! point: you don't touch C at all. `rusqlite` with the `bundled` feature
 //! compiles sqlite from source into the binary and hands you a safe API.
 //!
-//! Run: cargo run --bin spike_sqlite
+//! Run: cargo run --example spike_sqlite
 
 use rusqlite::{Connection, params};
 

@@ -2974,7 +2974,7 @@ for Terminal Ghost: never attach a `Block` with borders to a pane.
 ### 9.3 Cover Art (`ratatui-image`, spiked: ROD-417)
 
 The pipeline, validated end to end by `spike_cover` (**normative artifact:**
-sabigoku `src/bin/spike_cover.rs`; findings in `SPIKES.md` §6):
+sabigoku `examples/spike_cover.rs`; findings in `SPIKES.md` §6):
 
 1. Fetch cover image bytes (JPEG/PNG) from the AniList URL via HTTP.
 2. Decode to pixels (the `image` crate).
