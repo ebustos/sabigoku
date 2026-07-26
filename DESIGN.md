@@ -848,22 +848,30 @@ Format: `[████████░░░░░░░░]  8 / 28 eps`
 - Filled cells: **selection-aware** (see below); `state.focus` only on the cursor
   bar, otherwise the per-status color.
 - Empty cells: `border.hair`.
-- `█` for filled, `░` for empty, `·` for not-yet-aired (`border.hair`).
+- `█` for watched, `░` for empty, `▓` for watched-past-broadcast, `·` for
+  not-yet-aired (both `border.hair` for the unfilled pair; `▓` takes the fill
+  colour).
 - Bar width: 16 chars minimum, scales to available space with a max of 24 chars.
 - Episode fraction text: `text.muted` on the cursor bar, else `text.dim`.
 - Resume point: a `◐` injected at the resume position within the bar, e.g.
-  `[████◐░░░░░░░░░░░]` where `◐` is at episode 5 of 28.
-- **Aired tail.** On an airing show the cells past the aired count (§4.6's
-  `aired_count`, `nextAiringEpisode - 1`) render `·` instead of `░`, so the bar
-  separates "not watched" from "does not exist yet": `[███·············]  3 / 14 eps`
-  is three of the three episodes out, not three of fourteen. The fill is capped
-  at that same count, so it can never claim more episodes than have aired. The
-  cap binds only on progress the season cannot support, which is impossible data
-  but reachable: a first-contact sync adopts the remote entry whole, and before
-  ROD-497 the merge could not lower it again. Without the cap such a row paints a
-  full bar and reads as complete while the detail pane beside it counts down to
-  the next episode. The fraction text is untouched and still reports stored
-  progress over the season total; the bar is what stops implying they agree.
+  `[████◐░░░░░░░░░░░]` where `◐` is at episode 5 of 28. It outranks every other
+  glyph: it is a real watch, and the bar must never hide one.
+- **Broadcast edge.** On an airing show the cells past the aired count
+  (`aired_count`, `nextAiringEpisode - 1`) render in their own register, so the
+  bar separates "not watched" from "not out yet":
+  `[███·············]  3 / 14 eps` is three of the three episodes out.
+- **Progress past the edge** renders `▓` rather than being clipped:
+  `[████▓▓▓▓▓▓▓▓▓▓▓▓]  14 / 14 eps` on a season with four aired says "your
+  tracker claims more than has been broadcast" without erasing a watch. **The
+  fill is never capped at the aired count.** `nextAiringEpisode` comes from
+  cached enrichment and goes stale for a full TTL, which is exactly the window a
+  weekly viewer lives in: capping would hide the episode they watched three
+  hours after it aired, and 02 §domain fixes the direction of that trade
+  (over-list ok, under-list hides eps). The `▓` register degrades to a mild
+  over-claim for a day instead, and reads as a loud, permanent wrongness on data
+  that is genuinely broken.
+- The edge sits on the first cell **wholly** beyond the aired range: a cell
+  holding a partially-aired episode belongs to the aired side.
 
 The fill color is **selection-aware**: `state.focus` means "the focused cursor row"
 (the same cyan as the `▸`/title, §4.1), so the bar earns it ONLY when the row is
@@ -903,9 +911,11 @@ available column width.
 
 The resume point cell (`[▸N]`) is always the most visually prominent cell in the
 grid; `state.now` is only ever earned by one cell at a time. A resume point is
-the freshest partial watch recorded **since the frontier last moved**, whichever
-writer moved it (local ratchet, recompute, AniList sync); a partial the frontier
-has passed is dead, a partial written after it is a live rewatch (ROD-477).
+the freshest partial watch recorded **since the frontier last rose**, whichever
+writer raised it (local ratchet, recompute, AniList sync); a partial the frontier
+has passed is dead, a partial written after it is a live rewatch (ROD-477). Only
+a rise retires a partial: a sync correction that lowers progress leaves the
+frontier behind the partial, which keeps it live (ROD-497).
 
 **Launching cell state.** When playback is resolving (the 2-3s resolve → mpv-launch
 window), the played episode's cell renders the current braille spinner frame

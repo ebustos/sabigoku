@@ -393,6 +393,7 @@ mod tests {
         dirty_lib(&store, 10); // a dirty row exists, but pull_only must not push it
         let client = FakeAni::new(
             Ok(vec![RemoteEntry {
+                updated_at: 0,
                 anilist_id: 10,
                 status: ListStatus::Watching,
                 progress: 3,
@@ -618,6 +619,7 @@ mod tests {
         dirty_lib(&store, 22);
         let client = FakeAni::new(
             Ok(vec![RemoteEntry {
+                updated_at: 0,
                 anilist_id: 99,
                 status: ListStatus::Watching,
                 progress: 1,

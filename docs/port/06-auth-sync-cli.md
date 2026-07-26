@@ -236,6 +236,18 @@ park user state on a show the user never engaged (02 §3.7). The O3 auto-import
 WATCHING/REPEATING entry: it promotes an existing identity row rather than
 merging it.
 
+**Duplicate collapse, before the merge.** `MediaListCollection` returns one
+entry per custom list a media is tagged in, so the flat list can hold several
+rows for one id. They collapse to one pair per id by **latest `updatedAt`**,
+ties keeping the first seen. Recency, not magnitude: collapsing by progress
+would re-raise exactly what the merge below exists to lower, since a correction
+is by definition the smaller number, and a stale copy in any custom list would
+silently pin the old value forever. Ties are ordinary (one edit fans out across
+lists with the same stamp), so the tiebreak is fixed rather than left to wire
+order. Deviation from zigoku, which collapses by max progress (ROD-497; see the
+backport ledger). `updatedAt` rides the same pull; a null maps to `0` so it
+loses every tiebreak rather than winning one on an absent field.
+
 **Pure merge (`reconcile`), the total matrix.** `eff_base` = snapshot status,
 or `planning` when the snapshot is null (first contact). `local_moved` =
 local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
@@ -248,10 +260,12 @@ local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
 | yes | yes, same target | keep local (converged) | no |
 | yes | yes, different | **keep local** | **yes** (stays dirty for push) |
 
-- **progress** runs the same matrix against the snapshot's progress half
-  (`0` on first contact), independently of the status outcome:
+- **progress** runs its own matrix against the snapshot's **progress** half
+  (`0` on first contact). `local_progress_moved` = local progress ≠ base
+  progress; likewise for remote. These are independent of the status flags in
+  the table above and are evaluated separately:
 
-| local_moved | remote_moved | progress outcome |
+| local_progress_moved | remote_progress_moved | progress outcome |
 |---|---|---|
 | no | no | unchanged |
 | no | yes | **adopt remote, downward included** |
@@ -264,6 +278,12 @@ local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
   remote, and the resulting mismatch queues the row to push the stale value back
   over the correction. `max` survives only where it earns its keep, the
   both-moved race, so no watched episode is lost.
+- **Completed snap.** Because the two matrices run independently they can land
+  on `completed` with partial progress, a pair neither side held. When the status
+  outcome is `completed` and the total is known and non-zero, progress raises to
+  the total, the same invariant `setListStatus` enforces on every local write
+  (02 §4b). The merge owes the store that invariant rather than pushing the
+  contradiction to the server.
 - `REPEATING` is folded to `watching` at ingest, before the merge; the progress
   matrix runs the same either way.
 
