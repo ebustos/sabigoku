@@ -22,9 +22,13 @@ a push without it, and a second copy in this repo is a second thing to drift.
 
 ## Prerequisites
 
-`AUR_SSH_KEY` in the repo secrets, holding a private key whose public half is on
-the `vantroy` AUR account. The job pins the AUR host key, so a server key
-rotation breaks the push rather than trusting a new one.
+`AUR_SSH_PRIVATE_KEY` in the repo secrets, holding a private key whose public
+half is on the `vantroy` AUR account. The job pins the AUR host key, so a server
+key rotation breaks the push rather than trusting a new one.
+
+The key never shares a machine with the build. `aur-build` compiles and tests the
+package and hands two text files to `aur-publish`, which installs no toolchain
+and runs nothing from the crate graph.
 
 ## Doing it by hand
 

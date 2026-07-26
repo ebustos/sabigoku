@@ -8,6 +8,9 @@ pkgname=sabigoku
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Terminal anime browser and player"
+# The official Arch container image is x86_64 only, so CI never runs makepkg on
+# aarch64. The release matrix does build this target on real aarch64 hardware
+# every tag, so what is unexercised is the makepkg wrapper, not the compile.
 arch=('x86_64' 'aarch64')
 url="https://github.com/vantroy/sabigoku"
 license=('GPL-3.0-or-later')
@@ -30,20 +33,17 @@ sha256sums=('b2ce906de70677c6cdf736d0e61048907fee94d8b9e69def811baa5f40de733e')
 prepare() {
   cd "$pkgname-$pkgver"
   # A clean chroot has no network in build(), so every crate is fetched here.
-  export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
   cd "$pkgname-$pkgver"
-  export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release
 }
 
 check() {
   cd "$pkgname-$pkgver"
-  export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   # Never pass --ignored here: the _live tests reach the network, which a clean
   # chroot does not have and a package build has no business needing.

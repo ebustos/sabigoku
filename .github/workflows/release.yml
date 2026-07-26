@@ -266,8 +266,13 @@ jobs:
           fi
           cargo publish --locked
 
-  aur:
-    name: publish to the AUR
+
+  # The AUR half is two jobs on purpose. Building the package runs every crate's
+  # build script, proc macros and test binaries; the push holds a key that can
+  # write to a package other people install. Nothing that executes third-party
+  # code and nothing that holds the key may share a machine.
+  aur-build:
+    name: build the AUR package
     # The PKGBUILD builds from the tag's source tarball, so the tag must exist
     # and the release must have survived its own guards before Arch users are
     # pointed at it. Independent of crates-io: nothing here reads the registry.
@@ -276,24 +281,24 @@ jobs:
     # concept of a version users should not resolve.
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     container:
-      # Digest-pinned like every action: makepkg and namcap run arbitrary build
-      # logic with an SSH key that can write to the AUR in the same job.
       image: archlinux:base-devel@sha256:412efebb0eeef0ef322ff24ad73f82b1ba2d3b12377db4c5fbe3074c7e7e8678
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # -Syu, never a bare -Sy: a partial upgrade against a moved mirror is how
-      # an Arch container breaks halfway through a build.
+      # an Arch container breaks halfway through a build. mpv is installed here
+      # because it is a declared depends: with it already present, makepkg needs
+      # no -s, so the build user needs no sudo to reach pacman.
       - name: install toolchain
-        run: pacman -Syu --noconfirm --needed git openssh rust namcap pacman-contrib
+        run: pacman -Syu --noconfirm --needed git rust namcap mpv
 
-      # makepkg refuses to run as root, and refuses for a good reason.
+      # Unprivileged, and deliberately granted nothing. makepkg refuses to run
+      # as root, and the code it runs is every build script in the crate graph.
       - name: create a build user
         run: |
           useradd -m builder
-          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
           chown -R builder:builder packaging/aur
 
       - name: render the PKGBUILD for this tag
@@ -323,26 +328,56 @@ jobs:
           rm -f src.tar.gz
           sudo -u builder makepkg --printsrcinfo > .SRCINFO
           # Anchored, so v0.1.0 cannot be satisfied by a v0.1.01 line.
-          grep -qE "^[[:space:]]*pkgver = ${v}\$" .SRCINFO ||
+          grep -qE "^[[:space:]]*pkgver = ${v}$" .SRCINFO ||
             { echo "::error::.SRCINFO did not regenerate to v${v}"; exit 1; }
           cat PKGBUILD
 
       # Build it before publishing it. An AUR package that does not compile is
-      # visible to every Arch user the moment it is pushed, and the recipe here
-      # is the only thing that ever gets tested.
+      # visible to every Arch user the moment it is pushed, and this recipe is
+      # the only thing that ever gets tested.
       - name: build and test the package
         working-directory: packaging/aur
-        run: sudo -u builder makepkg -sf --noconfirm
+        run: sudo -u builder makepkg -f --noconfirm
 
+      # Errors fail the job; warnings do not. Two warnings are permanent and
+      # cannot be silenced: gcc-libs is implicitly satisfied, and mpv is a
+      # runtime shell-out namcap cannot see.
       - name: namcap
         working-directory: packaging/aur
-        continue-on-error: true
         run: |
-          namcap PKGBUILD
-          namcap ./*.pkg.tar.zst
+          namcap PKGBUILD ./*.pkg.tar.zst | tee namcap.log
+          # Match E: anywhere in the label, since namcap prefixes a package
+          # finding with "sabigoku" and a PKGBUILD finding with "PKGBUILD (sabigoku)".
+          if grep -qE '(^|[[:space:]])E: ' namcap.log; then
+            echo "::error::namcap reported an error"
+            exit 1
+          fi
+
+      # Only the two text files cross into the job that holds the key. The built
+      # package stays here.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aur-recipe
+          path: |
+            packaging/aur/PKGBUILD
+            packaging/aur/.SRCINFO
+          if-no-files-found: error
+
+  aur-publish:
+    name: publish to the AUR
+    needs: [guard, aur-build]
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # No cargo, no makepkg, no container: this job runs nothing from the crate
+      # graph, so the key is never in reach of third-party code.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: aur-recipe
+          path: recipe
 
       - name: publish
-        working-directory: packaging/aur
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
@@ -360,7 +395,7 @@ jobs:
           printf '%s\n' \
             'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' \
             > ~/.ssh/known_hosts
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes"
 
           # An unpublished package name clones as an empty repo; that is the
           # documented AUR submission path, so the first release creates it.
@@ -372,7 +407,7 @@ jobs:
             exit 0
           fi
 
-          cp PKGBUILD .SRCINFO aur-repo/
+          cp recipe/PKGBUILD recipe/.SRCINFO aur-repo/
           cd aur-repo
           git config user.name "vantroy"
           git config user.email "vantroy@gmail.com"
