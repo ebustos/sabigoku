@@ -520,6 +520,17 @@ fn list_collection_body(user_id: i64) -> serde_json::Value {
     })
 }
 
+/// One entry's live pair for the push guard (06 §5.3). `Page.mediaList` rather
+/// than the `MediaList` root query: root returns a GraphQL error for a media the
+/// account has no entry for, which the guard would have to read as absence
+/// rather than failure; the Page form returns an empty list instead.
+fn list_entry_body(user_id: i64, media_id: i64) -> serde_json::Value {
+    json!({
+        "query": "query($userId:Int!,$mediaId:Int!){Page(perPage:1){mediaList(userId:$userId,mediaId:$mediaId,type:ANIME){status progress}}}",
+        "variables": { "userId": user_id, "mediaId": media_id },
+    })
+}
+
 fn save_entry_body(media_id: i64, status: ListStatus, progress: u32) -> serde_json::Value {
     json!({
         "query": "mutation($mediaId:Int!,$status:MediaListStatus!,$progress:Int!){SaveMediaListEntry(mediaId:$mediaId,status:$status,progress:$progress){id}}",
@@ -585,6 +596,30 @@ struct ListEntryNode {
 struct ListMediaNode {
     title: Option<GqlTitle>,
     episodes: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct EntryResp {
+    data: Option<EntryData>,
+}
+
+#[derive(Deserialize)]
+struct EntryData {
+    #[serde(rename = "Page")]
+    page: Option<EntryPage>,
+}
+
+#[derive(Deserialize, Default)]
+struct EntryPage {
+    #[serde(rename = "mediaList")]
+    media_list: Option<Vec<EntryNode>>,
+}
+
+#[derive(Deserialize)]
+struct EntryNode {
+    status: Option<String>,
+    #[serde(default)]
+    progress: u32,
 }
 
 #[derive(Deserialize)]
@@ -657,6 +692,25 @@ fn classify_list(raw: &[u8]) -> Result<Vec<RemoteEntry>, CatalogError> {
         }
     }
     Ok(out)
+}
+
+/// Page.mediaList body -> the one entry's pair, `None` when the account has no
+/// entry for that media. The two are not interchangeable to the push guard:
+/// absence means there is nothing to overwrite, while a `data:null` or garbage
+/// body is a no-answer and must stay an Err so the guard holds the row back.
+fn classify_entry(raw: &[u8]) -> Result<Option<(ListStatus, u32)>, CatalogError> {
+    let resp: EntryResp =
+        serde_json::from_slice(raw).map_err(|e| CatalogError::Decode(e.to_string()))?;
+    let data = resp
+        .data
+        .ok_or_else(|| CatalogError::Decode("data is null".into()))?;
+    let page = data.page.unwrap_or_default();
+    Ok(page
+        .media_list
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .map(|e| (list_status_from_anilist(e.status.as_deref()), e.progress)))
 }
 
 /// Save body -> the server row id. A 200 without a non-null id is a failure, not
@@ -743,6 +797,17 @@ impl AniList {
     /// the whole pull (2 MiB cap) rather than truncating.
     pub fn pull_list(&self, token: &str, user_id: i64) -> Result<Vec<RemoteEntry>, CatalogError> {
         classify_list(&self.post_auth(token, list_collection_body(user_id))?)
+    }
+
+    /// One entry's live pair, read immediately before overwriting it (06 §5.3).
+    /// Ok(None) = the account has no entry for that media.
+    pub fn pull_entry(
+        &self,
+        token: &str,
+        user_id: i64,
+        media_id: i64,
+    ) -> Result<Option<(ListStatus, u32)>, CatalogError> {
+        classify_entry(&self.post_auth(token, list_entry_body(user_id, media_id))?)
     }
 
     /// Push one row (06 §5.3); returns the server row id (never null, see
@@ -1232,6 +1297,50 @@ mod tests {
                 || req.contains("Authorization: Bearer secret-token-value"),
             "bearer not sent; request head was:\n{req}"
         );
+    }
+
+    #[test]
+    fn classify_entry_separates_absence_from_no_answer() {
+        let hit = br#"{"data":{"Page":{"mediaList":[{"status":"CURRENT","progress":7}]}}}"#;
+        assert_eq!(
+            classify_entry(hit).unwrap(),
+            Some((ListStatus::Watching, 7))
+        );
+        // Absence, in both shapes AniList can spell it. Not an error: the guard
+        // reads it as "nothing on the server to overwrite".
+        assert_eq!(
+            classify_entry(br#"{"data":{"Page":{"mediaList":[]}}}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            classify_entry(br#"{"data":{"Page":{"mediaList":null}}}"#).unwrap(),
+            None
+        );
+        assert_eq!(classify_entry(br#"{"data":{"Page":null}}"#).unwrap(), None);
+        // A no-answer must stay an Err or the guard would wave the row through.
+        assert!(classify_entry(br#"{"data":null}"#).is_err());
+        assert!(classify_entry(b"not json").is_err());
+        // A missing status is planning, same mapping as the list pull.
+        assert_eq!(
+            classify_entry(br#"{"data":{"Page":{"mediaList":[{"progress":2}]}}}"#).unwrap(),
+            Some((ListStatus::Planning, 2))
+        );
+    }
+
+    #[test]
+    fn pull_entry_sends_both_ids() {
+        let (url, rx) = serve_once_capture(response_with_body(
+            "200 OK",
+            br#"{"data":{"Page":{"mediaList":[{"status":"DROPPED","progress":3}]}}}"#,
+        ));
+        let client = AniList::with_endpoint(url).unwrap();
+        let got = client.pull_entry("tok", 42, 154587).unwrap();
+        assert_eq!(got, Some((ListStatus::Dropped, 3)));
+
+        let raw = rx.recv().unwrap();
+        let req = String::from_utf8_lossy(&raw);
+        assert!(req.contains("154587"), "media id missing:\n{req}");
+        assert!(req.contains("42"), "user id missing:\n{req}");
     }
 
     #[test]

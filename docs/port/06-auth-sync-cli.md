@@ -201,6 +201,11 @@ a pull is inflight. Entry points at freeze:
 
 There is no push-oriented fast path for action flush; do not build one.
 
+Pull-then-push settles **ordering**, not freshness. What the pull learned decays
+across the run at `PUSH_SPACING` per row, and the quit flush pushes on whatever
+the last pull left behind, which can be a whole session old. Per-row freshness is
+the §5.3 guard's job, and it is the only protection the quit flush has.
+
 ### 5.3 Push (`pushAll`)
 
 | | |
@@ -208,12 +213,42 @@ There is no push-oriented fast path for action flush; do not build one.
 | Work list | Engaged, id-bearing, dirty rows only, **minus this run's contended ids** (§5.4; ROD-500) |
 | Hidden/search-only | Not in push set (02: only library `show`) |
 | Spacing | ~2s between **calls**, not between work-list entries: a held-back row costs no request and must not buy the next one a free gap |
-| 429 | Sleep ~60s once, retry row; second 429 → stop run, rest stay dirty |
+| Freshness guard | Re-read the entry immediately before overwriting it; write only if the server still holds the snapshot (ROD-498, below) |
+| 429 | Sleep ~60s once, retry row from the guard; second 429 → stop run, rest stay dirty |
 | 401 | Stop run immediately |
 | Success | `markSynced` advances snapshot; success requires a **non-null `SaveMediaListEntry.id` in the body**, never HTTP 200 alone (a 200 without id advancing the snapshot silently loses the row) |
 | Engaged-but-unlinked | summary lists their titles as an actionable list, capped at 12 + "and N more" (not just a count) |
 | No token / expired | No-op summary flags |
 | Per-row other errors | Count failed, continue |
+
+**The freshness guard (ROD-498).** `SaveMediaListEntry` is a blind write:
+AniList offers no compare-and-set, so nothing server-side stops a push from
+landing on top of an edit the user made elsewhere after our pull read the list.
+The only lever is the size of the window between learning the server's value and
+overwriting it, and the pull is the wrong place to learn it: with ~2s spacing,
+row N is written `2(N-1)` seconds after that pull, and the quit flush has no
+pull at all. So each row re-reads its own entry immediately before its write,
+which pins the window at one round trip **whatever the size of the dirty set**.
+
+| Guard read | Meaning | Action |
+|---|---|---|
+| Entry equals the snapshot | The server still holds what we think it does | Write |
+| **No entry** | Nothing of theirs to destroy. A deleted entry never reappears in the pull to clear our snapshot, so holding here would strand the row dirty forever | Write |
+| Entry differs from the snapshot | Someone moved it since our pull | **Hold**, stay dirty, next pull merges the two |
+| Read failed (not 401/429) | Unverified | **Hold**, count failed |
+
+Held rows are counted (`push_skipped`) and surfaced, never silent. Two things
+this guard is **not**:
+
+- **Not a CAS.** An edit landing between the read and the write is still lost.
+  That residual window is one round trip and cannot be closed from this side.
+- **Not a reason to guard `markSynced`.** The snapshot means "what the server
+  holds", and after an accepted write the server holds exactly what we sent. A
+  local edit arriving mid-round-trip leaves the newer pair mismatched against
+  that snapshot, so the row re-dirties itself and pushes next run. Making the
+  stamp conditional instead would leave the snapshot claiming a value we never
+  sent, which the `(false, true)` cell of the §5.4 matrix then adopts downward
+  as if it were a remote correction (see the INVARIANT in `merge_progress`).
 
 ### 5.4 Pull + reconcile (`pullAll`)
 

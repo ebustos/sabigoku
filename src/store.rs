@@ -1016,12 +1016,16 @@ impl Resume {
 }
 
 /// One push-work row for AniList list sync (ROD-284 shape on the show PK).
+/// `synced` is the snapshot: what we believe the server holds. The push guard
+/// (06 §5.3) re-reads the entry and compares against it before overwriting, so
+/// this must stay the raw snapshot and never the live pair (ROD-498).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyncRow {
     pub anilist_id: i64,
     pub title_romaji: String,
     pub list_status: ListStatus,
     pub progress: u32,
+    pub synced: Option<(ListStatus, u32)>,
 }
 
 /// Tally from one pull reconcile (06 §5.4, O3). `imported`: unmatched
@@ -1482,7 +1486,8 @@ impl Store {
     /// Library-only so identity rows never flood AniList planning.
     pub fn list_dirty_for_sync(&self) -> Result<Vec<SyncRow>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT anilist_id, title_romaji, list_status, progress FROM show
+            "SELECT anilist_id, title_romaji, list_status, progress,
+                    synced_status, synced_progress FROM show
              WHERE library_added_at IS NOT NULL
                AND (synced_status IS NULL
                     OR synced_status <> list_status
@@ -1492,11 +1497,17 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |row| {
             let status: String = row.get(2)?;
+            let snap_status: Option<String> = row.get(4)?;
+            let snap_progress: Option<u32> = row.get(5)?;
             Ok(SyncRow {
                 anilist_id: row.get(0)?,
                 title_romaji: row.get(1)?,
                 list_status: ListStatus::parse(&status),
                 progress: row.get(3)?,
+                synced: match (snap_status, snap_progress) {
+                    (Some(s), Some(p)) => Some((ListStatus::parse(&s), p)),
+                    _ => None,
+                },
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Error::from)
@@ -4201,6 +4212,7 @@ mod tests {
                 title_romaji: "Show 71".into(),
                 list_status: ListStatus::Planning,
                 progress: 0,
+                synced: None,
             }
         );
         // Accepted pair goes clean.
@@ -4212,6 +4224,9 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].progress, 1);
         assert_eq!(dirty[0].list_status, ListStatus::Watching);
+        // The snapshot rides along unchanged: the push guard compares the
+        // server against this, not against the live pair (ROD-498).
+        assert_eq!(dirty[0].synced, Some((ListStatus::Planning, 0)));
     }
 
     #[test]
