@@ -300,12 +300,31 @@ jobs:
         working-directory: packaging/aur
         run: |
           v="${{ needs.guard.outputs.version }}"
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/v${v}.tar.gz"
+          # The tag exists by the time this runs, but codeload's CDN can 404 for
+          # a beat right after a release publishes, so ride it out.
+          curl -fsSL --connect-timeout 30 --max-time 120 \
+            --retry 5 --retry-delay 3 --retry-all-errors "$url" -o src.tar.gz
+          # curl -f gates on HTTP status, not on the body: a 200 carrying a CDN
+          # interstitial would hash perfectly happily.
+          tar tzf src.tar.gz >/dev/null 2>&1 ||
+            { echo "::error::downloaded archive is not a valid gzip tarball"; exit 1; }
+          sum=$(sha256sum src.tar.gz | awk '{print $1}')
+
           sed -i "s/^pkgver=.*/pkgver=${v}/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-          # updpkgsums downloads the source and rewrites sha256sums in place, so
-          # the checksum is computed from what the tag actually serves and is
-          # never carried over from the committed value.
-          sudo -u builder updpkgsums
+          sed -i "s/^sha256sums=.*/sha256sums=('${sum}')/" PKGBUILD
+          # Verify the sed instead of trusting it. A no-op leaves the previous
+          # release's checksum, which still regenerates a self-consistent
+          # .SRCINFO that the AUR accepts, and then fails integrity on every
+          # user's makepkg.
+          grep -qx "sha256sums=('${sum}')" PKGBUILD ||
+            { echo "::error::sha256 bump did not land in PKGBUILD"; exit 1; }
+
+          rm -f src.tar.gz
           sudo -u builder makepkg --printsrcinfo > .SRCINFO
+          # Anchored, so v0.1.0 cannot be satisfied by a v0.1.01 line.
+          grep -qE "^[[:space:]]*pkgver = ${v}\$" .SRCINFO ||
+            { echo "::error::.SRCINFO did not regenerate to v${v}"; exit 1; }
           cat PKGBUILD
 
       # Build it before publishing it. An AUR package that does not compile is
@@ -325,16 +344,16 @@ jobs:
       - name: publish
         working-directory: packaging/aur
         env:
-          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
-          if [ -z "${AUR_SSH_KEY}" ]; then
-            echo "::error::AUR_SSH_KEY is unset; add it under repo settings -> secrets"
+          if [ -z "${AUR_SSH_PRIVATE_KEY}" ]; then
+            echo "::error::AUR_SSH_PRIVATE_KEY is unset; add it under repo settings -> secrets"
             exit 1
           fi
           v="${{ needs.guard.outputs.version }}"
 
           mkdir -p ~/.ssh
-          printf '%s\n' "${AUR_SSH_KEY}" > ~/.ssh/aur
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
           # Pinned host key, never StrictHostKeyChecking=no: this key can write
           # to a package other people install.
