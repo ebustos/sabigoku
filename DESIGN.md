@@ -850,9 +850,9 @@ Format: `[████████░░░░░░░░]  8 / 28 eps`
 - Empty cells: `border.hair`.
 - `█` for watched, `░` for empty, `▓` for watched-past-broadcast, `·` for
   not-yet-aired. Only `█` and the `◐` resume marker take the fill colour; `▓`,
-  `░` and `·` are all `border.hair`, so the **lit run of the bar always stops at
-  the broadcast edge**. `◐` is the deliberate exception, lit wherever it lands,
-  because a real watch outranks every other signal here. A
+  `░` and `·` are all `border.hair`, so the **lit `█` run always stops at the
+  broadcast edge**. `◐` is the deliberate exception and stays lit wherever it
+  lands, including past the edge. A
   claim past that edge has to read as unlit, or it scans as a full bar again and
   the whole point is lost.
 - Bar width: 16 chars minimum, scales to available space with a max of 24 chars.
@@ -879,10 +879,10 @@ Format: `[████████░░░░░░░░]  8 / 28 eps`
   whereas the bar reports a watch the user already has. Capping a count of
   things-you-can-do is correct; capping a record of what happened is data loss.
   A future reader diffing the two must not "fix" them into agreement.
-- Edge and fill share both their rounding mode (floor) and their one-cell
-  floor. Asymmetry either way puts the edge ahead of a fill reaching the same
+- Edge and fill round identically and carry the same one-cell minimum.
+  Asymmetry either way puts the edge ahead of a fill reaching the same
   episode, so a viewer caught up on everything broadcast gets a phantom `░`. The
-  one-cell floor is what gives a lone aired or watched episode a cell of its own
+  one-cell minimum is what gives a lone aired or watched episode a cell of its own
   on a long season, where the quotient truncates to zero.
 
 The fill color is **selection-aware**: `state.focus` means "the focused cursor row"

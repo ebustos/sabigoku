@@ -480,11 +480,11 @@ struct BarGeometry {
 /// 4.5): `next_airing_episode` is cached enrichment and goes stale for a full
 /// TTL, so a cap would hide an episode the user watched hours after it aired.
 ///
-/// Edge and fill share BOTH their rounding mode (floor) and their floor of one
-/// cell. Asymmetry either way puts the edge ahead of a fill reaching the same
+/// Edge and fill must round identically AND carry the same one-cell minimum.
+/// Asymmetry either way puts the edge ahead of a fill reaching the same
 /// episode, which paints a phantom "aired but unwatched" cell for a viewer who
-/// is caught up. The floor is what gives a lone aired or watched episode a cell
-/// of its own on a long season, where the quotient truncates to zero.
+/// is caught up. The minimum is what gives a lone aired or watched episode a
+/// cell of its own on a long season, where the quotient truncates to zero.
 fn bar_geometry(
     progress: u32,
     total: Option<u32>,
@@ -739,14 +739,14 @@ mod tests {
         // so nothing is hidden; the edge at 4 is what says the rest is not out.
         assert_eq!(g(14, Some(14), Some(4)), (16, Some(4)));
         // Caught up on everything broadcast: no cell may read as aired and
-        // unwatched. Swept, not sampled. Four hand-picked shapes passed this
-        // while 192 others failed, because the counterexamples cluster where
-        // the quotient truncates to zero.
+        // unwatched. Swept, not sampled: the counterexamples cluster where the
+        // quotient truncates to zero, which hand-picked shapes step over.
+        // `a < t` only, since an aired count at the total carries no edge.
         for width in [16u16, 20, 24] {
             for t in 1..=60u32 {
-                for a in 0..=t {
+                for a in 0..t {
                     let b = bar_geometry(a, Some(t), Some(a), None, width);
-                    let edge = b.aired.unwrap_or(b.filled);
+                    let edge = b.aired.expect("aired below total always marks an edge");
                     assert_eq!(
                         b.filled, edge,
                         "w{width} caught up {a}/{t}: phantom unwatched cell"

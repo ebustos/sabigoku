@@ -1804,14 +1804,13 @@ fn reconcile(
     let merged = merge_progress(base.map_or(0, |(_, p)| p), local.1, remote.1);
     Reconciled {
         status,
-        // Cross-half synthesis floor: only where the status half KEPT a local
-        // move to completed while the progress half adopted a remote value
-        // behind it, a pair neither side held. Every clause earns its place;
-        // drop `local_moved` and this fires on settled completed rows, where it
-        // reverts the correction the ticket exists to land (06 §5.4).
+        // Cross-half synthesis floor. Every clause excludes a distinct way of
+        // destroying a remote edit; 06 §5.4 tabulates which is which. Do not
+        // widen without reading it.
         progress: if local_moved
             && status == ListStatus::Completed
             && local.0 == ListStatus::Completed
+            && remote.0 != ListStatus::Completed
         {
             merged.max(local.1)
         } else {
@@ -3606,6 +3605,37 @@ mod tests {
             (ListStatus::Watching, 4, Some(ListStatus::Watching), Some(4))
         );
         assert!(store.list_dirty_for_sync().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_remote_that_completed_at_its_own_progress_is_adopted_whole() {
+        // Both sides moved to completed, so the remote HELD this pair: there is
+        // no synthesis to correct and the floor must stay out of it. Local
+        // reaching completed independently is not a licence to overwrite the
+        // progress the remote completed at.
+        let r = reconcile(
+            Some((ListStatus::Watching, 20)),
+            (ListStatus::Completed, 20),
+            (ListStatus::Completed, 5),
+        );
+        assert_eq!((r.status, r.progress), (ListStatus::Completed, 5));
+
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            92,
+            ListStatus::Completed,
+            10,
+            Some((ListStatus::Watching, 10)),
+        );
+        store
+            .reconcile_pull(&[remote(92, ListStatus::Completed, 3)], 800)
+            .unwrap();
+        assert_eq!(state(&store, 92).1, 3, "remote correction landed");
+        assert!(
+            store.list_dirty_for_sync().unwrap().is_empty(),
+            "nothing queued to push the stale value back"
+        );
     }
 
     #[test]
