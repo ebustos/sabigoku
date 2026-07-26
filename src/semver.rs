@@ -122,6 +122,16 @@ mod tests {
         assert_eq!(a.order(b), Ordering::Equal);
     }
 
+    /// Ratified deviation (ROD-465 review): zigoku splits on the first `-`
+    /// even inside build metadata and rejects this input; the semver-correct
+    /// read is kept on purpose.
+    #[test]
+    fn hyphen_inside_build_metadata_stays_build_metadata() {
+        let a = Version::parse("0.4.1+build-info").unwrap();
+        let b = Version::parse("0.4.1").unwrap();
+        assert_eq!(a.order(b), Ordering::Equal);
+    }
+
     #[test]
     fn is_newer_the_update_check_question() {
         assert!(is_newer("0.5.0", "0.4.1"));

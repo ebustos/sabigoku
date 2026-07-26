@@ -39,14 +39,6 @@ pub fn check(cache_dir: &Path, current_version: &str, now: i64) -> Option<String
     semver::is_newer(&latest, current_version).then_some(latest)
 }
 
-/// Fresh network tag, bypassing (and refreshing) the cache. For
-/// `sabigoku update` (ROD-466), which must not act on an hour-old answer.
-pub fn latest_fresh(cache_dir: &Path, now: i64) -> Option<String> {
-    let tag = fetch_latest()?;
-    write_cache(cache_dir, now, &tag);
-    Some(tag)
-}
-
 fn resolve_latest(cache_dir: &Path, now: i64) -> Option<String> {
     if let Some(entry) = read_cache(cache_dir)
         && is_fresh(entry.checked_at, now)
@@ -59,9 +51,11 @@ fn resolve_latest(cache_dir: &Path, now: i64) -> Option<String> {
 }
 
 /// Fresh if within TTL and not future-dated: a backward clock or a hand-edited
-/// cache must not wedge the check forever.
+/// cache must not wedge the check forever. Saturating: `checked_at` is
+/// untrusted file input, and a plain subtraction wraps on an extreme negative,
+/// which a release build would read as permanently fresh.
 pub fn is_fresh(checked_at: i64, now: i64) -> bool {
-    checked_at <= now && now - checked_at < CHECK_TTL_SECS
+    checked_at <= now && now.saturating_sub(checked_at) < CHECK_TTL_SECS
 }
 
 fn cache_path(cache_dir: &Path) -> PathBuf {
@@ -69,34 +63,63 @@ fn cache_path(cache_dir: &Path) -> PathBuf {
 }
 
 /// `None` on any problem: a bad cache is no cache, so the check re-fetches.
+/// Bounded like the network body (zigoku caps this same read at 4096); a
+/// bloated file truncates into a parse that fails or a tag the cap trims.
 fn read_cache(cache_dir: &Path) -> Option<CacheEntry> {
-    let text = std::fs::read_to_string(cache_path(cache_dir)).ok()?;
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(cache_path(cache_dir))
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut text)
+        .ok()?;
     parse_cache(&text)
 }
 
-/// Two-line body: `<checked_at>\n<tag>\n`.
+/// Two-line body: `<checked_at>\n<tag>\n`. The tag line goes through the same
+/// sanitizer as a network tag: the cache file is untrusted input too, and this
+/// path runs on most real boots.
 pub fn parse_cache(text: &str) -> Option<CacheEntry> {
     let mut lines = text.lines();
     let checked_at = lines.next()?.trim().parse().ok()?;
-    let latest = lines.next()?.trim();
-    if latest.is_empty() {
-        return None;
-    }
-    Some(CacheEntry {
-        checked_at,
-        latest: latest.to_string(),
-    })
+    let latest = sanitize_tag(lines.next()?.trim())?;
+    Some(CacheEntry { checked_at, latest })
 }
 
-/// Best-effort; a failure means the next launch re-checks.
+/// Printable ASCII, capped at 64; `None` when nothing survives. The one gate
+/// both tag sources (release JSON, cache file) pass through, so no consumer
+/// (toast copy, Settings row, `update` stdout) can be fed terminal escapes or
+/// an unbounded string. zigoku sanitizes at its CLI print instead; hoisting it
+/// here covers the TUI path too.
+fn sanitize_tag(raw: &str) -> Option<String> {
+    let clean: String = raw
+        .chars()
+        .filter(|c| (' '..='~').contains(c))
+        .take(64)
+        .collect();
+    if clean.is_empty() { None } else { Some(clean) }
+}
+
+/// Best-effort; a failure means the next launch re-checks. Write-then-rename:
+/// a concurrent boot must never read a truncated half-write, and teardown
+/// abandoning this worker mid-write must leave the old cache, not a torn one.
 fn write_cache(cache_dir: &Path, now: i64, latest: &str) {
     let _ = std::fs::create_dir_all(cache_dir);
-    if let Err(e) = std::fs::write(cache_path(cache_dir), format!("{now}\n{latest}\n")) {
+    let tmp = cache_dir.join(format!("{CACHE_FILE}.tmp"));
+    let write = std::fs::write(&tmp, format!("{now}\n{latest}\n"))
+        .and_then(|()| std::fs::rename(&tmp, cache_path(cache_dir)));
+    if let Err(e) = write {
         log::debug!("update check: cache write failed: {e}");
     }
 }
 
+/// Cap on the response body. The release JSON is a few KB; a host that can
+/// answer as api.github.com (DNS/proxy tampering) must not be able to force
+/// an arbitrarily large allocation inside the fetch deadline.
+const BODY_CAP: u64 = 64 * 1024;
+
 fn fetch_latest() -> Option<String> {
+    use std::io::Read;
     let client = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .user_agent(USER_AGENT)
@@ -106,32 +129,24 @@ fn fetch_latest() -> Option<String> {
         .get(LATEST_URL)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(reqwest::blocking::Response::text)
         .map_err(|e| log::debug!("update check: fetch failed: {e}"))
-        .ok()?;
+        .ok()
+        .and_then(|resp| {
+            let mut body = String::new();
+            resp.take(BODY_CAP).read_to_string(&mut body).ok()?;
+            Some(body)
+        })?;
     parse_latest_tag(&body)
 }
 
-/// Tag from the release JSON. Sanitized to printable ASCII and capped here,
-/// once, so no consumer (toast copy, `update` stdout) can be fed terminal
-/// escapes from a forged tag_name. zigoku sanitizes at its CLI print instead;
-/// hoisting it into the parse covers the TUI path too.
+/// Tag from the release JSON, through the `sanitize_tag` gate.
 pub fn parse_latest_tag(body: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct LatestRelease {
         tag_name: String,
     }
     let parsed: LatestRelease = serde_json::from_str(body).ok()?;
-    let clean: String = parsed
-        .tag_name
-        .chars()
-        .filter(|c| (' '..='~').contains(c))
-        .take(64)
-        .collect();
-    if clean.is_empty() {
-        return None;
-    }
-    Some(clean)
+    sanitize_tag(&parsed.tag_name)
 }
 
 #[cfg(test)]
@@ -145,6 +160,17 @@ mod tests {
         assert!(is_fresh(now - (CHECK_TTL_SECS - 1), now));
         assert!(!is_fresh(now - CHECK_TTL_SECS, now));
         assert!(!is_fresh(now + 1, now), "future-dated must re-check");
+    }
+
+    /// A release build's wrapped subtraction read i64::MIN as permanently
+    /// fresh, silencing the check forever from one edited cache line.
+    #[test]
+    fn is_fresh_survives_adversarial_extremes() {
+        let now: i64 = 1_700_000_000;
+        assert!(!is_fresh(i64::MIN, now));
+        assert!(!is_fresh(i64::MIN + 1, now));
+        assert!(!is_fresh(i64::MAX, now));
+        assert!(!is_fresh(-1, now), "negative is just very stale");
     }
 
     #[test]
@@ -172,6 +198,26 @@ mod tests {
         ] {
             assert_eq!(parse_cache(bad), None, "{bad:?} must not parse");
         }
+    }
+
+    /// The cache file is as untrusted as the network body; a poisoned tag
+    /// line must come out escape-free and capped, not ride into App state.
+    #[test]
+    fn parse_cache_sanitizes_and_caps_the_tag_line() {
+        let poisoned = "1700000000\nv1.0.0\u{1b}[2J\u{7}\n";
+        assert_eq!(parse_cache(poisoned).unwrap().latest, "v1.0.0[2J");
+        let flood = format!("1700000000\n{}\n", "x".repeat(10_000_000));
+        assert_eq!(parse_cache(&flood).unwrap().latest.len(), 64);
+        assert_eq!(parse_cache("1700000000\n\u{1b}\u{7}\n"), None);
+    }
+
+    #[test]
+    fn write_cache_leaves_no_tmp_behind() {
+        let dir = std::env::temp_dir().join("sabigoku-updatecheck-tmpfile");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_cache(&dir, 1_700_000_000, "v0.9.0");
+        assert!(dir.join(CACHE_FILE).is_file());
+        assert!(!dir.join(format!("{CACHE_FILE}.tmp")).exists());
     }
 
     #[test]

@@ -199,7 +199,8 @@ fn sync_worker(
 
 /// Boot update check (06 §6.1): posts `UpdateAvailable` only on a strictly
 /// newer release; every failure is silence, so the queue never learns the
-/// check ran. The fetch inside is deadline-capped, keeping the drain joinable.
+/// check ran. Its drain is never joined at teardown; the fetch deadline
+/// bounds how long an abandoned worker outlives quit.
 #[must_use]
 pub fn spawn_update_check(
     drain: &Drain,

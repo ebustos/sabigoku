@@ -108,9 +108,12 @@ pub struct App {
     sync_debounce: Debounce,
     /// A sync worker is inflight; gates overlap and the quit flush (04 §11).
     syncing: bool,
-    /// Connect, sync and update-check workers share one drain, joined at
-    /// teardown.
+    /// Connect and sync workers share one drain, joined at teardown.
     pub(super) sync_drain: Drain,
+    /// Deliberately never drained: quit must not wait on a nag. zigoku joins
+    /// its update thread instead; abandonment is safe here because the fetch
+    /// is deadline-capped and the cache write is rename-atomic (08 ledger).
+    pub(super) update_drain: Drain,
     /// Latest release tag when the boot check found one newer; feeds the
     /// Settings version row (DESIGN 5.5).
     latest_version: Option<String>,
@@ -184,6 +187,7 @@ impl App {
             sync_debounce: Debounce::default(),
             syncing: false,
             sync_drain: Drain::default(),
+            update_drain: Drain::default(),
             latest_version: None,
             pool,
             encode_drain,
@@ -1440,7 +1444,7 @@ impl App {
             return;
         }
         let _ = workers::spawn_update_check(
-            &self.sync_drain,
+            &self.update_drain,
             tx.clone(),
             self.play_dirs.cache.clone(),
             env!("CARGO_PKG_VERSION"),
@@ -2485,7 +2489,7 @@ mod tests {
         let (tx, rx) = super::super::event::channel();
         let app = update_check_app("update-check-on", true, &tx);
         app.bootstrap_update_check(&tx);
-        assert!(app.sync_drain.drain(Duration::from_secs(5)));
+        assert!(app.update_drain.drain(Duration::from_secs(5)));
         assert_eq!(
             rx.try_recv().unwrap(),
             Event::UpdateAvailable {
@@ -2499,7 +2503,7 @@ mod tests {
         let (tx, rx) = super::super::event::channel();
         let app = update_check_app("update-check-off", false, &tx);
         app.bootstrap_update_check(&tx);
-        assert!(app.sync_drain.drain(Duration::from_secs(5)));
+        assert!(app.update_drain.drain(Duration::from_secs(5)));
         assert!(rx.try_recv().is_err());
     }
 
