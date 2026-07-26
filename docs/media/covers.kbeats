@@ -1,0 +1,34 @@
+# covers.kbeats: the Kitty-graphics cover-art stills. Showcases the Discover
+# feed: a wall of real cover art that every cell-grid recorder renders as
+# halfblocks (ROD-464, ported from zigoku ROD-255).
+#
+# READ-ONLY on the real store: shift+d/h nav, one Return opens the Discover
+# detail zoom (a 2nd Return there would PLAY; Escape backs out instead). The
+# mutating `P` (plan) key the Discover status bar offers is refused by the
+# runner's lint.
+#
+# Run:  ./docs/media/capture-kitty.sh docs/media/covers.kbeats
+
+sleep 2
+key shift+d
+sleep 7s                        # the Discover feed is LIVE (AniList ranking + covers);
+                                # wait for the wall to resolve before grabbing
+grab browse-covers.png          # Discover cover-wall, WIDE: two full rows of covers
+
+# The single-pane detail zoom leaves the right half empty at the wide default.
+# Shrink to a standard window so it reads balanced, grab, then restore the wide
+# size for the two-pane History view.
+resize 1280x800
+key Return
+sleep 4s                        # open #1's detail zoom: cover + kanji chips + synopsis
+                                # + episode grid (the grid loads a beat after the pane)
+grab detail-cover.png
+
+key Escape                      # back out of the zoom (NEVER Return here; it plays)
+sleep 600ms
+key shift+h
+sleep 1400ms
+resize 1596x996                 # back to wide for the two-pane view
+key j j j
+sleep 900ms
+grab history.png                # real watchlist master-detail (grouped status + covers)
