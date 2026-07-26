@@ -90,6 +90,7 @@ pub fn run(paths: &Paths, config: &Config) -> std::io::Result<()> {
     }
     // Launch pull-refresh (04 §3), pull only so first contact never blind-pushes.
     app.bootstrap_sync(&tx);
+    app.bootstrap_update_check(&tx);
 
     let mut clock = TickClock::new(Instant::now());
     let result = (|| {

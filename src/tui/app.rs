@@ -108,8 +108,12 @@ pub struct App {
     sync_debounce: Debounce,
     /// A sync worker is inflight; gates overlap and the quit flush (04 §11).
     syncing: bool,
-    /// Connect and sync workers share one drain, joined at teardown.
+    /// Connect, sync and update-check workers share one drain, joined at
+    /// teardown.
     pub(super) sync_drain: Drain,
+    /// Latest release tag when the boot check found one newer; feeds the
+    /// Settings version row (DESIGN 5.5).
+    latest_version: Option<String>,
     pub(super) pool: ProtocolPool,
     pub(super) encode_drain: Drain,
 }
@@ -180,6 +184,7 @@ impl App {
             sync_debounce: Debounce::default(),
             syncing: false,
             sync_drain: Drain::default(),
+            latest_version: None,
             pool,
             encode_drain,
         };
@@ -257,6 +262,7 @@ impl App {
             } => self.on_prewarm_result(anilist_id, &provider, &verdict, token, now, tx),
             Event::ConnectResult(result) => self.on_connect_result(result, now, tx),
             Event::SyncFlushed(summary) => self.on_sync_flushed(summary, now),
+            Event::UpdateAvailable { version } => self.on_update_available(version, now),
         }
     }
 
@@ -1266,11 +1272,13 @@ impl App {
         let names: Vec<&str> = self.registry.iter().map(|p| p.name()).collect();
         let covers_dir = settings::tilde_path(&self.covers_dir);
         let account = self.account_line();
+        let version = self.version_line();
         let env = settings::SettingsEnv {
             config: &self.config,
             providers: &names,
             covers_dir: &covers_dir,
             account: &account,
+            version: &version,
         };
         settings::draw(frame, area, self.palette, &self.settings, &env);
     }
@@ -1425,6 +1433,30 @@ impl App {
         self.flush_sync(Instant::now(), tx, true);
     }
 
+    /// Boot update check (06 §6.1), gated on `check_for_updates`. One shot;
+    /// silence on failure is the worker's contract, so nothing tracks it.
+    pub(super) fn bootstrap_update_check(&self, tx: &EventTx) {
+        if !self.config.check_for_updates {
+            return;
+        }
+        let _ = workers::spawn_update_check(
+            &self.sync_drain,
+            tx.clone(),
+            self.play_dirs.cache.clone(),
+            env!("CARGO_PKG_VERSION"),
+            unix_now(),
+        );
+    }
+
+    /// A newer release exists: one low-key toast (04 §4.6), and the Settings
+    /// version row carries it from here on. The tag arrives pre-sanitized.
+    fn on_update_available(&mut self, version: String, now: Instant) {
+        self.toasts
+            .push(Kind::Info, &format!("update available: {version}"), now);
+        self.latest_version = Some(version);
+        self.dirty = true;
+    }
+
     /// A sync run finished: clear the inflight flag and toast what moved
     /// (DESIGN 4.10 up/down rows). Failures and no-ops are silent by design.
     fn on_sync_flushed(&mut self, summary: sync::SyncSummary, now: Instant) {
@@ -1463,6 +1495,16 @@ impl App {
             self.config.anilist_sync_enabled,
             unix_now(),
         );
+    }
+
+    /// The version row's live text (DESIGN 5.5): the built-in version, tagged
+    /// with the newer release when the boot check found one.
+    fn version_line(&self) -> String {
+        let current = env!("CARGO_PKG_VERSION");
+        match &self.latest_version {
+            Some(latest) => format!("v{current} ({latest} available)"),
+            None => format!("v{current}"),
+        }
     }
 
     /// The account row's live text (DESIGN 5.5): the user name once connected,
@@ -2406,6 +2448,81 @@ mod tests {
         assert_eq!(
             app.history.selected().map(|s| s.enrichment.anilist_id),
             Some(42)
+        );
+    }
+
+    /// A fresh seeded cache makes the check answer without network, so the
+    /// gate pair below is a real mutation check: same fixture, only the gate
+    /// differs, and only the open gate posts.
+    fn seed_update_cache(paths: &Paths, tag: &str) {
+        std::fs::create_dir_all(&paths.cache).unwrap();
+        std::fs::write(
+            paths.cache.join("update_check"),
+            format!("{}\n{tag}\n", unix_now()),
+        )
+        .unwrap();
+    }
+
+    fn update_check_app(name: &str, check_for_updates: bool, tx: &EventTx) -> App {
+        let paths = test_paths(name);
+        seed_update_cache(&paths, "v999.0.0");
+        App::new(
+            &Config {
+                check_for_updates,
+                ..Config::default()
+            },
+            Store::open_memory().unwrap(),
+            StubCatalog::inert(),
+            teststub::inert_registry(),
+            &paths,
+            Picker::halfblocks(),
+            tx,
+        )
+    }
+
+    #[test]
+    fn boot_update_check_posts_when_the_cache_holds_a_newer_release() {
+        let (tx, rx) = super::super::event::channel();
+        let app = update_check_app("update-check-on", true, &tx);
+        app.bootstrap_update_check(&tx);
+        assert!(app.sync_drain.drain(Duration::from_secs(5)));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Event::UpdateAvailable {
+                version: "v999.0.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn boot_update_check_gate_off_posts_nothing() {
+        let (tx, rx) = super::super::event::channel();
+        let app = update_check_app("update-check-off", false, &tx);
+        app.bootstrap_update_check(&tx);
+        assert!(app.sync_drain.drain(Duration::from_secs(5)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn update_available_toasts_and_feeds_the_version_row() {
+        let (mut app, tx, now) = harness("update-available");
+        let current = env!("CARGO_PKG_VERSION");
+        assert_eq!(app.version_line(), format!("v{current}"));
+        app.tick(
+            Event::UpdateAvailable {
+                version: "v999.0.0".into(),
+            },
+            now,
+            &tx,
+        );
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.copy == "update available: v999.0.0")
+        );
+        assert_eq!(
+            app.version_line(),
+            format!("v{current} (v999.0.0 available)")
         );
     }
 

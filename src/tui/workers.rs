@@ -197,6 +197,24 @@ fn sync_worker(
     .unwrap_or_else(|_| SyncSummary::terminal(SyncOutcome::Failed))
 }
 
+/// Boot update check (06 §6.1): posts `UpdateAvailable` only on a strictly
+/// newer release; every failure is silence, so the queue never learns the
+/// check ran. The fetch inside is deadline-capped, keeping the drain joinable.
+#[must_use]
+pub fn spawn_update_check(
+    drain: &Drain,
+    tx: EventTx,
+    cache_dir: PathBuf,
+    current_version: &'static str,
+    now: i64,
+) -> bool {
+    drain.spawn("update-check", move || {
+        if let Some(version) = crate::updatecheck::check(&cache_dir, current_version, now) {
+            tx.post(Event::UpdateAvailable { version });
+        }
+    })
+}
+
 /// Quit flush worker (04 §11): push only, no spacing/backoff (`NoSleep`), so it
 /// pushes what it can inside teardown's drain deadline.
 #[must_use]
