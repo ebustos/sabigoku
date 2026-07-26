@@ -17,6 +17,43 @@ release.yml refuses to build a tag whose section is missing or empty, and
 publishes that section verbatim as the release body.
 -->
 
+## [0.1.1] - 2026-07-26
+
+Bug fixes and four new install channels.
+
+### Added
+
+- **cargo, curl, AUR, and Homebrew installs**: `cargo install sabigoku` on
+  crates.io, a `curl | sh` installer at the repo root that verifies the
+  downloaded tarball's sha256, an AUR package (`sabigoku`, source build) for
+  Arch, and a Homebrew tap (`brew install vantroy/sabigoku/sabigoku`) for
+  Apple Silicon Macs. All four are fed automatically on every release.
+
+### Fixed
+
+- **`sabigoku <query>` works on a stock install**: the CLI now picks a source
+  that can actually search, instead of binding to the primary source
+  regardless of whether it supports search. `preferred_provider` still
+  overrides. The TUI was never affected.
+- **Watch progress can no longer run ahead of what has aired**: an airing
+  show could show a full progress bar with only a few episodes out, and that
+  number would get pushed to AniList. Sync now reconciles each side's
+  progress against what was last agreed, instead of always taking the higher
+  number.
+- **A sync push can no longer overwrite an edit made elsewhere mid-sync**: if
+  an entry changes on AniList between the read and the write, the push backs
+  off instead of clobbering the edit and recording false agreement. A row
+  that loses this race waits for the next sync run instead of pushing its
+  stale value later in the same one.
+
+### Removed
+
+- **Intel macOS binary**: it was cross-compiled and nothing in CI could run
+  it, so every shipped byte was untested. Cut rather than shipped blind.
+  Apple Silicon macOS binaries are unaffected, built and smoke-tested on real
+  arm64 hardware. On an Intel Mac, `cargo install sabigoku`; the installer
+  says the same if run there.
+
 ## [0.1.0] - 2026-07-25
 
 First tagged release, a terminal anime browser and player written in Rust.
@@ -62,4 +99,5 @@ Licensed GPL-3.0-or-later.
 - **`sabigoku update` is not implemented**: it prints a message saying so. There
   is no self-update yet.
 
+[0.1.1]: https://github.com/vantroy/sabigoku/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vantroy/sabigoku/releases/tag/v0.1.0
