@@ -103,6 +103,10 @@ pub struct SyncSummary {
     pub dirty: u32,
     pub pushed: u32,
     pub push_failed: u32,
+    /// Dirty rows deliberately not pushed this run because what we believe the
+    /// server holds for them is known-bad: the pull left them contended
+    /// (ROD-500). They stay dirty for the next run.
+    pub push_skipped: u32,
 }
 
 impl SyncSummary {
@@ -114,6 +118,7 @@ impl SyncSummary {
             dirty: 0,
             pushed: 0,
             push_failed: 0,
+            push_skipped: 0,
         }
     }
 }
@@ -173,6 +178,7 @@ pub fn run_sync<A: AniListSync, S: Sleeper>(
         dirty: 0,
         pushed: 0,
         push_failed: 0,
+        push_skipped: 0,
     };
     if let Some(remote) = remote {
         summary.pulled = store.reconcile_pull(&remote, now)?;
@@ -180,7 +186,8 @@ pub fn run_sync<A: AniListSync, S: Sleeper>(
     if pull_only {
         return Ok(summary);
     }
-    push_dirty(client, token, store, sleeper, &mut summary)?;
+    let contended = summary.pulled.contended.clone();
+    push_dirty(client, token, store, sleeper, &contended, &mut summary)?;
     Ok(summary)
 }
 
@@ -202,7 +209,8 @@ pub fn flush_push<A: AniListSync, S: Sleeper>(
         Err(o) => return Ok(SyncSummary::terminal(o)),
     };
     let mut summary = SyncSummary::terminal(SyncOutcome::Completed);
-    push_dirty(client, token, store, sleeper, &mut summary)?;
+    // No pull this run, so no contended set to gate on.
+    push_dirty(client, token, store, sleeper, &[], &mut summary)?;
     Ok(summary)
 }
 
@@ -210,20 +218,34 @@ pub fn flush_push<A: AniListSync, S: Sleeper>(
 /// backs off once and retries the row, a second 429 stops the run leaving the
 /// rest dirty. Other per-row errors count and continue. A success advances the
 /// snapshot only after AniList returned a non-null id (enforced in `save_entry`).
+///
+/// `contended` are ids the pull failed to reconcile this run (ROD-500). Their
+/// snapshot never advanced, so the live pair is pre-merge and pushing it would
+/// overwrite the remote change the pull was carrying. Held back as
+/// `push_skipped`, left dirty.
 fn push_dirty<A: AniListSync, S: Sleeper>(
     client: &A,
     token: &str,
     store: &Store,
     sleeper: &S,
+    contended: &[i64],
     summary: &mut SyncSummary,
 ) -> Result<(), Error> {
     let dirty = store.list_dirty_for_sync()?;
     summary.dirty = dirty.len() as u32;
     let mut backed_off = false;
-    for (i, row) in dirty.iter().enumerate() {
-        if i > 0 {
+    let mut called = false;
+    for row in &dirty {
+        if contended.contains(&row.anilist_id) {
+            summary.push_skipped += 1;
+            continue;
+        }
+        // Spacing is between calls, not between work-list entries: a skipped
+        // row costs no request and must not buy the next one a free 2s.
+        if called {
             sleeper.sleep(PUSH_SPACING);
         }
+        called = true;
         loop {
             match client.save_entry(token, row.anilist_id, row.list_status, row.progress) {
                 Ok(_) => {
@@ -589,6 +611,43 @@ mod tests {
         assert_eq!(out.pushed, 3);
         // Three rows -> two gaps, no leading sleep.
         assert_eq!(*sleeper.slept.borrow(), vec![PUSH_SPACING, PUSH_SPACING]);
+    }
+
+    // ROD-500: the pull failed to land this row's merge, so its live pair is
+    // pre-merge and its snapshot never advanced. Pushing it in the same run
+    // would overwrite the remote change the pull was carrying.
+    #[test]
+    fn a_contended_row_is_held_back_from_the_push() {
+        let store = Store::open_memory().unwrap();
+        dirty_lib(&store, 23);
+        dirty_lib(&store, 24);
+        let client = FakeAni::new(Ok(vec![]), vec![Ok(1), Ok(1)]);
+        let sleeper = RecordingSleeper::new();
+        let mut summary = SyncSummary::terminal(SyncOutcome::Completed);
+        push_dirty(&client, "tok", &store, &sleeper, &[23], &mut summary).unwrap();
+
+        assert_eq!(summary.push_skipped, 1);
+        assert_eq!(summary.pushed, 1);
+        assert_eq!(
+            client.push_calls.borrow().len(),
+            1,
+            "the contended row never reaches AniList"
+        );
+        assert_eq!(client.push_calls.borrow()[0].0, 24);
+        assert!(
+            sleeper.slept.borrow().is_empty(),
+            "one call means no spacing: a skipped row costs no request"
+        );
+        assert_eq!(
+            store
+                .list_dirty_for_sync()
+                .unwrap()
+                .iter()
+                .map(|r| r.anilist_id)
+                .collect::<Vec<_>>(),
+            vec![23],
+            "held back, not lost: still dirty for the next run"
+        );
     }
 
     #[test]

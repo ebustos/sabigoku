@@ -247,11 +247,11 @@ pub fn render_sync_summary(s: &SyncSummary) -> String {
                 s.pulled.conflicts
             );
         }
-        if s.pulled.contended > 0 {
+        if !s.pulled.contended.is_empty() {
             let _ = writeln!(
                 out,
                 "  ({} show(s) changed mid-sync; left as-is, will reconcile next run.)",
-                s.pulled.contended
+                s.pulled.contended.len()
             );
         }
         if !s.pulled.unmatched.is_empty() {
@@ -284,6 +284,13 @@ pub fn render_sync_summary(s: &SyncSummary) -> String {
             out,
             "  {} push(es) failed; re-run with --debug for details.",
             s.push_failed
+        );
+    }
+    if s.push_skipped > 0 {
+        let _ = writeln!(
+            out,
+            "  ({} change(s) held back; AniList's copy moved underneath them, so they'll merge next sync.)",
+            s.push_skipped
         );
     }
     match s.outcome {
@@ -614,6 +621,7 @@ mod tests {
             dirty: 0,
             pushed: 0,
             push_failed: 0,
+            push_skipped: 0,
         }
     }
 
@@ -652,10 +660,11 @@ mod tests {
         s.pulled.reconciled = 2;
         s.pulled.imported = 1;
         s.pulled.conflicts = 3;
-        s.pulled.contended = 1;
+        s.pulled.contended = vec![77];
         s.dirty = 5;
         s.pushed = 4;
         s.push_failed = 1;
+        s.push_skipped = 1;
         let text = render_sync_summary(&s);
         assert!(text.contains("pulled 2 update(s)"), "{text}");
         assert!(text.contains("imported 1 show(s)"), "{text}");
@@ -663,6 +672,7 @@ mod tests {
         assert!(text.contains("(1 show(s) changed mid-sync"), "{text}");
         assert!(text.contains("pushed 4 of 5 change(s)"), "{text}");
         assert!(text.contains("1 push(es) failed"), "{text}");
+        assert!(text.contains("(1 change(s) held back"), "{text}");
         assert!(!text.contains("up to date"), "{text}");
 
         let mut s = summary(SyncOutcome::Completed);

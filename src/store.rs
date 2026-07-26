@@ -1028,11 +1028,16 @@ pub struct SyncRow {
 /// WATCHING/REPEATING entries minted into the library from their seed.
 /// `unmatched`: remaining remote ids with no library row, counted not imported
 /// (other statuses, or WATCHING with no usable seed).
+///
+/// `contended` carries ids, not a count: the push gates on them (06 §5.3). A row
+/// whose merge we failed to land holds a pre-merge pair against a snapshot that
+/// never advanced, so pushing it in the same run overwrites the very remote
+/// change the pull was carrying (ROD-500).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PullOutcome {
     pub reconciled: u32,
     pub conflicts: u32,
-    pub contended: u32,
+    pub contended: Vec<i64>,
     pub imported: u32,
     pub unmatched: Vec<i64>,
 }
@@ -1683,7 +1688,7 @@ impl Store {
                 },
             )?;
             if changed == 0 {
-                out.contended += 1;
+                out.contended.push(r.seed.anilist_id);
                 continue; // drop(tx) rolls the mint back
             }
             tx.commit()?;
@@ -1716,7 +1721,7 @@ impl Store {
                 },
             )?;
             if changed == 0 {
-                out.contended += 1;
+                out.contended.push(p.id);
                 continue;
             }
             out.reconciled += 1;
@@ -4038,7 +4043,7 @@ mod tests {
         let out = store
             .apply_reconcile(&plan, &imports, unmatched, 0)
             .unwrap();
-        assert_eq!(out.contended, 1);
+        assert_eq!(out.contended, vec![800], "the id gates the push (ROD-500)");
         assert_eq!(out.imported, 0);
         // The concurrent edit survives; the mint rolled back.
         assert_eq!(state(&store, 800).0, ListStatus::Completed);
@@ -4171,7 +4176,7 @@ mod tests {
         let out = store
             .apply_reconcile(&plan, &imports, unmatched, 0)
             .unwrap();
-        assert_eq!(out.contended, 1);
+        assert_eq!(out.contended, vec![6], "the id gates the push (ROD-500)");
         assert_eq!(out.reconciled, 0);
         // The concurrent edit survives; the stale merge did not overwrite it.
         assert_eq!(state(&store, 6).0, ListStatus::Dropped);

@@ -205,9 +205,9 @@ There is no push-oriented fast path for action flush; do not build one.
 
 | | |
 |---|---|
-| Work list | Engaged, id-bearing, dirty rows only |
+| Work list | Engaged, id-bearing, dirty rows only, **minus this run's contended ids** (§5.4; ROD-500) |
 | Hidden/search-only | Not in push set (02: only library `show`) |
-| Spacing | ~2s between row calls (AniList rate) |
+| Spacing | ~2s between **calls**, not between work-list entries: a held-back row costs no request and must not buy the next one a free gap |
 | 429 | Sleep ~60s once, retry row; second 429 → stop run, rest stay dirty |
 | 401 | Stop run immediately |
 | Success | `markSynced` advances snapshot; success requires a **non-null `SaveMediaListEntry.id` in the body**, never HTTP 200 alone (a 200 without id advancing the snapshot silently loses the row) |
@@ -336,6 +336,11 @@ After merge write:
   next run. A real guard, not advisory. The merged pair and the snapshot land in
   **one** CAS-guarded UPDATE; when neither the local pair nor the snapshot
   changed, the row is skipped entirely.
+  **A contended row is also held back from this run's push** (§5.3; ROD-500).
+  Its snapshot never advanced, so its live pair is pre-merge: pushing it would
+  overwrite the very remote change the pull was carrying, reaching the ROD-497
+  failure through the contention door. `contended` therefore carries ids, not a
+  count.
 - Unmatched remote ids: counted and listed. A WATCHING/REPEATING entry with a
   usable title seed is **auto-imported** as an add-only library row, adopting the
   remote pair as truth with a matching snapshot so it is born clean (never pushed

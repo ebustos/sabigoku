@@ -2466,6 +2466,7 @@ mod tests {
             dirty: 3,
             pushed: 3,
             push_failed: 0,
+            push_skipped: 0,
         };
         app.on_sync_flushed(summary, now);
         assert!(!app.syncing, "the inflight flag clears");
