@@ -21,12 +21,22 @@ and two-way sync, and settings with four palettes.
 Needs `mpv` on `PATH` to play anything.
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/vantroy/sabigoku/master/install.sh | sh
+```
+
+Downloads the build for your machine, checks it against the published
+`sha256sums.txt`, and installs to `~/.local/bin` (`BINDIR` to change that,
+`SABIGOKU_VERSION` to pin a release). Linux x86_64 and aarch64, macOS arm64.
+
+With a Rust toolchain, which is also the route for Intel Macs:
+
+```sh
 cargo install sabigoku
 ```
 
-Prebuilt binaries for Linux (x86_64, aarch64) and macOS (arm64) are attached to
-each [release](https://github.com/vantroy/sabigoku/releases). A `curl | sh`
-installer, AUR and Homebrew are on the way.
+Tarballs for each target are attached to every
+[release](https://github.com/vantroy/sabigoku/releases). AUR and Homebrew are on
+the way.
 
 From source, with Rust (edition 2024):
 
