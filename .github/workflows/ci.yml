@@ -67,3 +67,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --bin sabigoku
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # install.sh declares #!/bin/sh, so shellcheck holds it to POSIX and
+      # rejects the bashisms that would break it on a box where /bin/sh is dash.
+      # Preinstalled on the runner image.
+      - run: shellcheck install.sh scripts/*.sh

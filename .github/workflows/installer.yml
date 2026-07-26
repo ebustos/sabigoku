@@ -1,0 +1,59 @@
+name: installer
+
+# Runs install.sh from the branch under test against the LATEST PUBLISHED
+# release. shellcheck in ci.yml proves the script parses; only this proves it
+# installs, which is where the archive layout, the target triples and the
+# checksum lookup are actually exercised.
+on:
+  push:
+    paths: [install.sh, .github/workflows/installer.yml]
+  pull_request:
+    paths: [install.sh, .github/workflows/installer.yml]
+  workflow_dispatch:
+  # The release side can break this script without touching it: a renamed asset,
+  # a changed redirect. Nothing else would notice until a user pasted the line.
+  schedule:
+    - cron: "17 6 * * 1"
+
+# Every `uses:` below is pinned to a commit SHA, never a tag; dependabot bumps
+# them (.github/dependabot.yml).
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: install (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # One runner per published target. No Intel macOS leg exists to test the
+        # refusal path with, which is the same reason that target was withdrawn.
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: install
+        run: |
+          BINDIR="$RUNNER_TEMP/bin" ./install.sh
+          "$RUNNER_TEMP/bin/sabigoku" --version
+
+      # `curl | sh` feeds the script on stdin, which is a different execution
+      # mode than running a file. Doing it second also lands the binary on top
+      # of the one already there, so the staged-rename path gets exercised.
+      - name: install again, piped, over the existing binary
+        run: |
+          BINDIR="$RUNNER_TEMP/bin" sh < install.sh
+          "$RUNNER_TEMP/bin/sabigoku" --version
+
+      - name: refuse an unpublished version
+        run: |
+          if SABIGOKU_VERSION=99.99.99 BINDIR="$RUNNER_TEMP/bin" ./install.sh; then
+            echo "::error::installer accepted a version that does not exist"
+            exit 1
+          fi
