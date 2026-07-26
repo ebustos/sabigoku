@@ -24,6 +24,12 @@ const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 /// without a socket. Distinct names from the inherent methods they delegate to.
 pub trait AniListSync {
     fn fetch_list(&self, token: &str, user_id: i64) -> Result<Vec<RemoteEntry>, CatalogError>;
+    fn fetch_entry(
+        &self,
+        token: &str,
+        user_id: i64,
+        media_id: i64,
+    ) -> Result<Option<(ListStatus, u32)>, CatalogError>;
     fn save_entry(
         &self,
         token: &str,
@@ -36,6 +42,14 @@ pub trait AniListSync {
 impl AniListSync for AniList {
     fn fetch_list(&self, token: &str, user_id: i64) -> Result<Vec<RemoteEntry>, CatalogError> {
         self.pull_list(token, user_id)
+    }
+    fn fetch_entry(
+        &self,
+        token: &str,
+        user_id: i64,
+        media_id: i64,
+    ) -> Result<Option<(ListStatus, u32)>, CatalogError> {
+        self.pull_entry(token, user_id, media_id)
     }
     fn save_entry(
         &self,
@@ -103,6 +117,10 @@ pub struct SyncSummary {
     pub dirty: u32,
     pub pushed: u32,
     pub push_failed: u32,
+    /// Dirty rows deliberately not pushed this run because what we believe the
+    /// server holds for them is known-bad: left contended by the pull (ROD-500),
+    /// or moved on the server since it (ROD-498). They stay dirty.
+    pub push_skipped: u32,
 }
 
 impl SyncSummary {
@@ -114,6 +132,7 @@ impl SyncSummary {
             dirty: 0,
             pushed: 0,
             push_failed: 0,
+            push_skipped: 0,
         }
     }
 }
@@ -173,6 +192,7 @@ pub fn run_sync<A: AniListSync, S: Sleeper>(
         dirty: 0,
         pushed: 0,
         push_failed: 0,
+        push_skipped: 0,
     };
     if let Some(remote) = remote {
         summary.pulled = store.reconcile_pull(&remote, now)?;
@@ -180,7 +200,16 @@ pub fn run_sync<A: AniListSync, S: Sleeper>(
     if pull_only {
         return Ok(summary);
     }
-    push_dirty(client, token, store, sleeper, &mut summary)?;
+    let contended = summary.pulled.contended.clone();
+    push_dirty(
+        client,
+        token,
+        user_id,
+        store,
+        sleeper,
+        &contended,
+        &mut summary,
+    )?;
     Ok(summary)
 }
 
@@ -197,12 +226,15 @@ pub fn flush_push<A: AniListSync, S: Sleeper>(
     if !enabled {
         return Ok(SyncSummary::terminal(SyncOutcome::Disabled));
     }
-    let token = match usable_auth(auth, now) {
-        Ok((t, _)) => t,
+    let (token, user_id) = match usable_auth(auth, now) {
+        Ok(v) => v,
         Err(o) => return Ok(SyncSummary::terminal(o)),
     };
     let mut summary = SyncSummary::terminal(SyncOutcome::Completed);
-    push_dirty(client, token, store, sleeper, &mut summary)?;
+    // No pull this run, so no contended set to gate on. The per-row guard in
+    // push_dirty is the only thing standing between a session-old snapshot and
+    // whatever the server holds now, which is why this path needs it most.
+    push_dirty(client, token, user_id, store, sleeper, &[], &mut summary)?;
     Ok(summary)
 }
 
@@ -210,21 +242,75 @@ pub fn flush_push<A: AniListSync, S: Sleeper>(
 /// backs off once and retries the row, a second 429 stops the run leaving the
 /// rest dirty. Other per-row errors count and continue. A success advances the
 /// snapshot only after AniList returned a non-null id (enforced in `save_entry`).
+///
+/// Two gates hold a row back as `push_skipped`, leaving it dirty, rather than
+/// overwrite a server value we cannot account for:
+///
+/// - `contended` are ids the pull failed to reconcile this run (ROD-500). Their
+///   snapshot never advanced, so the live pair is pre-merge and pushing it would
+///   overwrite the remote change the pull was carrying.
+/// - The per-row guard below (ROD-498). `SaveMediaListEntry` has no
+///   compare-and-set, so the only defence against overwriting a newer remote
+///   edit is to shrink the window between learning the server's value and
+///   overwriting it. Checking here rather than reusing the pull keeps that
+///   window at one round trip whatever the size of the dirty set; the pull is
+///   `PUSH_SPACING` per row further behind by the time the tail is written.
 fn push_dirty<A: AniListSync, S: Sleeper>(
     client: &A,
     token: &str,
+    user_id: i64,
     store: &Store,
     sleeper: &S,
+    contended: &[i64],
     summary: &mut SyncSummary,
 ) -> Result<(), Error> {
     let dirty = store.list_dirty_for_sync()?;
     summary.dirty = dirty.len() as u32;
     let mut backed_off = false;
-    for (i, row) in dirty.iter().enumerate() {
-        if i > 0 {
+    let mut called = false;
+    for row in &dirty {
+        if contended.contains(&row.anilist_id) {
+            summary.push_skipped += 1;
+            continue;
+        }
+        // Spacing is between calls, not between work-list entries: a skipped
+        // row costs no request and must not buy the next one a free 2s.
+        if called {
             sleeper.sleep(PUSH_SPACING);
         }
+        called = true;
         loop {
+            match client.fetch_entry(token, user_id, row.anilist_id) {
+                // No entry on the server: nothing of theirs to destroy, and a
+                // deleted entry never returns in the pull to clear our
+                // snapshot, so holding the row back here would strand it dirty
+                // forever.
+                Ok(None) => {}
+                Ok(live) if live == row.synced => {}
+                Ok(_) => {
+                    summary.push_skipped += 1;
+                    break;
+                }
+                Err(CatalogError::Http { status: 401 }) => {
+                    summary.outcome = SyncOutcome::Unauthorized;
+                    return Ok(());
+                }
+                Err(CatalogError::RateLimited) => {
+                    if backed_off {
+                        summary.outcome = SyncOutcome::RateLimited;
+                        return Ok(());
+                    }
+                    backed_off = true;
+                    sleeper.sleep(RATE_LIMIT_BACKOFF);
+                    continue; // retry the row from the guard
+                }
+                // Unverified is not a licence to overwrite.
+                Err(e) => {
+                    log::warn!("sync push guard {}: {e}", row.anilist_id);
+                    summary.push_failed += 1;
+                    break;
+                }
+            }
             match client.save_entry(token, row.anilist_id, row.list_status, row.progress) {
                 Ok(_) => {
                     store.mark_synced(row.anilist_id, row.list_status, row.progress)?;
@@ -262,11 +348,18 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
+    /// One scripted answer from the push guard's entry read.
+    type GuardAnswer = Result<Option<(ListStatus, u32)>, CatalogError>;
+
     struct FakeAni {
         remote: RefCell<Option<Result<Vec<RemoteEntry>, CatalogError>>>,
         pushes: RefCell<VecDeque<Result<i64, CatalogError>>>,
         pull_calls: RefCell<u32>,
         push_calls: RefCell<Vec<(i64, ListStatus, u32)>>,
+        /// Scripted push-guard answers, front first. Exhausted or unset reads as
+        /// "no entry on the server", which is the guard's pass-through case, so
+        /// tests about the push ladder itself stay unaffected by the guard.
+        guards: RefCell<VecDeque<GuardAnswer>>,
     }
 
     impl FakeAni {
@@ -279,7 +372,13 @@ mod tests {
                 pushes: RefCell::new(pushes.into()),
                 pull_calls: RefCell::new(0),
                 push_calls: RefCell::new(Vec::new()),
+                guards: RefCell::new(VecDeque::new()),
             }
+        }
+
+        fn with_guards(mut self, guards: Vec<GuardAnswer>) -> Self {
+            self.guards = RefCell::new(guards.into());
+            self
         }
     }
 
@@ -287,6 +386,14 @@ mod tests {
         fn fetch_list(&self, _t: &str, _u: i64) -> Result<Vec<RemoteEntry>, CatalogError> {
             *self.pull_calls.borrow_mut() += 1;
             self.remote.borrow_mut().take().unwrap_or(Ok(vec![]))
+        }
+        fn fetch_entry(
+            &self,
+            _t: &str,
+            _u: i64,
+            _m: i64,
+        ) -> Result<Option<(ListStatus, u32)>, CatalogError> {
+            self.guards.borrow_mut().pop_front().unwrap_or(Ok(None))
         }
         fn save_entry(
             &self,
@@ -591,6 +698,43 @@ mod tests {
         assert_eq!(*sleeper.slept.borrow(), vec![PUSH_SPACING, PUSH_SPACING]);
     }
 
+    // ROD-500: the pull failed to land this row's merge, so its live pair is
+    // pre-merge and its snapshot never advanced. Pushing it in the same run
+    // would overwrite the remote change the pull was carrying.
+    #[test]
+    fn a_contended_row_is_held_back_from_the_push() {
+        let store = Store::open_memory().unwrap();
+        dirty_lib(&store, 23);
+        dirty_lib(&store, 24);
+        let client = FakeAni::new(Ok(vec![]), vec![Ok(1), Ok(1)]);
+        let sleeper = RecordingSleeper::new();
+        let mut summary = SyncSummary::terminal(SyncOutcome::Completed);
+        push_dirty(&client, "tok", 7, &store, &sleeper, &[23], &mut summary).unwrap();
+
+        assert_eq!(summary.push_skipped, 1);
+        assert_eq!(summary.pushed, 1);
+        assert_eq!(
+            client.push_calls.borrow().len(),
+            1,
+            "the contended row never reaches AniList"
+        );
+        assert_eq!(client.push_calls.borrow()[0].0, 24);
+        assert!(
+            sleeper.slept.borrow().is_empty(),
+            "one call means no spacing: a skipped row costs no request"
+        );
+        assert_eq!(
+            store
+                .list_dirty_for_sync()
+                .unwrap()
+                .iter()
+                .map(|r| r.anilist_id)
+                .collect::<Vec<_>>(),
+            vec![23],
+            "held back, not lost: still dirty for the next run"
+        );
+    }
+
     #[test]
     fn per_row_error_counts_and_continues() {
         let store = Store::open_memory().unwrap();
@@ -611,6 +755,283 @@ mod tests {
         assert_eq!(out.push_failed, 1);
         assert_eq!(out.pushed, 1);
         assert_eq!(client.push_calls.borrow().len(), 2, "both rows attempted");
+    }
+
+    /// A fake AniList that holds server state across the pull and the push, with
+    /// hooks that land a concurrent edit at a chosen point in the sequence. The
+    /// three points are the whole ROD-498 story: `before_guard` is the window the
+    /// guard closes, `after_guard` is the round trip it cannot, and `local_edit`
+    /// is the store moving under us while we wait on the socket.
+    struct RaceAni<'a> {
+        store: &'a Store,
+        server: RefCell<std::collections::HashMap<i64, (ListStatus, u32)>>,
+        before_guard: RefCell<Option<(i64, ListStatus, u32)>>,
+        after_guard: RefCell<Option<(i64, ListStatus, u32)>>,
+        local_edit: RefCell<Option<(i64, ListStatus)>>,
+    }
+
+    impl<'a> RaceAni<'a> {
+        fn new(store: &'a Store, server: &[(i64, ListStatus, u32)]) -> Self {
+            RaceAni {
+                store,
+                server: RefCell::new(server.iter().map(|&(i, s, p)| (i, (s, p))).collect()),
+                before_guard: RefCell::new(None),
+                after_guard: RefCell::new(None),
+                local_edit: RefCell::new(None),
+            }
+        }
+
+        fn pair(&self, id: i64) -> Option<(ListStatus, u32)> {
+            self.server.borrow().get(&id).copied()
+        }
+    }
+
+    impl AniListSync for RaceAni<'_> {
+        fn fetch_entry(
+            &self,
+            _t: &str,
+            _u: i64,
+            media_id: i64,
+        ) -> Result<Option<(ListStatus, u32)>, CatalogError> {
+            if let Some((id, s, p)) = self.before_guard.borrow_mut().take() {
+                self.server.borrow_mut().insert(id, (s, p));
+            }
+            Ok(self.pair(media_id))
+        }
+        fn fetch_list(&self, _t: &str, _u: i64) -> Result<Vec<RemoteEntry>, CatalogError> {
+            Ok(self
+                .server
+                .borrow()
+                .iter()
+                .map(|(&id, &(status, progress))| RemoteEntry {
+                    updated_at: 0,
+                    anilist_id: id,
+                    status,
+                    progress,
+                    import_seed: None,
+                })
+                .collect())
+        }
+        fn save_entry(
+            &self,
+            _t: &str,
+            media_id: i64,
+            status: ListStatus,
+            progress: u32,
+        ) -> Result<i64, CatalogError> {
+            if let Some((id, s, p)) = self.after_guard.borrow_mut().take() {
+                self.server.borrow_mut().insert(id, (s, p));
+            }
+            if let Some((id, s)) = self.local_edit.borrow_mut().take() {
+                self.store.set_list_status(id, s, 0).unwrap();
+            }
+            self.server
+                .borrow_mut()
+                .insert(media_id, (status, progress));
+            Ok(1)
+        }
+    }
+
+    // ROD-498: the row this run wants to push is `dropped` locally against a
+    // server that said `watching / 0` at pull time. The user then watches 12
+    // episodes on the site. Without the guard our stale write lands on top of
+    // their 12 and marks the pair agreed, so nothing is ever dirty again and no
+    // later run can find the loss.
+    #[test]
+    fn a_remote_edit_after_the_pull_is_not_overwritten() {
+        let store = Store::open_memory().unwrap();
+        dirty_lib(&store, 40);
+        store.set_list_status(40, ListStatus::Dropped, 0).unwrap();
+        let client = RaceAni::new(&store, &[(40, ListStatus::Watching, 0)]);
+        *client.before_guard.borrow_mut() = Some((40, ListStatus::Watching, 12));
+
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
+
+        assert_eq!(out.pushed, 0);
+        assert_eq!(out.push_skipped, 1);
+        assert_eq!(
+            client.pair(40),
+            Some((ListStatus::Watching, 12)),
+            "their 12 episodes survive"
+        );
+        assert_eq!(
+            store
+                .list_dirty_for_sync()
+                .unwrap()
+                .iter()
+                .map(|r| (r.anilist_id, r.list_status))
+                .collect::<Vec<_>>(),
+            vec![(40, ListStatus::Dropped)],
+            "our edit is held, not dropped: the next pull merges the two"
+        );
+    }
+
+    // The residual window, stated so nobody mistakes the guard for a CAS.
+    // SaveMediaListEntry has no compare-and-set, so an edit landing between our
+    // read and our write is still lost. The guard shrinks that window to one
+    // round trip; it cannot remove it.
+    #[test]
+    fn a_remote_edit_inside_the_round_trip_is_still_lost() {
+        let store = Store::open_memory().unwrap();
+        dirty_lib(&store, 42);
+        store.set_list_status(42, ListStatus::Dropped, 0).unwrap();
+        let client = RaceAni::new(&store, &[(42, ListStatus::Watching, 0)]);
+        *client.after_guard.borrow_mut() = Some((42, ListStatus::Watching, 12));
+
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
+
+        assert_eq!(out.pushed, 1);
+        assert_eq!(client.pair(42), Some((ListStatus::Dropped, 0)));
+    }
+
+    // The local half of the same race, and the reason `mark_synced` stays
+    // unconditional: the snapshot records what the server now holds, which the
+    // newer local pair no longer matches, so the row re-dirties itself. Guarding
+    // that write instead would leave the snapshot claiming a value we never sent.
+    #[test]
+    fn a_local_edit_inside_the_round_trip_leaves_the_row_dirty() {
+        let store = Store::open_memory().unwrap();
+        dirty_lib(&store, 41);
+        store.set_list_status(41, ListStatus::Watching, 0).unwrap();
+        let client = RaceAni::new(&store, &[]);
+        *client.local_edit.borrow_mut() = Some((41, ListStatus::Dropped));
+
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            false,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
+
+        assert_eq!(out.pushed, 1);
+        assert_eq!(
+            store
+                .list_dirty_for_sync()
+                .unwrap()
+                .iter()
+                .map(|r| (r.anilist_id, r.list_status))
+                .collect::<Vec<_>>(),
+            vec![(41, ListStatus::Dropped)],
+            "the newer local pair stays dirty for the next run"
+        );
+    }
+
+    // A deleted remote entry never reappears in the pull to clear our snapshot,
+    // so treating absence as a mismatch would strand the row dirty forever.
+    // Nothing of theirs is on the server to destroy, so the write goes.
+    #[test]
+    fn an_absent_remote_entry_does_not_block_the_push() {
+        let store = Store::open_memory().unwrap();
+        dirty_lib(&store, 43);
+        store.set_list_status(43, ListStatus::Watching, 0).unwrap();
+        let client = RaceAni::new(&store, &[(43, ListStatus::Watching, 5)]);
+        let out = run_sync(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            true,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
+        assert_eq!(out.pulled.reconciled, 1, "the snapshot is now watching/5");
+
+        // The user deletes the entry on AniList, then we push.
+        client.server.borrow_mut().remove(&43);
+        store.set_list_status(43, ListStatus::Dropped, 0).unwrap();
+        let out = flush_push(
+            &client,
+            &connected(0),
+            &store,
+            0,
+            true,
+            &RecordingSleeper::new(),
+        )
+        .unwrap();
+
+        assert_eq!(out.pushed, 1);
+        assert_eq!(out.push_skipped, 0);
+        // Progress 5 rides along: set_list_status keeps the adopted count.
+        assert_eq!(client.pair(43), Some((ListStatus::Dropped, 5)));
+    }
+
+    #[test]
+    fn the_guard_stops_the_run_on_401_and_rides_the_429_ladder() {
+        let store = Store::open_memory().unwrap();
+        dirty_lib(&store, 44);
+        let client = FakeAni::new(Ok(vec![]), vec![])
+            .with_guards(vec![Err(CatalogError::Http { status: 401 })]);
+        let mut summary = SyncSummary::terminal(SyncOutcome::Completed);
+        push_dirty(
+            &client,
+            "tok",
+            7,
+            &store,
+            &RecordingSleeper::new(),
+            &[],
+            &mut summary,
+        )
+        .unwrap();
+        assert_eq!(summary.outcome, SyncOutcome::Unauthorized);
+        assert!(
+            client.push_calls.borrow().is_empty(),
+            "a 401 on the guard never reaches the write"
+        );
+
+        // First 429 backs off and retries the guard, which then passes.
+        let client = FakeAni::new(Ok(vec![]), vec![Ok(1)])
+            .with_guards(vec![Err(CatalogError::RateLimited), Ok(None)]);
+        let sleeper = RecordingSleeper::new();
+        let mut summary = SyncSummary::terminal(SyncOutcome::Completed);
+        push_dirty(&client, "tok", 7, &store, &sleeper, &[], &mut summary).unwrap();
+        assert_eq!(summary.pushed, 1);
+        assert_eq!(*sleeper.slept.borrow(), vec![RATE_LIMIT_BACKOFF]);
+    }
+
+    #[test]
+    fn an_unverifiable_row_is_not_pushed_blind() {
+        let store = Store::open_memory().unwrap();
+        dirty_lib(&store, 45);
+        let client =
+            FakeAni::new(Ok(vec![]), vec![Ok(1)]).with_guards(vec![Err(CatalogError::Network)]);
+        let mut summary = SyncSummary::terminal(SyncOutcome::Completed);
+        push_dirty(
+            &client,
+            "tok",
+            7,
+            &store,
+            &RecordingSleeper::new(),
+            &[],
+            &mut summary,
+        )
+        .unwrap();
+        assert_eq!(summary.push_failed, 1);
+        assert_eq!(summary.pushed, 0);
+        assert!(client.push_calls.borrow().is_empty());
+        assert_eq!(store.list_dirty_for_sync().unwrap().len(), 1);
     }
 
     #[test]
