@@ -6,49 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!--
-Curated by hand. `git cliff --unreleased` prints a grouped draft from the commit
-log since the last tag; copy what is worth keeping into [Unreleased], then edit
-it for voice. At release, promote [Unreleased] to [X.Y.Z] with the date, bump the
-version in Cargo.toml, and add the compare link at the bottom.
+Written at release time, not accumulated. Nothing lands here between tags: git
+holds that record already, and a section written ticket by ticket reads like a
+commit log. When a release is being cut, `git cliff --unreleased` prints a
+grouped draft of everything since the last tag, that draft gets rewritten as
+prose in a new `## [X.Y.Z]` section with the date, and the Cargo.toml version
+and the compare link at the bottom follow.
 
 release.yml refuses to build a tag whose section is missing or empty, and
 publishes that section verbatim as the release body.
 -->
-
-## [Unreleased]
-
-### Added
-
-- **`cargo install sabigoku`**: sabigoku is published on crates.io, so anyone
-  with a Rust toolchain has a complete install path without downloading a
-  release artifact. This is also the install route for platforms that ship no
-  prebuilt binary, Intel macOS among them.
-
-### Removed
-
-- **Intel macOS builds are no longer published**: a release now carries linux
-  x86_64, linux aarch64, and macOS arm64. The Intel mac binary could no longer
-  be built on Intel hardware or run before it shipped, so it is withdrawn
-  rather than published unverified. Intel Macs can still build from source.
-
-### Fixed
-
-- **Correcting an episode count on AniList sticks**: sync only ever raised
-  progress, so lowering a wrong count on AniList did not survive. The next sync
-  kept the old higher number and pushed it back over the correction. Corrections
-  now land, and a local watch that has not reached AniList yet is still safe.
-- **Airing shows no longer read as finished**: the lit part of a progress bar now
-  stops at the last episode actually broadcast, and anything your tracked count
-  claims beyond that is shaded rather than lit. A show whose count ran ahead of
-  the broadcast used to paint a solid full bar while the detail pane beside it
-  counted down to the next episode.
-- **A resume point survives a sync**: correcting an episode count no longer
-  discards the "you are partway through this episode" marker for that show.
-- **`sabigoku <query>` works on a stock install**: the CLI used to bind to
-  whichever source was configured and give up if that one could not search,
-  which on a fresh install it never could. It now picks the first source that
-  can search. A source you set by name is still honoured whenever it can search,
-  and when it cannot you get a one-line note naming the one used instead.
 
 ## [0.1.0] - 2026-07-25
 
@@ -95,5 +62,4 @@ Licensed GPL-3.0-or-later.
 - **`sabigoku update` is not implemented**: it prints a message saying so. There
   is no self-update yet.
 
-[Unreleased]: https://github.com/vantroy/sabigoku/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/vantroy/sabigoku/releases/tag/v0.1.0

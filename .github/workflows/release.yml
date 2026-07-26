@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Every `uses:` below is pinned to a commit SHA, never a tag. A mutable tag
+# repointed at hostile code runs inside the build job, where it can corrupt the
+# binary before sha256sums.txt is computed over it: the checksum would then
+# faithfully attest tampered bytes. The trailing comment is the version;
+# dependabot bumps both (.github/dependabot.yml).
+
 # A half-published release is worse than a slow one, so never cancel in flight.
 concurrency:
   group: release-${{ github.ref }}
@@ -21,7 +27,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # A tag disagreeing with the manifest ships a binary whose --version lies,
       # and ROD-465's update-check compares against that string.
       # Keep the version line bare: this parser does not strip inline comments.
@@ -52,18 +58,7 @@ jobs:
         shell: bash
         run: |
           v="${{ steps.version.outputs.version }}"
-          grep -qE "^## \[${v}\]" CHANGELOG.md \
-            || { echo "::error::no '## [${v}]' section in CHANGELOG.md; promote [Unreleased] before tagging"; exit 1; }
-          body=$(awk -v ver="$v" '
-            $0 ~ "^## \\[" ver "\\]" { g = 1; next }
-            g && /^## \[/            { exit }
-            g && /^\[[^]]+\]:/       { exit }
-            g                        { print }
-          ' CHANGELOG.md)
-          if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
-            echo "::error::section '## [${v}]' in CHANGELOG.md is empty"
-            exit 1
-          fi
+          scripts/changelog-section.sh "$v" > /dev/null
           echo "changelog section [${v}] present and non-empty"
 
   build:
@@ -89,8 +84,8 @@ jobs:
             runner: macos-latest
             musl: false
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
       # rusqlite is `bundled` and ring carries C and asm, so a musl target
@@ -98,7 +93,7 @@ jobs:
       - name: install musl-tools
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }} --bin sabigoku
@@ -133,7 +128,7 @@ jobs:
           tar -czf "${name}.tar.gz" -C dist sabigoku LICENSE README.md
           ls -lh "${name}.tar.gz"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sabigoku-${{ matrix.target }}
           path: sabigoku-v*.tar.gz
@@ -148,23 +143,18 @@ jobs:
       contents: write
     steps:
       # Needed for CHANGELOG.md: the release body is curated text from the repo.
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
 
-      # Same extraction the guard validated, so a release cannot be published
-      # with a body the guard never saw.
+      # The same script the guard ran, so a release cannot be published with a
+      # body the guard never saw.
       - name: release notes from CHANGELOG
         shell: bash
         run: |
-          awk -v ver="${{ needs.guard.outputs.version }}" '
-            $0 ~ "^## \\[" ver "\\]" { g = 1; next }
-            g && /^## \[/            { exit }
-            g && /^\[[^]]+\]:/       { exit }
-            g                        { print }
-          ' CHANGELOG.md > notes.md
+          scripts/changelog-section.sh "${{ needs.guard.outputs.version }}" > notes.md
           echo "----- release notes -----"
           cat notes.md
 
@@ -222,9 +212,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # Re-running the workflow, or re-cutting a tag, must not fail on a version
       # that already shipped. crates.io refuses a duplicate and offers no way to

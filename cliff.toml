@@ -1,8 +1,8 @@
 # git-cliff: DRAFT generator for CHANGELOG.md.
 #
-# An authoring aid, never a source of truth. Run it locally to draft the changes
-# since the last tag, then hand-merge what is worth keeping into the curated
-# `## [Unreleased]` section and edit it for voice:
+# An authoring aid, never a source of truth. Run it when cutting a release to
+# draft the changes since the last tag, then write that draft up as the curated
+# `## [X.Y.Z]` section in CHANGELOG.md:
 #
 #     git cliff --unreleased            # grouped draft to stdout, copy by hand
 #
@@ -11,7 +11,7 @@
 # changelog reads like a commit log, which is the thing this flow exists to avoid.
 #
 # Drafts name streaming sources, because commit scopes and subjects do. Scrub
-# them before a bullet reaches [Unreleased]: nothing user-facing names a source
+# them before a bullet reaches CHANGELOG.md: nothing user-facing names a source
 # or says how playback gets past its protections. Never paste a draft bullet
 # through unread.
 

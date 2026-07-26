@@ -1,0 +1,15 @@
+version: 2
+
+updates:
+  # Without this the SHA pins in the workflows never move again, missed security
+  # fixes included. Review a bump like any other third-party code: dependabot
+  # verifies the SHA belongs to the tag, not that the code behind it is safe.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: build

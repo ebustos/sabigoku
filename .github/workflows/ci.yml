@@ -11,6 +11,11 @@ on:
 permissions:
   contents: read
 
+# Every `uses:` below is pinned to a commit SHA, never a tag: a tag is mutable
+# and can be repointed at new code by whoever controls that action's repo, and
+# that code runs here. The trailing comment is the version; dependabot bumps
+# both (.github/dependabot.yml).
+
 # One run per ref; a fresh push cancels the superseded run instead of piling up.
 concurrency:
   group: ci-${{ github.ref }}
@@ -22,11 +27,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       # No --ignored / --include-ignored here, ever: the _live tests hit the network.
@@ -58,7 +63,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --bin sabigoku
