@@ -601,6 +601,12 @@ struct ListMediaNode {
 #[derive(Deserialize)]
 struct EntryResp {
     data: Option<EntryData>,
+    /// Read here and nowhere else: a partial GraphQL failure nulls the errored
+    /// field, rides HTTP 200, and reports itself only in this array. Every
+    /// other classifier can treat that null as "absent" harmlessly; for the
+    /// push guard, absent means "write", so it has to tell the two apart.
+    #[serde(default)]
+    errors: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -609,7 +615,7 @@ struct EntryData {
     page: Option<EntryPage>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct EntryPage {
     #[serde(rename = "mediaList")]
     media_list: Option<Vec<EntryNode>>,
@@ -695,19 +701,33 @@ fn classify_list(raw: &[u8]) -> Result<Vec<RemoteEntry>, CatalogError> {
 }
 
 /// Page.mediaList body -> the one entry's pair, `None` when the account has no
-/// entry for that media. The two are not interchangeable to the push guard:
-/// absence means there is nothing to overwrite, while a `data:null` or garbage
-/// body is a no-answer and must stay an Err so the guard holds the row back.
+/// entry for that media.
+///
+/// INVARIANT the push guard rests on: `Ok(None)` is reserved for **one** shape,
+/// a present-and-empty `mediaList`. Every other null on the path is an Err.
+/// A nulled `Page` is not absence: GraphQL propagates a failed resolver's null
+/// up to the nearest nullable ancestor, so `Page: null` is the shape a
+/// server-side error takes, and the empty list is the shape a genuine miss
+/// takes. Reading the first as the second lets a transient AniList fault
+/// present as "nothing to overwrite" and wave a stale write through, which is
+/// the overwrite ROD-498 exists to stop. Widen this back to `unwrap_or_default`
+/// and the guard silently stops guarding.
 fn classify_entry(raw: &[u8]) -> Result<Option<(ListStatus, u32)>, CatalogError> {
     let resp: EntryResp =
         serde_json::from_slice(raw).map_err(|e| CatalogError::Decode(e.to_string()))?;
+    if resp.errors.is_some_and(|e| !e.is_empty()) {
+        return Err(CatalogError::Decode("entry read reported errors".into()));
+    }
     let data = resp
         .data
         .ok_or_else(|| CatalogError::Decode("data is null".into()))?;
-    let page = data.page.unwrap_or_default();
-    Ok(page
+    let page = data
+        .page
+        .ok_or_else(|| CatalogError::Decode("Page is null".into()))?;
+    let list = page
         .media_list
-        .unwrap_or_default()
+        .ok_or_else(|| CatalogError::Decode("mediaList is null".into()))?;
+    Ok(list
         .into_iter()
         .next()
         .map(|e| (list_status_from_anilist(e.status.as_deref()), e.progress)))
@@ -1306,20 +1326,34 @@ mod tests {
             classify_entry(hit).unwrap(),
             Some((ListStatus::Watching, 7))
         );
-        // Absence, in both shapes AniList can spell it. Not an error: the guard
-        // reads it as "nothing on the server to overwrite".
+        // The ONLY absence shape: present and empty. The guard reads this as
+        // "nothing on the server to overwrite" and writes, so nothing else may
+        // reach it.
         assert_eq!(
             classify_entry(br#"{"data":{"Page":{"mediaList":[]}}}"#).unwrap(),
             None
         );
-        assert_eq!(
-            classify_entry(br#"{"data":{"Page":{"mediaList":null}}}"#).unwrap(),
-            None
-        );
-        assert_eq!(classify_entry(br#"{"data":{"Page":null}}"#).unwrap(), None);
-        // A no-answer must stay an Err or the guard would wave the row through.
+        // Every other null is a no-answer. A nulled Page or mediaList is the
+        // shape a failed resolver takes, not the shape a miss takes; reading
+        // either as absence waves a stale write through (ROD-498 review).
+        assert!(classify_entry(br#"{"data":{"Page":{"mediaList":null}}}"#).is_err());
+        assert!(classify_entry(br#"{"data":{"Page":null}}"#).is_err());
         assert!(classify_entry(br#"{"data":null}"#).is_err());
         assert!(classify_entry(b"not json").is_err());
+        // A partial failure rides HTTP 200 and reports itself only in `errors`.
+        assert!(
+            classify_entry(
+                br#"{"data":{"Page":null},"errors":[{"message":"Internal Server Error"}]}"#
+            )
+            .is_err()
+        );
+        // Errors next to a well-formed body still hold the row back.
+        assert!(
+            classify_entry(
+                br#"{"data":{"Page":{"mediaList":[]}},"errors":[{"message":"partial"}]}"#
+            )
+            .is_err()
+        );
         // A missing status is planning, same mapping as the list pull.
         assert_eq!(
             classify_entry(br#"{"data":{"Page":{"mediaList":[{"progress":2}]}}}"#).unwrap(),

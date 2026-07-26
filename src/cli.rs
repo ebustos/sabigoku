@@ -289,7 +289,7 @@ pub fn render_sync_summary(s: &SyncSummary) -> String {
     if s.push_skipped > 0 {
         let _ = writeln!(
             out,
-            "  ({} change(s) held back; AniList's copy moved underneath them, so they'll merge next sync.)",
+            "  ({} change(s) held back so they don't overwrite AniList; they'll merge next sync.)",
             s.push_skipped
         );
     }

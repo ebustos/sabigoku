@@ -237,6 +237,19 @@ which pins the window at one round trip **whatever the size of the dirty set**.
 | Entry differs from the snapshot | Someone moved it since our pull | **Hold**, stay dirty, next pull merges the two |
 | Read failed (not 401/429) | Unverified | **Hold**, count failed |
 
+"No entry" is **exactly one wire shape**: a present, empty `mediaList`. A nulled
+`Page` or `mediaList`, or any response carrying a top-level `errors` array, is a
+failed read, not a miss. GraphQL propagates a failed resolver's null up to the
+nearest nullable ancestor and rides HTTP 200, so the permissive reading would
+let a transient AniList fault present as "nothing to overwrite" and wave the
+stale write through, silently and uncounted (ROD-498 review).
+
+Two calls per row also means the **one-shot 60s 429 grace is spent across double
+the request volume**, so a run under sustained rate pressure reaches its second
+429 and stops sooner than it did pre-guard. Rows left over stay dirty for the
+next run, which is the intended shape, but the effective rows-per-run ceiling is
+lower than the spacing alone suggests.
+
 Held rows are counted (`push_skipped`) and surfaced, never silent. Two things
 this guard is **not**:
 
