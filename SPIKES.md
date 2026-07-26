@@ -12,11 +12,11 @@ So the ledger below only counts things attributable to the language and its
 ecosystem, not to me already knowing the problem.
 
 ```
-cargo run --bin spike_http        -- frieren     # ROD-403  HTTP + JSON
-cargo run --bin spike_sqlite                      # ROD-404  SQLite + migration
-cargo run --bin spike_concurrency -- frieren      # ROD-405  threads + channel
-cargo run --bin spike_stream      -- frieren      # ROD-406  AES-GCM resolver
-cargo run --bin spike_mpv         -- frieren      # ROD-407  full pipeline -> mpv
+cargo run --example spike_http        -- frieren      # ROD-403  HTTP + JSON
+cargo run --example spike_sqlite                      # ROD-404  SQLite + migration
+cargo run --example spike_concurrency -- frieren      # ROD-405  threads + channel
+cargo run --example spike_stream      -- frieren      # ROD-406  AES-GCM resolver
+cargo run --example spike_mpv         -- frieren      # ROD-407  full pipeline -> mpv
 ```
 
 ---
@@ -207,9 +207,9 @@ That's the case for the port, stated in receipts instead of vibes.
 ## 6. spike_cover: cover-art pipeline (post-M0, ROD-417)
 
 ```
-cargo run --bin spike_cover                    # interactive grid, ROD-417
-cargo run --bin spike_cover -- --halfblocks    # force the fallback path
-cargo run --bin spike_cover -- --probe 10      # auto-quit, print a report
+cargo run --example spike_cover                    # interactive grid, ROD-417
+cargo run --example spike_cover -- --halfblocks    # force the fallback path
+cargo run --example spike_cover -- --probe 10      # auto-quit, print a report
 ```
 
 Not an M0 parity spike: zigoku got Kitty graphics natively from libvaxis, so

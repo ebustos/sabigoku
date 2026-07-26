@@ -208,3 +208,55 @@ jobs:
             "${extra[@]}" \
             artifacts/sabigoku-v*.tar.gz \
             artifacts/sha256sums.txt
+
+  crates-io:
+    name: publish to crates.io
+    # Last, and only once the GitHub release exists. A crates.io version is
+    # permanent (yank hides it, nothing replaces it), so the reversible half of
+    # the release goes first: a failure there must not strand a version that
+    # can never be reused.
+    needs: [guard, publish]
+    # A suffixed tag stays on the GitHub prerelease channel. Spending a
+    # permanent version on an rc buys nothing an artifact download does not.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Re-running the workflow, or re-cutting a tag, must not fail on a version
+      # that already shipped. crates.io refuses a duplicate and offers no way to
+      # replace one, so skipping is the only recovery that exists.
+      - name: is this version already on crates.io
+        id: published
+        shell: bash
+        run: |
+          name=sabigoku
+          # Sparse-index layout for a crate name of four or more characters.
+          url="https://index.crates.io/${name:0:2}/${name:2:2}/${name}"
+          v="${{ needs.guard.outputs.version }}"
+          if curl -sfS "$url" | grep -q "\"vers\":\"${v}\""; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "${v} is already on crates.io; nothing to publish"
+          else
+            # A 404 here is the first-ever publish, not a failure.
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "${v} is not on crates.io yet; publishing"
+          fi
+
+      # --locked keeps the verify build on the lockfile the rest of CI tested.
+      # Never add --no-verify: that build is the only thing proving the packaged
+      # tarball compiles on its own, and it is unfixable once uploaded.
+      - name: publish
+        if: steps.published.outputs.skip == 'false'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is unset; add it under repo settings -> secrets"
+            exit 1
+          fi
+          cargo publish --locked
