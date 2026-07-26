@@ -422,3 +422,100 @@ jobs:
           fi
           git commit -m "sabigoku ${v}-1"
           git push
+
+  # The macOS mirror of the AUR pair: render the in-repo formula for this tag
+  # and push it to vantroy/homebrew-sabigoku, where users reach it as
+  # `brew install vantroy/sabigoku/sabigoku`. One job, not two, because the
+  # render runs nothing from the crate graph: curl, sed and a ruby syntax check
+  # over a file this repo owns, so the key never meets third-party code.
+  brew-publish:
+    name: publish to the Homebrew tap
+    needs: [guard, publish]
+    # Same rule as the AUR: the tap has one channel, prereleases stay off it.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: render the formula for this tag
+        shell: bash
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          name="sabigoku-v${v}-aarch64-apple-darwin.tar.gz"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${v}/${name}"
+          # Hash the artifact itself, not sha256sums.txt: the formula attests
+          # the bytes this exact URL serves. Same CDN-lag retries and same
+          # 200-with-an-interstitial trap as the AUR render.
+          curl -fsSL --connect-timeout 30 --max-time 120 \
+            --retry 5 --retry-delay 3 --retry-all-errors "$url" -o release.tar.gz
+          tar tzf release.tar.gz >/dev/null 2>&1 ||
+            { echo "::error::downloaded archive is not a valid gzip tarball"; exit 1; }
+          sum=$(sha256sum release.tar.gz | awk '{print $1}')
+          rm -f release.tar.gz
+
+          f=packaging/homebrew/sabigoku.rb
+          # The version appears twice in the url (tag dir and file name); bump
+          # both. Only unsuffixed tags reach this job, so the pattern is safe.
+          sed -i -E "/^[[:space:]]*url /s/v[0-9]+\.[0-9]+\.[0-9]+/v${v}/g" "$f"
+          sed -i -E "s/^([[:space:]]*sha256 )\"[0-9a-f]{64}\"/\1\"${sum}\"/" "$f"
+          # Verify the sed instead of trusting it, same as the AUR render: a
+          # no-op leaves the previous release's url and checksum, which is a
+          # formula that installs the wrong version without erroring.
+          grep -qF "download/v${v}/${name}" "$f" ||
+            { echo "::error::url bump did not land in the formula"; exit 1; }
+          grep -qF "sha256 \"${sum}\"" "$f" ||
+            { echo "::error::sha256 bump did not land in the formula"; exit 1; }
+          # Parse-only: catches a formula Ruby cannot read before it reaches
+          # every user's brew.
+          ruby -c "$f"
+          cat "$f"
+
+      # ruby -c proves the file parses; only brew proves it is a formula.
+      # Audit wants the file inside a tap, hence the throwaway local skeleton.
+      # The ubuntu image ships linuxbrew off PATH.
+      - name: brew audit the rendered formula
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap-new --no-git vantroy/sabigoku
+          cp packaging/homebrew/sabigoku.rb \
+            "$(brew --repository vantroy/sabigoku)/Formula/sabigoku.rb"
+          brew audit --strict --formula vantroy/sabigoku/sabigoku
+
+      - name: push to the tap
+        shell: bash
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [ -z "${DEPLOY_KEY}" ]; then
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY is unset; add it under repo settings -> secrets"
+            exit 1
+          fi
+          v="${{ needs.guard.outputs.version }}"
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DEPLOY_KEY}" > ~/.ssh/tap
+          chmod 600 ~/.ssh/tap
+          # Pinned host key, never ssh-keyscan at run time: this key can write
+          # to a repo other people install from.
+          printf '%s\n' \
+            'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+            > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+
+          git clone git@github.com:vantroy/homebrew-sabigoku.git tap
+          mkdir -p tap/Formula
+          cp "packaging/homebrew/sabigoku.rb" tap/Formula/sabigoku.rb
+          cd tap
+          git config user.name "vantroy"
+          git config user.email "vantroy@gmail.com"
+          git add Formula/sabigoku.rb
+          if git diff --cached --quiet; then
+            echo "the tap already carries v${v}; nothing to push"
+            exit 0
+          fi
+          git commit -m "sabigoku v${v}"
+          git push
