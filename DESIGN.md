@@ -849,8 +849,10 @@ Format: `[████████░░░░░░░░]  8 / 28 eps`
   bar, otherwise the per-status color.
 - Empty cells: `border.hair`.
 - `█` for watched, `░` for empty, `▓` for watched-past-broadcast, `·` for
-  not-yet-aired (both `border.hair` for the unfilled pair; `▓` takes the fill
-  colour).
+  not-yet-aired. Only `█` takes the fill colour; the other three are
+  `border.hair`, so the **bright run always stops at the broadcast edge**. A
+  claim past that edge has to read as unlit, or it scans as a full bar again and
+  the whole point is lost.
 - Bar width: 16 chars minimum, scales to available space with a max of 24 chars.
 - Episode fraction text: `text.muted` on the cursor bar, else `text.dim`.
 - Resume point: a `◐` injected at the resume position within the bar, e.g.
@@ -865,13 +867,20 @@ Format: `[████████░░░░░░░░]  8 / 28 eps`
   tracker claims more than has been broadcast" without erasing a watch. **The
   fill is never capped at the aired count.** `nextAiringEpisode` comes from
   cached enrichment and goes stale for a full TTL, which is exactly the window a
-  weekly viewer lives in: capping would hide the episode they watched three
-  hours after it aired, and 02 §domain fixes the direction of that trade
-  (over-list ok, under-list hides eps). The `▓` register degrades to a mild
-  over-claim for a day instead, and reads as a loud, permanent wrongness on data
-  that is genuinely broken.
-- The edge sits on the first cell **wholly** beyond the aired range: a cell
-  holding a partially-aired episode belongs to the aired side.
+  weekly viewer lives in, so a cap would hide the episode they watched three
+  hours after it aired. `▓` degrades to a mild over-claim for a day instead.
+- **This is deliberately not the §4.6 grid rule.** `expected_episode_count`
+  (02 §4, ROD-359) caps the grid at `min(aired, total)`, so the grid on that
+  same show draws four cells while the bar spans fourteen. The two answer
+  different questions: a grid cell is a thing you can press Enter on, and
+  offering one for an episode that does not exist is a broken affordance,
+  whereas the bar reports a watch the user already has. Capping a count of
+  things-you-can-do is correct; capping a record of what happened is data loss.
+  A future reader diffing the two must not "fix" them into agreement.
+- Edge and fill share one rounding mode, floor. Mixing them (a ceil edge over a
+  floor fill) puts the edge one cell ahead of a fill reaching the same episode,
+  so a viewer caught up on everything broadcast gets a phantom `░`. An aired
+  episode still owns a cell via a floor of 1, not by rounding the edge up.
 
 The fill color is **selection-aware**: `state.focus` means "the focused cursor row"
 (the same cyan as the `▸`/title, §4.1), so the bar earns it ONLY when the row is

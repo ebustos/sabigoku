@@ -432,8 +432,10 @@ fn draw_bar_row(
         let (glyph, style) = if Some(i) == bar.resume {
             ("◐", fill_style)
         } else if i < bar.filled {
+            // Dim, not the fill colour: the bright run has to stop at the
+            // broadcast edge or a claim past it still scans as a full bar.
             if beyond_broadcast {
-                ("▓", fill_style)
+                ("▓", chrome)
             } else {
                 ("█", fill_style)
             }
@@ -478,8 +480,10 @@ struct BarGeometry {
 /// 4.5): `next_airing_episode` is cached enrichment and goes stale for a full
 /// TTL, so a cap would hide an episode the user watched hours after it aired.
 ///
-/// `div_ceil` on the edge keeps a partially-aired cell on the aired side; a
-/// floor would mark the whole bar unaired when one episode of many is out.
+/// Edge and fill share one rounding mode. Mixing them puts the edge a cell
+/// ahead of a fill that reaches the same episode, so a viewer caught up on
+/// everything broadcast gets a phantom "aired but unwatched" cell. The
+/// aired-episode-exists case is handled by the floor of 1, not by rounding up.
 fn bar_geometry(
     progress: u32,
     total: Option<u32>,
@@ -499,7 +503,7 @@ fn bar_geometry(
                 .map(|ep| cell((ep - 1).min(t - 1), t)),
             aired: aired
                 .filter(|a| *a < t)
-                .map(|a| (u64::from(a) * width_u64).div_ceil(u64::from(t)) as u16),
+                .map(|a| cell(a, t).max(u16::from(a > 0))),
         },
         _ => BarGeometry {
             filled: if progress > 0 { width / 3 } else { 0 },
@@ -732,13 +736,23 @@ mod tests {
         };
         // ROD-497: 14 claimed of a season with 4 aired. Fill still reaches 14,
         // so nothing is hidden; the edge at 4 is what says the rest is not out.
-        assert_eq!(g(14, Some(14), Some(4)), (16, Some(5)));
+        assert_eq!(g(14, Some(14), Some(4)), (16, Some(4)));
+        // Caught up on everything broadcast: no cell may read as aired and
+        // unwatched, so the edge sits exactly where the fill stops.
+        for (t, a) in [(14u32, 4u32), (24, 5), (13, 7), (12, 1)] {
+            let (filled, edge) = g(a, Some(t), Some(a));
+            assert_eq!(
+                filled,
+                edge.unwrap(),
+                "caught up {a}/{t}: phantom unwatched cell"
+            );
+        }
         // The stale-enrichment case the cap used to eat: next_airing_episode is
         // a day old and the user has watched the episode it does not know aired.
         // A stale edge must not shrink the fill by one episode for a day.
         assert_eq!(g(5, Some(14), Some(4)).0, g(5, Some(14), None).0);
         // Aired but unwatched sits between fill and edge.
-        assert_eq!(g(0, Some(14), Some(4)), (0, Some(5)));
+        assert_eq!(g(0, Some(14), Some(4)), (0, Some(4)));
         // Nothing aired: the whole bar is beyond the edge.
         assert_eq!(g(0, Some(14), Some(0)), (0, Some(0)));
         // An aired count at or past the total leaves no edge to mark.

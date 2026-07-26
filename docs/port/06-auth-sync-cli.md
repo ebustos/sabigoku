@@ -238,15 +238,23 @@ merging it.
 
 **Duplicate collapse, before the merge.** `MediaListCollection` returns one
 entry per custom list a media is tagged in, so the flat list can hold several
-rows for one id. They collapse to one pair per id by **latest `updatedAt`**,
-ties keeping the first seen. Recency, not magnitude: collapsing by progress
-would re-raise exactly what the merge below exists to lower, since a correction
-is by definition the smaller number, and a stale copy in any custom list would
-silently pin the old value forever. Ties are ordinary (one edit fans out across
-lists with the same stamp), so the tiebreak is fixed rather than left to wire
-order. Deviation from zigoku, which collapses by max progress (ROD-497; see the
-backport ledger). `updatedAt` rides the same pull; a null maps to `0` so it
-loses every tiebreak rather than winning one on an absent field.
+rows for one id. They collapse to one pair per id by **`(updatedAt, progress)`**:
+recency decides, and progress only breaks a tie. Recency, not magnitude:
+collapsing by progress would re-raise exactly what the merge below exists to
+lower, since a correction is by definition the smaller number, and a stale copy
+in any custom list would silently pin the old value forever.
+
+Ties are ordinary. One edit fans across custom lists at a single stamp, and
+AniList nulls `updatedAt` on entries untouched since the field landed, which maps
+to `0` and can leave a whole group unstamped. The progress tiebreak keeps the
+fold order-independent in both cases rather than adopting whichever group the
+server happened to serialize first.
+
+Deviation from zigoku, which dedupes at ingest by **unconditional last-wins wire
+order** (`anilist.zig:605-611`) and never requested `updatedAt`
+(`anilist.zig:560`). The max-progress collapse this replaced was sabigoku's own
+invention, not a ported rule, and cited a 06 clause that did not exist
+(ROD-497; see the backport ledger).
 
 **Pure merge (`reconcile`), the total matrix.** `eff_base` = snapshot status,
 or `planning` when the snapshot is null (first contact). `local_moved` =
@@ -278,12 +286,24 @@ local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
   remote, and the resulting mismatch queues the row to push the stale value back
   over the correction. `max` survives only where it earns its keep, the
   both-moved race, so no watched episode is lost.
-- **Completed snap.** Because the two matrices run independently they can land
-  on `completed` with partial progress, a pair neither side held. When the status
-  outcome is `completed` and the total is known and non-zero, progress raises to
-  the total, the same invariant `setListStatus` enforces on every local write
-  (02 §4b). The merge owes the store that invariant rather than pushing the
-  contradiction to the server.
+- **Cross-half synthesis guard.** Because the two matrices run independently they
+  can land on `completed` with a progress adopted from behind it, a pair neither
+  side held. When the status outcome is `completed` **and local's own status was
+  already `completed`**, progress holds at local's value.
+
+  The guard is deliberately on the synthesis, not on the merged status alone,
+  and it holds a value **local already had** rather than reaching for the
+  episode total. Snapping to the total looks like the `setListStatus` invariant
+  (02 §4b) but is not safe here: `total_episodes` is cached enrichment that
+  drifts, `completed` below the total is legal on AniList, and a status-only
+  guard fires on settled rows that nobody edited. That mints watch data, the
+  snapshot re-baselines to the raw remote, the row goes dirty, and the invented
+  value is pushed and re-minted on every subsequent pull. `setListStatus` is a
+  deliberate user gesture; reconcile runs unattended on a timer, and the two do
+  not get the same licence.
+
+  A remote that moved **both** halves is not a synthesis: the completion and the
+  progress under it arrive as one edit and are adopted together.
 - `REPEATING` is folded to `watching` at ingest, before the merge; the progress
   matrix runs the same either way.
 
