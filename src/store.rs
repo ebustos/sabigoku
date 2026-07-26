@@ -1801,21 +1801,12 @@ fn reconcile(
         Some(b) if b == remote => b,
         _ => remote,
     };
-    let merged = merge_progress(base.map_or(0, |(_, p)| p), local.1, remote.1);
     Reconciled {
         status,
-        // Cross-half synthesis floor. Every clause excludes a distinct way of
-        // destroying a remote edit; 06 §5.4 tabulates which is which. Do not
-        // widen without reading it.
-        progress: if local_moved
-            && status == ListStatus::Completed
-            && local.0 == ListStatus::Completed
-            && remote.0 != ListStatus::Completed
-        {
-            merged.max(local.1)
-        } else {
-            merged
-        },
+        // No status special-case here, `completed` included: every rule tried
+        // reduced to overriding the remote-lowered-progress cell, which is the
+        // one this ticket exists to preserve (06 §5.4).
+        progress: merge_progress(base.map_or(0, |(_, p)| p), local.1, remote.1),
         snapshot_status: snapshot.0,
         snapshot_progress: snapshot.1,
         conflict,
@@ -3670,35 +3661,34 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_local_completed_floors_progress_at_its_own() {
-        // Cross-half synthesis: status keeps local Completed while progress
-        // adopts a remote value behind it, a pair neither side held.
+    fn completing_locally_does_not_make_local_progress_authoritative() {
+        // A local status move to completed must NOT override the progress half.
+        // The user pressed `c` on the device and lowered progress on the server;
+        // both edits survive, and the resulting pair is legal on AniList. Every
+        // floor tried here reduced to overriding exactly this cell, the one the
+        // ticket exists to preserve.
         let r = reconcile(
             Some((ListStatus::Watching, 24)),
             (ListStatus::Completed, 24),
             (ListStatus::Watching, 4),
         );
-        assert_eq!((r.status, r.progress), (ListStatus::Completed, 24));
+        assert_eq!((r.status, r.progress), (ListStatus::Completed, 4));
 
-        // Not a synthesis: the remote moved BOTH halves and local moved
-        // neither, so the completion and the progress under it arrive as one
-        // edit and are adopted together. Guarding on the merged status alone
-        // would hold local's higher 20 here and discard half of what the user
-        // did on the server.
+        // The same shape under any other status always behaved this way. The
+        // point of the assertion above is that completed is not special.
         let r = reconcile(
-            Some((ListStatus::Watching, 20)),
-            (ListStatus::Watching, 20),
-            (ListStatus::Completed, 5),
+            Some((ListStatus::Planning, 24)),
+            (ListStatus::Watching, 24),
+            (ListStatus::Planning, 4),
         );
-        assert_eq!((r.status, r.progress), (ListStatus::Completed, 5));
+        assert_eq!((r.status, r.progress), (ListStatus::Watching, 4));
     }
 
     #[test]
-    fn the_completed_guard_never_invents_progress() {
-        // The guard holds a value local ALREADY had; it must never reach for the
-        // episode total. A settled row where all three agree has to come out
-        // untouched, whatever its total says, or every pull mints watch data,
-        // pushes it, and re-mints it next run.
+    fn a_settled_completed_row_is_not_touched_by_a_pull() {
+        // The merge must never reach for the episode total. A settled row where
+        // all three agree comes out untouched whatever its total says; snapping
+        // to the total minted watch data, pushed it, and re-minted it next run.
         let store = Store::open_memory().unwrap();
         // sample() carries total_episodes = 12; the row sits at 10.
         lib_row(

@@ -849,12 +849,11 @@ Format: `[████████░░░░░░░░]  8 / 28 eps`
   bar, otherwise the per-status color.
 - Empty cells: `border.hair`.
 - `█` for watched, `░` for empty, `▓` for watched-past-broadcast, `·` for
-  not-yet-aired. Only `█` and the `◐` resume marker take the fill colour; `▓`,
-  `░` and `·` are all `border.hair`, so the **lit `█` run always stops at the
-  broadcast edge**. `◐` is the deliberate exception and stays lit wherever it
-  lands, including past the edge. A
-  claim past that edge has to read as unlit, or it scans as a full bar again and
-  the whole point is lost.
+  not-yet-aired. `▓`, `░` and `·` are all `border.hair`, so the **lit `█` run
+  always stops at the broadcast edge**: a `▓` claim has to read as unlit, or the
+  row scans as a full bar again and the whole point is lost. The `◐` resume
+  marker is the one deliberate exception and takes the fill colour wherever it
+  lands, edge or no edge.
 - Bar width: 16 chars minimum, scales to available space with a max of 24 chars.
 - Episode fraction text: `text.muted` on the cursor bar, else `text.dim`.
 - Resume point: a `◐` injected at the resume position within the bar, e.g.

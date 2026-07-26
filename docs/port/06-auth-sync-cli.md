@@ -295,37 +295,22 @@ local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
   remote, and the resulting mismatch queues the row to push the stale value back
   over the correction. `max` survives only where it earns its keep, the
   both-moved race, so no watched episode is lost.
-- **Cross-half synthesis floor.** Because the two matrices run independently they
-  can land on `completed` paired with a progress adopted from behind it, a pair
-  **neither side ever held**. Only that synthesis is corrected, and only by
-  raising progress to a value **local already had**:
+- **No status special-case, `completed` included.** The two halves merge
+  independently, so a kept-local `completed` can pair with a progress adopted
+  from behind it. That pair is **accepted**: it is legal on AniList, and every
+  rule tried for "correcting" it reduced to overriding the one cell where local
+  progress did not move and the remote lowered it, which is precisely the
+  correction this section exists to let through (ROD-497, four review rounds).
 
-  ```
-  if local_status_moved
-     && merged_status  == completed
-     && local.status   == completed
-     && remote.status  != completed
-  then progress = max(merged_progress, local.progress)
-  ```
+  In particular the merge must never snap progress to `total_episodes`. That is
+  what `setListStatus` does (02 §4b), but `setListStatus` is a deliberate user
+  gesture on one row while reconcile runs unattended over the whole library.
+  Cached totals drift, so the snap mints watch data, pushes it, and re-mints it
+  on every later pull without ever draining.
 
-  Each clause excludes a failure the others do not, and every one of them was
-  reached by shipping the rule without it (ROD-497):
-
-  | Clause | Without it |
-  |---|---|
-  | `local_status_moved` | Fires on settled rows nobody edited, reverting a remote-only correction and pushing the stale value back |
-  | `merged_status == completed` | No synthesis to correct; the floor is unrelated to any other status |
-  | `local.status == completed` | Fires where the merge ADOPTED completion from the remote, discarding the progress that arrived with it |
-  | `remote.status != completed` | Fires where the remote itself held `(completed, progress)`, so the pair was held after all, and its correction is destroyed |
-
-  It is a **floor** (`max`), not a hold: a remote advance above local still wins.
-
-  It must never reach for `total_episodes`. That snaps the way `setListStatus`
-  does (02 §4b), but `setListStatus` is a deliberate user gesture on one row,
-  while reconcile runs unattended on a timer over the whole library. Cached
-  totals drift, `completed` below the total is legal on AniList, and the snap
-  mints watch data, pushes it, and re-mints it every pull without ever draining.
-
+  A local status edit still wins on the status half and still leaves the row
+  dirty, so it reaches the server on the next push. It simply does not carry
+  local's progress with it.
 - `REPEATING` is folded to `watching` at ingest, before the merge; the progress
   matrix runs the same either way.
 
