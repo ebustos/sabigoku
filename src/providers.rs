@@ -103,6 +103,18 @@ pub trait StreamProvider: Send + Sync {
     /// Tier-C binding search only, never Browse (03 §1).
     fn search(&self, query: &str, opts: &SearchOptions) -> Result<Vec<SearchHit>, ProviderError>;
 
+    /// Whether `search` can ever answer. `false` means structurally incapable,
+    /// not "failed this time", so a caller may skip the provider without
+    /// calling it.
+    ///
+    /// Defaults true because tier-C search is the norm; a provider that cannot
+    /// search MUST override, or the CLI will bind it and die at runtime on a
+    /// path it believes unreachable (`cli::fetch_error_rows`). The roster test
+    /// over `default_registry` is what keeps the two in step.
+    fn supports_search(&self) -> bool {
+        true
+    }
+
     /// Sorted labels. Empty = authoritative not stocked; cannot-answer must be
     /// `Err` (03 §4.3). `count_hint` mints a 1..N grid on listing-less
     /// providers; real listings ignore it.
@@ -157,10 +169,24 @@ impl ProviderRegistry {
     }
 
     /// Named, or `primary()` when empty/unknown (03 §3.2).
+    ///
+    /// No production caller. Kept because 03 §3.2 lists it as a registry view;
+    /// retiring it is a bible change, not a cleanup.
     pub fn preferred(&self, name: Option<&str>) -> &dyn StreamProvider {
         name.filter(|n| !n.is_empty())
             .and_then(|n| self.by_name(n))
             .unwrap_or_else(|| self.primary())
+    }
+
+    /// First entry of `ordered` that can search, `None` if none can.
+    ///
+    /// Deviation from zigoku, ratified ROD-491: zigoku's CLI takes `preferred`
+    /// and hard-fails when it cannot search, which on a stock config is always
+    /// (the primary has no tier C, 03 §8.1). The walk stays search-only; every
+    /// other path still binds to one provider, because a provider id is
+    /// meaningless on another.
+    pub fn preferred_searchable(&self, pref: Option<&str>) -> Option<&dyn StreamProvider> {
+        self.ordered(pref).into_iter().find(|p| p.supports_search())
     }
 
     /// Preferred first, then construction order for the rest (03 §3.2, ROD-344).
@@ -251,7 +277,8 @@ pub trait CatalogProvider: Send + Sync {
 mod tests {
     use super::*;
 
-    struct Fake(&'static str);
+    /// `.1` is search capability; the registry's primary genuinely lacks it.
+    struct Fake(&'static str, bool);
 
     impl StreamProvider for Fake {
         fn name(&self) -> &'static str {
@@ -269,6 +296,9 @@ mod tests {
             _opts: &SearchOptions,
         ) -> Result<Vec<SearchHit>, ProviderError> {
             Err(ProviderError::Unsupported)
+        }
+        fn supports_search(&self) -> bool {
+            self.1
         }
         fn episodes(
             &self,
@@ -298,10 +328,33 @@ mod tests {
 
     fn registry() -> ProviderRegistry {
         ProviderRegistry::new(vec![
-            Box::new(Fake("megaplay")),
-            Box::new(Fake("senshi")),
-            Box::new(Fake("allanime")),
+            Box::new(Fake("megaplay", false)),
+            Box::new(Fake("senshi", true)),
+            Box::new(Fake("allanime", true)),
         ])
+    }
+
+    /// Every other test here runs against `Fake`s that MODEL the live lineup.
+    /// This one pins the lineup itself: construction order (03 §3.1) and the
+    /// precondition the ROD-491 deviation rests on, that the primary cannot
+    /// search. Without it, reordering `default_registry` leaves the fakes
+    /// passing while the reason for the deviation silently evaporates.
+    #[test]
+    fn live_registry_leads_with_a_primary_that_cannot_search() {
+        let reg = default_registry().expect("offline construction");
+        assert_eq!(
+            names(&reg.iter().collect::<Vec<_>>()),
+            ["megaplay", "senshi", "allanime"]
+        );
+        assert!(
+            !reg.primary().supports_search(),
+            "the CLI walk exists because the primary cannot search"
+        );
+        assert!(
+            reg.preferred_searchable(None)
+                .is_some_and(|p| p.name() == "senshi"),
+            "a stock run binds the first searchable provider"
+        );
     }
 
     fn names(providers: &[&dyn StreamProvider]) -> Vec<&'static str> {
@@ -371,6 +424,49 @@ mod tests {
             names(&reg.ordered(Some("megaplay"))),
             vec!["megaplay", "senshi", "allanime"]
         );
+    }
+
+    /// ROD-491: the stock config leaves `preferred_provider` empty, which
+    /// resolves to a primary that cannot search. Walking past it is the whole
+    /// deviation; drop the `supports_search` filter and this returns "megaplay".
+    #[test]
+    fn preferred_searchable_skips_a_primary_that_cannot_search() {
+        let reg = registry();
+        assert!(!reg.primary().supports_search(), "fixture precondition");
+        assert_eq!(
+            reg.preferred_searchable(Some("")).map(|p| p.name()),
+            Some("senshi")
+        );
+        assert_eq!(
+            reg.preferred_searchable(None).map(|p| p.name()),
+            Some("senshi")
+        );
+    }
+
+    #[test]
+    fn preferred_searchable_honors_a_capable_preference() {
+        let reg = registry();
+        assert_eq!(
+            reg.preferred_searchable(Some("allanime")).map(|p| p.name()),
+            Some("allanime")
+        );
+    }
+
+    /// An explicit but incapable preference still gets walked past, otherwise
+    /// `preferred_provider = "megaplay"` reintroduces the dead CLI.
+    #[test]
+    fn preferred_searchable_walks_past_an_incapable_preference() {
+        let reg = registry();
+        assert_eq!(
+            reg.preferred_searchable(Some("megaplay")).map(|p| p.name()),
+            Some("senshi")
+        );
+    }
+
+    #[test]
+    fn preferred_searchable_is_none_when_nothing_can_search() {
+        let reg = ProviderRegistry::new(vec![Box::new(Fake("megaplay", false))]);
+        assert!(reg.preferred_searchable(Some("")).is_none());
     }
 
     #[test]

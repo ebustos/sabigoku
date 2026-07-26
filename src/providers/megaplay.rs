@@ -362,6 +362,10 @@ impl StreamProvider for MegaPlay {
         Err(ProviderError::Unsupported)
     }
 
+    fn supports_search(&self) -> bool {
+        false
+    }
+
     /// Listing-less: probe ep 1 (sub, track-agnostic) for existence, then mint
     /// "1".."N" from `count_hint`. `tt` does not filter here; a missing dub
     /// surfaces at resolve, and a dub-mode probe must not read a sub-only show
@@ -751,6 +755,10 @@ mod tests {
             },
         );
         assert!(matches!(got, Err(ProviderError::Unsupported)));
+        // The pair is the contract: `supports_search` lets callers skip this
+        // provider without calling it, so a `search` that started answering
+        // while the flag stayed false would strand a working source.
+        assert!(!p.supports_search());
     }
 
     #[test]

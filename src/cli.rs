@@ -412,10 +412,13 @@ pub fn fetch_error_line(stage: FetchStage, class: FetchClass, provider: &str) ->
             ),
         },
         FetchClass::Unsupported => match stage {
-            FetchStage::Search => format!(
-                "  ✗ {provider} can't search directly.\n     \
-                 set preferred_provider to \"senshi\" or \"allanime\" in config, or use the TUI.\n"
-            ),
+            // Reached only by a provider whose `supports_search` disagrees with
+            // its `search` (the flag defaults true, 03 §3.2), since the run
+            // binds on the flag. Kept total. No retry advice: Unsupported is
+            // structural, so trying again can never answer.
+            FetchStage::Search => {
+                format!("  ✗ {provider} can't search directly; use the TUI.\n")
+            }
             FetchStage::Episodes => {
                 format!("  ✗ {provider} can't list episodes for this show.\n")
             }
@@ -431,6 +434,20 @@ pub fn fetch_error_line(stage: FetchStage, class: FetchClass, provider: &str) ->
 /// The flag is parsed but never wired to resolve; `default_quality` drives it.
 pub fn quality_note_needed(quality: Option<&str>) -> bool {
     matches!(quality, Some(q) if !q.eq_ignore_ascii_case("best"))
+}
+
+/// Heads-up when the configured source was walked past because it cannot
+/// search (ROD-491). `None` when nothing was overridden: no preference set, or
+/// the preference is the source the run is using. Tuples are (name, display):
+/// identity compares on the stable name, the copy shows the display one.
+pub fn provider_override_note(asked: Option<(&str, &str)>, chosen: (&str, &str)) -> Option<String> {
+    let (asked_name, asked_display) = asked?;
+    (asked_name != chosen.0).then(|| {
+        format!(
+            "  (note: {asked_display} can't search, so this run uses {}.)",
+            chosen.1
+        )
+    })
 }
 
 /// Play-failure copy in the CLI's sentence register. A resolve failure is a
@@ -819,14 +836,49 @@ mod tests {
         assert_eq!(classify_pick("5", 5), PickInput::Pick(4));
     }
 
+    /// The three states the note distinguishes. Silence on a stock config is
+    /// the one that matters: nothing was overridden, so nothing is explained.
     #[test]
-    fn search_unsupported_steers_to_the_fix_not_a_bare_word() {
+    fn override_note_fires_only_when_a_preference_was_walked_past() {
+        let senshi = ("senshi", "Senshi");
+        assert_eq!(provider_override_note(None, senshi), None);
+        assert_eq!(
+            provider_override_note(Some(("senshi", "Senshi")), senshi),
+            None
+        );
+        let note = provider_override_note(Some(("megaplay", "MegaPlay")), senshi)
+            .expect("an incapable preference is explained");
+        assert!(note.contains("MegaPlay"), "{note}");
+        assert!(note.contains("Senshi"), "{note}");
+        assert!(note.contains("can't search"), "{note}");
+    }
+
+    /// Identity is the stable name, never the display string; two sources are
+    /// free to share a display name without the note misfiring.
+    #[test]
+    fn override_note_compares_names_not_display_strings() {
+        assert_eq!(
+            provider_override_note(Some(("senshi", "Same Label")), ("senshi", "Same Label")),
+            None
+        );
+        assert!(provider_override_note(Some(("a", "Same Label")), ("b", "Same Label")).is_some());
+    }
+
+    /// No config nudge on this row: the run binds on `supports_search`, so
+    /// pointing at `preferred_provider` would prescribe a fix for a state the
+    /// user cannot reach. Every Unsupported stage reads as a dead operation.
+    #[test]
+    fn search_unsupported_no_longer_nudges_at_config() {
+        for stage in [
+            FetchStage::Search,
+            FetchStage::Episodes,
+            FetchStage::Resolve,
+        ] {
+            let line = fetch_error_line(stage, FetchClass::Unsupported, "megaplay");
+            assert!(!line.contains("preferred_provider"), "{line}");
+        }
         let line = fetch_error_line(FetchStage::Search, FetchClass::Unsupported, "megaplay");
         assert!(line.contains("can't search directly"), "{line}");
-        assert!(line.contains("preferred_provider"), "{line}");
-        // Episodes/resolve stages read as a dead operation, not a config nudge.
-        let ep = fetch_error_line(FetchStage::Episodes, FetchClass::Unsupported, "megaplay");
-        assert!(!ep.contains("preferred_provider"), "{ep}");
     }
 
     #[test]
