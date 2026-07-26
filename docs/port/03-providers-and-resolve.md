@@ -75,7 +75,13 @@ Slice is process-immutable. User preference never rewrites the registry in place
 | `primary()` | `providers[0]` (megaplay @ freeze) |
 | `by_name(name)` | Owner of a persisted binding key. **Must** use this for bound rows, never `primary()` (fetching a bound id on the wrong provider silently corrupts the binding). `None` = retired provider. |
 | `preferred(name)` | Named or `primary()` if empty/unknown |
+| `preferred_searchable(pref)` | First entry of `ordered(pref)` whose `supports_search` is true; `None` when none can. **The CLI query path only** (06 §7.3, ROD-491); every other path binds one provider, because a provider id is meaningless on another |
 | `ordered(pref)` | Preferred first, then construction order for the rest (ROD-344) |
+
+`supports_search` defaults to **true**: tier-C search is the norm, so a provider
+that cannot search must override it. A provider that forgets becomes eligible
+for the CLI binding and fails at runtime instead of being skipped. The roster
+test over `default_registry` pins the live lineup against exactly this drift.
 
 ### 3.3 When preference applies
 

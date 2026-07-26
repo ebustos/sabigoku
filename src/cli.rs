@@ -412,11 +412,12 @@ pub fn fetch_error_line(stage: FetchStage, class: FetchClass, provider: &str) ->
             ),
         },
         FetchClass::Unsupported => match stage {
-            // Unreachable in practice since ROD-491: the run only ever binds to
-            // a provider that reports `supports_search`. Kept total, and worded
-            // without the old config advice, which no longer applies.
+            // Reached only by a provider whose `supports_search` disagrees with
+            // its `search` (the flag defaults true, 03 §3.2), since the run
+            // binds on the flag. Kept total. No retry advice: Unsupported is
+            // structural, so trying again can never answer.
             FetchStage::Search => {
-                format!("  ✗ {provider} can't search directly; try again or use the TUI.\n")
+                format!("  ✗ {provider} can't search directly; use the TUI.\n")
             }
             FetchStage::Episodes => {
                 format!("  ✗ {provider} can't list episodes for this show.\n")
@@ -863,10 +864,9 @@ mod tests {
         assert!(provider_override_note(Some(("a", "Same Label")), ("b", "Same Label")).is_some());
     }
 
-    /// ROD-491 retired the config nudge here. The run only ever binds to a
-    /// provider reporting `supports_search`, so pointing at `preferred_provider`
-    /// would prescribe a fix for a state the user cannot reach. Every
-    /// Unsupported stage now reads as a dead operation.
+    /// No config nudge on this row: the run binds on `supports_search`, so
+    /// pointing at `preferred_provider` would prescribe a fix for a state the
+    /// user cannot reach. Every Unsupported stage reads as a dead operation.
     #[test]
     fn search_unsupported_no_longer_nudges_at_config() {
         for stage in [
