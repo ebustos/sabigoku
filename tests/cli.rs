@@ -38,11 +38,98 @@ fn unknown_flag_and_missing_quality_value_print_usage_and_exit_zero() {
     }
 }
 
+/// One-shot local release endpoint. `update` in this suite ALWAYS runs
+/// against this (via SABIGOKU_UPDATE_URL): the real endpoint would make the
+/// suite network-dependent, and an offline fallthrough would execute the real
+/// installer over the binary under test.
+fn serve_latest(tag: &str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let body = format!("{{\"tag_name\":\"{tag}\"}}");
+    std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    url
+}
+
 #[test]
-fn subcommand_stubs_exit_zero() {
-    let out = run(&["--debug", "update"]);
+fn update_at_latest_reports_and_exits_zero() {
+    let url = serve_latest(&format!("v{}", env!("CARGO_PKG_VERSION")));
+    let out = Command::new(env!("CARGO_BIN_EXE_sabigoku"))
+        .args(["--debug", "update"])
+        .env("SABIGOKU_UPDATE_URL", &url)
+        .output()
+        .expect("spawn sabigoku");
     assert_eq!(out.status.code(), Some(0));
-    assert!(stdout(&out).contains("update"));
+    assert!(
+        stdout(&out).contains("is already the latest release"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// The standalone self-update path end to end: newer tag, writable bindir,
+/// installer driven with the pinned version. The file:// installer records
+/// its env instead of installing, so the whole flow runs with zero network.
+#[test]
+fn update_standalone_drives_the_installer_with_the_pinned_version() {
+    let dir = std::env::temp_dir().join("sabigoku-cli-update-standalone");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("installer-env.log");
+    let installer = dir.join("fake-installer.sh");
+    std::fs::write(
+        &installer,
+        "#!/bin/sh\nprintf '%s\\n%s\\n' \"$SABIGOKU_VERSION\" \"$BINDIR\" > \"$LOG\"\n",
+    )
+    .unwrap();
+
+    let url = serve_latest("v999.0.0");
+    let out = Command::new(env!("CARGO_BIN_EXE_sabigoku"))
+        .args(["update"])
+        .env("SABIGOKU_UPDATE_URL", &url)
+        .env(
+            "SABIGOKU_INSTALL_URL",
+            format!("file://{}", installer.display()),
+        )
+        .env("LOG", &log)
+        .env_remove("CARGO_HOME")
+        .output()
+        .expect("spawn sabigoku");
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!(
+            "update available: v{} -> v999.0.0",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{text}"
+    );
+    assert!(text.contains("updated. restart sabigoku"), "{text}");
+    let recorded = std::fs::read_to_string(&log).expect("installer ran");
+    let mut lines = recorded.lines();
+    assert_eq!(
+        lines.next(),
+        Some("v999.0.0"),
+        "version pinned for the installer"
+    );
+    let bindir = lines.next().expect("bindir recorded");
+    assert!(
+        std::path::Path::new(bindir).join("sabigoku").exists()
+            || env!("CARGO_BIN_EXE_sabigoku").starts_with(bindir),
+        "BINDIR is the running binary's dir: {bindir}"
+    );
 }
 
 fn run_isolated(args: &[&str], dir: &std::path::Path, stdin: std::process::Stdio) -> Output {

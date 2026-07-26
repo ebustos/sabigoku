@@ -39,6 +39,15 @@ pub fn check(cache_dir: &Path, current_version: &str, now: i64) -> Option<String
     semver::is_newer(&latest, current_version).then_some(latest)
 }
 
+/// Fresh network tag, bypassing (and refreshing) the cache: `sabigoku update`
+/// (06 §6.2) must not act on an hour-old answer. Nothing here is reachable
+/// without the network, so coverage lives in tests/update_live.rs.
+pub fn latest_fresh(cache_dir: &Path, now: i64) -> Option<String> {
+    let tag = fetch_latest()?;
+    write_cache(cache_dir, now, &tag);
+    Some(tag)
+}
+
 fn resolve_latest(cache_dir: &Path, now: i64) -> Option<String> {
     if let Some(entry) = read_cache(cache_dir)
         && is_fresh(entry.checked_at, now)
@@ -120,13 +129,17 @@ const BODY_CAP: u64 = 64 * 1024;
 
 fn fetch_latest() -> Option<String> {
     use std::io::Read;
+    // Test seam (tests/cli.rs): the default suite must never reach GitHub,
+    // and `update` falling through to the installer mid-suite would overwrite
+    // the binary under test.
+    let url = std::env::var("SABIGOKU_UPDATE_URL").unwrap_or_else(|_| LATEST_URL.to_string());
     let client = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .user_agent(USER_AGENT)
         .build()
         .ok()?;
     let body = client
-        .get(LATEST_URL)
+        .get(url)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
         .map_err(|e| log::debug!("update check: fetch failed: {e}"))
