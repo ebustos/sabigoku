@@ -11,6 +11,10 @@ set -euo pipefail
 version=${1:?usage: changelog-section.sh <version> [changelog]}
 changelog=${2:-CHANGELOG.md}
 
+# Errors go to stderr, never stdout: stdout is the section body, and both
+# callers redirect it. On stdout the guard would discard its own error into
+# /dev/null and publish would write it into the release notes. The runner parses
+# ::error:: on either stream.
 die() {
   echo "::error::$*" >&2
   exit 1

@@ -1,13 +1,9 @@
 version: 2
 
 updates:
-  # SHA pins never move on their own, so without this the workflows would sit on
-  # whatever commit was current the day they were pinned, missed security fixes
-  # included. Grouped into one PR: five actions that move a few times a year do
-  # not justify a stream of single-action PRs.
-  #
-  # Review a bump like any other third-party code: dependabot verifies the SHA
-  # belongs to the tag, not that the code behind it is safe.
+  # Without this the SHA pins in the workflows never move again, missed security
+  # fixes included. Review a bump like any other third-party code: dependabot
+  # verifies the SHA belongs to the tag, not that the code behind it is safe.
   - package-ecosystem: github-actions
     directory: /
     schedule:
