@@ -265,3 +265,102 @@ jobs:
             exit 1
           fi
           cargo publish --locked
+
+  aur:
+    name: publish to the AUR
+    # The PKGBUILD builds from the tag's source tarball, so the tag must exist
+    # and the release must have survived its own guards before Arch users are
+    # pointed at it. Independent of crates-io: nothing here reads the registry.
+    needs: [guard, publish]
+    # A prerelease has no business on the AUR, which has one channel and no
+    # concept of a version users should not resolve.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      # Digest-pinned like every action: makepkg and namcap run arbitrary build
+      # logic with an SSH key that can write to the AUR in the same job.
+      image: archlinux:base-devel@sha256:412efebb0eeef0ef322ff24ad73f82b1ba2d3b12377db4c5fbe3074c7e7e8678
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # -Syu, never a bare -Sy: a partial upgrade against a moved mirror is how
+      # an Arch container breaks halfway through a build.
+      - name: install toolchain
+        run: pacman -Syu --noconfirm --needed git openssh rust namcap pacman-contrib
+
+      # makepkg refuses to run as root, and refuses for a good reason.
+      - name: create a build user
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          chown -R builder:builder packaging/aur
+
+      - name: render the PKGBUILD for this tag
+        working-directory: packaging/aur
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          sed -i "s/^pkgver=.*/pkgver=${v}/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          # updpkgsums downloads the source and rewrites sha256sums in place, so
+          # the checksum is computed from what the tag actually serves and is
+          # never carried over from the committed value.
+          sudo -u builder updpkgsums
+          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+          cat PKGBUILD
+
+      # Build it before publishing it. An AUR package that does not compile is
+      # visible to every Arch user the moment it is pushed, and the recipe here
+      # is the only thing that ever gets tested.
+      - name: build and test the package
+        working-directory: packaging/aur
+        run: sudo -u builder makepkg -sf --noconfirm
+
+      - name: namcap
+        working-directory: packaging/aur
+        continue-on-error: true
+        run: |
+          namcap PKGBUILD
+          namcap ./*.pkg.tar.zst
+
+      - name: publish
+        working-directory: packaging/aur
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          if [ -z "${AUR_SSH_KEY}" ]; then
+            echo "::error::AUR_SSH_KEY is unset; add it under repo settings -> secrets"
+            exit 1
+          fi
+          v="${{ needs.guard.outputs.version }}"
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "${AUR_SSH_KEY}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          # Pinned host key, never StrictHostKeyChecking=no: this key can write
+          # to a package other people install.
+          printf '%s\n' \
+            'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' \
+            > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+
+          # An unpublished package name clones as an empty repo; that is the
+          # documented AUR submission path, so the first release creates it.
+          git clone "ssh://aur@aur.archlinux.org/sabigoku.git" aur-repo
+          if [ -f aur-repo/PKGBUILD ] &&
+             grep -qx "pkgver=${v}" aur-repo/PKGBUILD &&
+             grep -qx "pkgrel=1" aur-repo/PKGBUILD; then
+            echo "the AUR already carries ${v}-1; nothing to push"
+            exit 0
+          fi
+
+          cp PKGBUILD .SRCINFO aur-repo/
+          cd aur-repo
+          git config user.name "vantroy"
+          git config user.email "vantroy@gmail.com"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "no change to push"
+            exit 0
+          fi
+          git commit -m "sabigoku ${v}-1"
+          git push
