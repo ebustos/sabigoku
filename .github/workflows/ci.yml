@@ -33,9 +33,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      # No --ignored / --include-ignored here, ever: the _live tests hit the network.
-      - run: cargo test
+      - run: cargo clippy --all-targets --features test-seams -- -D warnings
+      # test-seams gates the update env-var overrides so the `update` CLI tests
+      # can drive the real binary against a local fixture; off in every shipped
+      # build. No --ignored / --include-ignored here, ever: _live tests hit the network.
+      - run: cargo test --features test-seams
       # Assert each live target runs zero tests (all #[ignore]d). Semantic, not a
       # grep of #[ignore]: a commented-out attribute, #[tokio::test], or a rename
       # all fool text counting, but a test that actually runs cannot hide here.

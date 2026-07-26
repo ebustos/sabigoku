@@ -1,8 +1,8 @@
 //! Bootstrap order per 01 §2: paths -> config -> store -> registry -> tui::run.
-//! CLI dispatch (06 §7) runs before any of it; the Version, Usage and Update
-//! arms never touch disk. Exit law (06 §7.4): login/sync/update/usage/version
-//! exit 0 unconditionally; the play path is the one command whose failure exits
-//! 1. Boot failures (no HOME, tui::run error) are a separate pre-existing 1.
+//! CLI dispatch (06 §7) runs before any of it; the Version and Usage arms
+//! never touch disk. Exit law (06 §7.4): login/sync/update/usage/version exit
+//! 0 unconditionally; the play path is the one command whose failure exits 1.
+//! Boot failures (no HOME, tui::run error) are a separate pre-existing 1.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -38,7 +38,12 @@ fn main() -> ExitCode {
         }
         Command::Update => {
             sabigoku::logging::init_stderr(debug);
-            println!("update isn't available yet");
+            // No HOME still updates; only the cache refresh is lost, and the
+            // module treats a failed cache write as silence anyway.
+            let cache = Paths::resolve()
+                .map(|p| p.cache)
+                .unwrap_or_else(|_| std::env::temp_dir().join("sabigoku"));
+            sabigoku::update::run(env!("CARGO_PKG_VERSION"), &cache, unix_now());
             ExitCode::SUCCESS
         }
         Command::Usage => {

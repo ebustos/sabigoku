@@ -25,6 +25,7 @@ pub mod sync;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod tui;
+pub mod update;
 pub mod updatecheck;
 
 pub use error::Error;
