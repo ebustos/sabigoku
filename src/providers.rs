@@ -105,7 +105,12 @@ pub trait StreamProvider: Send + Sync {
 
     /// Whether `search` can ever answer. `false` means structurally incapable,
     /// not "failed this time", so a caller may skip the provider without
-    /// calling it. Keep this in step with `search` returning `Unsupported`.
+    /// calling it.
+    ///
+    /// Defaults true because tier-C search is the norm; a provider that cannot
+    /// search MUST override, or the CLI will bind it and die at runtime on a
+    /// path it believes unreachable (`cli::fetch_error_rows`). The roster test
+    /// over `default_registry` is what keeps the two in step.
     fn supports_search(&self) -> bool {
         true
     }
@@ -165,9 +170,8 @@ impl ProviderRegistry {
 
     /// Named, or `primary()` when empty/unknown (03 §3.2).
     ///
-    /// No production caller since ROD-491 moved the CLI to
-    /// `preferred_searchable`. Kept because 03 §3.2 lists it as a registry
-    /// view; retiring it is a bible change, not a cleanup.
+    /// No production caller. Kept because 03 §3.2 lists it as a registry view;
+    /// retiring it is a bible change, not a cleanup.
     pub fn preferred(&self, name: Option<&str>) -> &dyn StreamProvider {
         name.filter(|n| !n.is_empty())
             .and_then(|n| self.by_name(n))
@@ -328,6 +332,29 @@ mod tests {
             Box::new(Fake("senshi", true)),
             Box::new(Fake("allanime", true)),
         ])
+    }
+
+    /// Every other test here runs against `Fake`s that MODEL the live lineup.
+    /// This one pins the lineup itself: construction order (03 §3.1) and the
+    /// precondition the ROD-491 deviation rests on, that the primary cannot
+    /// search. Without it, reordering `default_registry` leaves the fakes
+    /// passing while the reason for the deviation silently evaporates.
+    #[test]
+    fn live_registry_leads_with_a_primary_that_cannot_search() {
+        let reg = default_registry().expect("offline construction");
+        assert_eq!(
+            names(&reg.iter().collect::<Vec<_>>()),
+            ["megaplay", "senshi", "allanime"]
+        );
+        assert!(
+            !reg.primary().supports_search(),
+            "the CLI walk exists because the primary cannot search"
+        );
+        assert!(
+            reg.preferred_searchable(None)
+                .is_some_and(|p| p.name() == "senshi"),
+            "a stock run binds the first searchable provider"
+        );
     }
 
     fn names(providers: &[&dyn StreamProvider]) -> Vec<&'static str> {

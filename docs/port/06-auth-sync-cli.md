@@ -382,6 +382,23 @@ Subcommand detection: flags may precede (`--debug login` OK). After a real query
 | `sabigoku <query>…` | zigoku's non-TUI path is a full secondary UI: **single provider** via `preferred()` (no fallback walk), interactive stdin picks, cache-first episodes, resume + AniSkip + recordPlay wiring, and the CLI's only nonzero exit (1) on failure. **Lean: defer** to post-M1 (01 O3); M1 behavior for a positional arg: print "not supported yet", exit 2 — never silently open the TUI |
 | Bare flags only | TUI |
 
+**Query provider binding (ROD-491, deliberate divergence from zigoku).** The row
+above records the freeze: zigoku's CLI takes `preferred()` and hard-fails when
+that provider cannot search (`main.zig:178-180`, "CLI does not walk the
+registry"). Combined with megaplay as primary (03 §3.1) and megaplay having no
+tier C (03 §8.1) and `preferred_provider` defaulting to empty, a stock
+`zigoku <query>` is dead on arrival, exit 1. Faithful parity with an upstream
+defect, verified against the freeze rather than assumed.
+
+sabigoku binds `preferred_searchable(pref)` instead (03 §3.2): the first
+provider in `ordered` that can search. An explicit `preferred_provider` is still
+honoured whenever it can search, and when it cannot the run notes the
+substitution on one line and proceeds rather than dying. The walk is **search
+only**; every other CLI path still binds exactly one provider, because a
+provider id is meaningless on another. `None` (no provider can search) prints
+and exits 1, an exit-1 reason additional to the play path in §7.4. A future
+engineer diffing against zigoku must not "fix" this back to a hard fail.
+
 ### 7.4 Exit / messaging
 
 Sync/login print human summaries (signed-out, expired, rate limit, conflicts,
