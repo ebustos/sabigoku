@@ -72,10 +72,22 @@ fi
 
 # ── read-only lint: refuse dangerous beats before we touch the real store ─────
 # Store-writing keys (src/tui/app.rs): P (plan), p/x/c/w (status), r (recompute),
-# u (undo), v (provider pin), X (arms hard-delete). Resolve a key spec to its
-# final char (strip modifiers: shift+p -> p) and ban both cases of each letter,
-# so `p`, `P`, `shift+p`, `shift+P` are all caught.
-is_mutating() { case "${1##*+}" in p|P|x|X|c|C|w|W|r|R|u|U|v|V) return 0 ;; *) return 1 ;; esac; }
+# u (undo), v (provider pin), X (arms hard-delete). Check EVERY +-token of a key
+# spec, not just the last: xdotool accepts any keysym in any chord position, so
+# `key p+j` presses p for real. Both cases of each letter are banned, so `p`,
+# `P`, `shift+p`, `shift+P`, `p+j` are all caught.
+is_mutating() {
+  local spec="$1" tok
+  local IFS='+'
+  set -f
+  for tok in $spec; do
+    case "$tok" in
+      p|P|x|X|c|C|w|W|r|R|u|U|v|V) set +f; return 0 ;;
+    esac
+  done
+  set +f
+  return 1
+}
 # Output filenames must be a plain basename: no `../` traversal or absolute path
 # that could let `grab`/`record` write over the real store/config under $OUTDIR/..
 is_bad_name() { case "$1" in ''|*/*|.*) return 0 ;; *) return 1 ;; esac; }
@@ -106,6 +118,14 @@ unset TMUX TMUX_PANE
 export DISPLAY="$DISP" LIBGL_ALWAYS_SOFTWARE=1 KITTY_ENABLE_WAYLAND=0
 
 TMP="$(mktemp -d)"
+XVFB_PID=""; KITTY_PID=""; FF_PID=""
+cleanup() {
+  [ -n "$FF_PID" ] && kill "$FF_PID" 2>/dev/null || true
+  [ -n "$KITTY_PID" ] && kill "$KITTY_PID" 2>/dev/null || true
+  [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 # Isolate config on an EMPTY throwaway dir: sabigoku reads $XDG_CONFIG_HOME/sabigoku
 # (src/paths.rs) and falls back to built-in defaults when it's absent. Three wins:
@@ -130,14 +150,6 @@ cat > "$XDG_CONFIG_HOME/sabigoku/config.toml" <<'TOML'
 landing = "history"
 check_for_updates = false
 TOML
-XVFB_PID=""; KITTY_PID=""; FF_PID=""
-cleanup() {
-  [ -n "$FF_PID" ] && kill "$FF_PID" 2>/dev/null || true
-  [ -n "$KITTY_PID" ] && kill "$KITTY_PID" 2>/dev/null || true
-  [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
-  rm -rf "$TMP"
-}
-trap cleanup EXIT
 
 # ── headless X + kitty running sabigoku via the read-only launcher ────────────
 pkill -f "Xvfb $DISP" 2>/dev/null || true
@@ -191,6 +203,9 @@ resize_win() {  # resize <W>x<H>: resize the window, let the app reflow, update 
   read -r WINW WINH < <(xdotool getwindowgeometry --shell "$WID" | awk -F= '/WIDTH/{w=$2} /HEIGHT/{h=$2} END{print w, h}')
   echo "  resize → ${WINW}x${WINH}"
 }
+# grab and record both assume the kitty window sits at origin (0,0): true under
+# bare Xvfb with no WM, broken the moment a WM or window gravity enters the
+# launch flow. If a capture comes out shifted, this is why.
 grab() {  # grab <file>: framebuffer cropped to the kitty window, kept under budget
   is_bad_name "$1" && { echo "  refusing grab to unsafe path: '$1'" >&2; return 1; }  # defense in depth (lint already caught it)
   local out="$OUTDIR/$1" bytes

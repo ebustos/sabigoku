@@ -32,7 +32,9 @@ cargo build --release                            # beats drive ./target/release/
 
 Requires `Xvfb`, `kitty`, `xdotool`, `xdpyinfo`, `ffmpeg`, `gifski`, ImageMagick
 (`import` + `magick`) on PATH (verified with kitty, ffmpeg + gifski, Mesa
-llvmpipe software GL).
+llvmpipe software GL). The pipeline is Linux-only: it drives X11 and uses GNU
+coreutils (`stat -c`); the app it captures is cross-platform, the tooling is
+not.
 
 > **Content is live where it says so.** `demo`, `discover`, `browse`, and
 > `covers` beats read your real store / the live Discover feed / live catalogue
