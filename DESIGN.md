@@ -848,11 +848,41 @@ Format: `[████████░░░░░░░░]  8 / 28 eps`
 - Filled cells: **selection-aware** (see below); `state.focus` only on the cursor
   bar, otherwise the per-status color.
 - Empty cells: `border.hair`.
-- `█` for filled, `░` for empty.
+- `█` for watched, `░` for empty, `▓` for watched-past-broadcast, `·` for
+  not-yet-aired. `▓`, `░` and `·` are all `border.hair`, so the **lit `█` run
+  always stops at the broadcast edge**: a `▓` claim has to read as unlit, or the
+  row scans as a full bar again and the whole point is lost. The `◐` resume
+  marker is the one deliberate exception and takes the fill colour wherever it
+  lands, edge or no edge.
 - Bar width: 16 chars minimum, scales to available space with a max of 24 chars.
 - Episode fraction text: `text.muted` on the cursor bar, else `text.dim`.
 - Resume point: a `◐` injected at the resume position within the bar, e.g.
-  `[████◐░░░░░░░░░░░]` where `◐` is at episode 5 of 28.
+  `[████◐░░░░░░░░░░░]` where `◐` is at episode 5 of 28. It outranks every other
+  glyph: it is a real watch, and the bar must never hide one.
+- **Broadcast edge.** On an airing show the cells past the aired count
+  (`aired_count`, `nextAiringEpisode - 1`) render in their own register, so the
+  bar separates "not watched" from "not out yet":
+  `[███·············]  3 / 14 eps` is three of the three episodes out.
+- **Progress past the edge** renders `▓` rather than being clipped:
+  `[████▓▓▓▓▓▓▓▓▓▓▓▓]  14 / 14 eps` on a season with four aired says "your
+  tracker claims more than has been broadcast" without erasing a watch. **The
+  fill is never capped at the aired count.** `nextAiringEpisode` comes from
+  cached enrichment and goes stale for a full TTL, which is exactly the window a
+  weekly viewer lives in, so a cap would hide the episode they watched three
+  hours after it aired. `▓` degrades to a mild over-claim for a day instead.
+- **This is deliberately not the §4.6 grid rule.** `expected_episode_count`
+  (02 §4, ROD-359) caps the grid at `min(aired, total)`, so the grid on that
+  same show draws four cells while the bar spans fourteen. The two answer
+  different questions: a grid cell is a thing you can press Enter on, and
+  offering one for an episode that does not exist is a broken affordance,
+  whereas the bar reports a watch the user already has. Capping a count of
+  things-you-can-do is correct; capping a record of what happened is data loss.
+  A future reader diffing the two must not "fix" them into agreement.
+- Edge and fill round identically and carry the same one-cell minimum.
+  Asymmetry either way puts the edge ahead of a fill reaching the same
+  episode, so a viewer caught up on everything broadcast gets a phantom `░`. The
+  one-cell minimum is what gives a lone aired or watched episode a cell of its own
+  on a long season, where the quotient truncates to zero.
 
 The fill color is **selection-aware**: `state.focus` means "the focused cursor row"
 (the same cyan as the `▸`/title, §4.1), so the bar earns it ONLY when the row is
@@ -892,9 +922,11 @@ available column width.
 
 The resume point cell (`[▸N]`) is always the most visually prominent cell in the
 grid; `state.now` is only ever earned by one cell at a time. A resume point is
-the freshest partial watch recorded **since the frontier last moved**, whichever
-writer moved it (local ratchet, recompute, AniList sync); a partial the frontier
-has passed is dead, a partial written after it is a live rewatch (ROD-477).
+the freshest partial watch recorded **since the frontier last rose**, whichever
+writer raised it (local ratchet, recompute, AniList sync); a partial the frontier
+has passed is dead, a partial written after it is a live rewatch (ROD-477). Only
+a rise retires a partial: a sync correction that lowers progress leaves the
+frontier behind the partial, which keeps it live (ROD-497).
 
 **Launching cell state.** When playback is resolving (the 2-3s resolve → mpv-launch
 window), the played episode's cell renders the current braille spinner frame

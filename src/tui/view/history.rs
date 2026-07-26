@@ -416,22 +416,33 @@ fn draw_bar_row(
         frame.render_widget(Block::new().style(Style::new().bg(palette.surface)), row);
     }
     let width = bar_width(area.width);
-    let (filled, resume_cell) = bar_geometry(
+    let bar = bar_geometry(
         show.progress,
         show.enrichment.total_episodes,
+        super::detail::aired_count(&show.enrichment),
         state.resume.get(ix).copied().flatten(),
         width,
     );
     let fill_style = render::bar_fill_color(palette, show.list_status, selected, focused);
     let frac_style = render::bar_frac_color(palette, show.list_status, selected, focused);
-    let mut spans = vec![Span::styled("[", Style::new().fg(palette.chrome))];
+    let chrome = Style::new().fg(palette.chrome);
+    let mut spans = vec![Span::styled("[", chrome)];
     for i in 0..width {
-        let (glyph, style) = if Some(i) == resume_cell {
+        let beyond_broadcast = bar.aired.is_some_and(|a| i >= a);
+        let (glyph, style) = if Some(i) == bar.resume {
             ("◐", fill_style)
-        } else if i < filled {
-            ("█", fill_style)
+        } else if i < bar.filled {
+            // Dim, not the fill colour: the bright run has to stop at the
+            // broadcast edge or a claim past it still scans as a full bar.
+            if beyond_broadcast {
+                ("▓", chrome)
+            } else {
+                ("█", fill_style)
+            }
+        } else if beyond_broadcast {
+            ("·", chrome)
         } else {
-            ("░", Style::new().fg(palette.chrome))
+            ("░", chrome)
         };
         spans.push(Span::styled(glyph, style));
     }
@@ -452,24 +463,54 @@ fn bar_width(avail: u16) -> u16 {
     avail.saturating_sub(30).clamp(BAR_MIN, BAR_MAX)
 }
 
-/// Filled cells + the `◐` resume cell (DESIGN 4.5, 8.1): a null total fills
-/// a third of the bar as a non-zero signal and carries no resume marker.
+/// Cell geometry for one bar (DESIGN 4.5, 8.1).
+struct BarGeometry {
+    filled: u16,
+    /// The `◐` resume cell; outranks every other glyph, being a real watch.
+    resume: Option<u16>,
+    /// First cell past the broadcast. None means everything the total claims is
+    /// already out, which is every settled show.
+    aired: Option<u16>,
+}
+
+/// A null total fills a third of the bar as a non-zero signal and carries
+/// neither resume marker nor broadcast edge: no denominator, nothing to scale.
+///
+/// Fill follows stored progress and is NEVER capped at the aired count (DESIGN
+/// 4.5): `next_airing_episode` is cached enrichment and goes stale for a full
+/// TTL, so a cap would hide an episode the user watched hours after it aired.
+///
+/// Edge and fill must round identically AND carry the same one-cell minimum.
+/// Asymmetry either way puts the edge ahead of a fill reaching the same
+/// episode, which paints a phantom "aired but unwatched" cell for a viewer who
+/// is caught up. The minimum is what gives a lone aired or watched episode a
+/// cell of its own on a long season, where the quotient truncates to zero.
 fn bar_geometry(
     progress: u32,
     total: Option<u32>,
+    aired: Option<u32>,
     resume_ep: Option<u32>,
     width: u16,
-) -> (u16, Option<u16>) {
-    let width_u32 = u32::from(width);
+) -> BarGeometry {
+    // Widened: both operands come off the wire unclamped, and the product
+    // overflows u32 well inside a legal episode count.
+    let width_u64 = u64::from(width);
+    let cell = |eps: u32, t: u32| (u64::from(eps) * width_u64 / u64::from(t)) as u16;
     match total {
-        Some(t) if t > 0 => {
-            let filled = (progress.min(t) * width_u32 / t) as u16;
-            let resume = resume_ep
+        Some(t) if t > 0 => BarGeometry {
+            filled: cell(progress.min(t), t).max(u16::from(progress > 0)),
+            resume: resume_ep
                 .filter(|ep| *ep >= 1)
-                .map(|ep| ((ep - 1).min(t - 1) * width_u32 / t) as u16);
-            (filled, resume)
-        }
-        _ => (if progress > 0 { width / 3 } else { 0 }, None),
+                .map(|ep| cell((ep - 1).min(t - 1), t)),
+            aired: aired
+                .filter(|a| *a < t)
+                .map(|a| cell(a, t).max(u16::from(a > 0))),
+        },
+        _ => BarGeometry {
+            filled: if progress > 0 { width / 3 } else { 0 },
+            resume: None,
+            aired: None,
+        },
     }
 }
 
@@ -672,16 +713,158 @@ mod tests {
 
     #[test]
     fn bar_geometry_fills_marks_and_degrades() {
+        let g = |p, t, aired, ep| {
+            let b = bar_geometry(p, t, aired, ep, 16);
+            (b.filled, b.resume, b.aired)
+        };
         // 6/12 in a 16-wide bar: half filled.
-        assert_eq!(bar_geometry(6, Some(12), None, 16), (8, None));
+        assert_eq!(g(6, Some(12), None, None), (8, None, None));
         // Resume at episode 7: marker on the cell after the fill.
-        assert_eq!(bar_geometry(6, Some(12), Some(7), 16), (8, Some(8)));
+        assert_eq!(g(6, Some(12), None, Some(7)), (8, Some(8), None));
         // Overshoot clamps; marker clamps to the last cell.
-        assert_eq!(bar_geometry(20, Some(12), Some(99), 16), (16, Some(14)));
+        assert_eq!(g(20, Some(12), None, Some(99)), (16, Some(14), None));
         // Null total: one-third signal when engaged, empty when not (8.1).
-        assert_eq!(bar_geometry(3, None, Some(2), 16), (5, None));
-        assert_eq!(bar_geometry(0, None, None, 16), (0, None));
-        assert_eq!(bar_geometry(0, Some(12), Some(1), 16), (0, Some(0)));
+        assert_eq!(g(3, None, None, Some(2)), (5, None, None));
+        assert_eq!(g(0, None, None, None), (0, None, None));
+        assert_eq!(g(0, Some(12), None, Some(1)), (0, Some(0), None));
+    }
+
+    #[test]
+    fn bar_geometry_marks_the_broadcast_edge_without_hiding_progress() {
+        let g = |p, t, aired| {
+            let b = bar_geometry(p, t, aired, None, 16);
+            (b.filled, b.aired)
+        };
+        // ROD-497: 14 claimed of a season with 4 aired. Fill still reaches 14,
+        // so nothing is hidden; the edge at 4 is what says the rest is not out.
+        assert_eq!(g(14, Some(14), Some(4)), (16, Some(4)));
+        // Caught up on everything broadcast: no cell may read as aired and
+        // unwatched. Swept, not sampled: the counterexamples cluster where the
+        // quotient truncates to zero, which hand-picked shapes step over.
+        // `a < t` only, since an aired count at the total carries no edge.
+        for width in [16u16, 20, 24] {
+            for t in 1..=60u32 {
+                for a in 0..t {
+                    let b = bar_geometry(a, Some(t), Some(a), None, width);
+                    let edge = b.aired.expect("aired below total always marks an edge");
+                    assert_eq!(
+                        b.filled, edge,
+                        "w{width} caught up {a}/{t}: phantom unwatched cell"
+                    );
+                }
+            }
+        }
+        // The stale-enrichment case the cap used to eat: next_airing_episode is
+        // a day old and the user has watched the episode it does not know aired.
+        // A stale edge must not shrink the fill by one episode for a day.
+        assert_eq!(g(5, Some(14), Some(4)).0, g(5, Some(14), None).0);
+        // Aired but unwatched sits between fill and edge.
+        assert_eq!(g(0, Some(14), Some(4)), (0, Some(4)));
+        // Nothing aired: the whole bar is beyond the edge.
+        assert_eq!(g(0, Some(14), Some(0)), (0, Some(0)));
+        // An aired count at or past the total leaves no edge to mark.
+        assert_eq!(g(14, Some(14), Some(14)), (16, None));
+        // One episode out of many owns a cell on BOTH sides: the quotient
+        // truncates to zero, so without the floor the bar would read as
+        // nothing-aired while episode 1 is streaming, and without the SAME
+        // floor on the fill it would read as watched-nothing once seen.
+        assert_eq!(g(1, Some(20), Some(1)), (1, Some(1)));
+        assert_eq!(g(0, Some(20), Some(1)), (0, Some(1)));
+    }
+
+    /// The glyph precedence in `draw_bar_row` is the only place the three
+    /// registers meet, and geometry tests cannot see it.
+    #[test]
+    fn bar_row_renders_watched_claimed_and_unaired_registers() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let w = 60u16;
+        let pal = &crate::tui::theme::TERMINAL_GHOST;
+        // 4 aired of 14. `progress` picks which registers coexist: 8 leaves an
+        // unaired tail past the claim, 14 is the ticket's own row.
+        let render = |progress: u32| {
+            let mut s = show(1, "Airing", ListStatus::Watching, progress);
+            s.enrichment.total_episodes = Some(14);
+            s.enrichment.status = Some("RELEASING".into());
+            s.enrichment.next_airing_episode = Some(5);
+            let mut st = state(vec![s]);
+            st.resume = vec![Some(4)];
+            let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
+            term.draw(|f| draw_bar_row(f, Rect::new(0, 0, w, 1), 0, pal, &st, 0, true))
+                .unwrap();
+            let buf = term.backend().buffer();
+            let row: String = (0..w).map(|x| buf[(x, 0)].symbol()).collect();
+            let fg: Vec<_> = (0..w).map(|x| buf[(x, 0)].fg).collect();
+            (row, fg)
+        };
+
+        let (row, fg) = render(8);
+        assert!(row.contains("8 / 14 eps"), "fraction text intact: {row:?}");
+        for g in ['█', '▓', '·', '◐'] {
+            assert!(row.contains(g), "missing {g} register: {row:?}");
+        }
+        // Glyph alone is nearly invisible at one-cell scale: a claim past the
+        // broadcast must be UNLIT, or the row still scans as a full bar and the
+        // ticket's symptom stands. Style, not just shape.
+        let fg_of = |row: &str, fg: &[ratatui::style::Color], g: char| {
+            row.chars()
+                .position(|c| c == g)
+                .map(|i| fg[i])
+                .unwrap_or_else(|| panic!("no {g} cell in {row:?}"))
+        };
+        assert_eq!(
+            fg_of(&row, &fg, '▓'),
+            fg_of(&row, &fg, '·'),
+            "claimed-past-broadcast must be as unlit as the unaired tail"
+        );
+        assert_ne!(
+            fg_of(&row, &fg, '▓'),
+            fg_of(&row, &fg, '█'),
+            "claimed-past-broadcast must not wear the fill colour"
+        );
+
+        // The ticket's row: a claim spanning the whole season must still leave
+        // the lit run stopping at the broadcast edge.
+        let (row, fg) = render(14);
+        let cells: Vec<char> = row.chars().collect();
+        let lit = fg_of(&row, &fg, '█');
+        let last_lit = cells
+            .iter()
+            .enumerate()
+            .filter(|&(i, &c)| c == '█' && fg[i] == lit)
+            .map(|(i, _)| i)
+            .next_back()
+            .expect("some lit cell");
+        let first_claim = cells.iter().position(|&c| c == '▓').expect("claim shown");
+        assert!(
+            last_lit < first_claim,
+            "lit run must end before the claim begins: {row:?}"
+        );
+        // The claimed span sits after the aired span, never before it.
+        let first_claimed = row.find('▓').unwrap();
+        assert!(
+            row.find('█').unwrap() < first_claimed,
+            "aired fill precedes the claimed span: {row:?}"
+        );
+    }
+
+    #[test]
+    fn bar_geometry_survives_absurd_wire_counts() {
+        // total_episodes and next_airing_episode reach here unclamped off the
+        // wire. u32 math overflows well inside a legal count: debug panics on
+        // the render thread, release paints wrapped garbage.
+        let huge = 200_000_000u32;
+        for (p, t, aired) in [
+            (huge, Some(huge), None),
+            (1, Some(huge), Some(huge - 1)),
+            (huge, Some(huge), Some(huge / 2)),
+            (u32::MAX, Some(u32::MAX), Some(u32::MAX - 1)),
+        ] {
+            let b = bar_geometry(p, t, aired, Some(u32::MAX), 24);
+            assert!(b.filled <= 24);
+            assert!(b.resume.is_none_or(|r| r <= 24));
+            assert!(b.aired.is_none_or(|a| a <= 24));
+        }
     }
 
     #[test]

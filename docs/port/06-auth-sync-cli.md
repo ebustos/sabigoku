@@ -236,6 +236,35 @@ park user state on a show the user never engaged (02 §3.7). The O3 auto-import
 WATCHING/REPEATING entry: it promotes an existing identity row rather than
 merging it.
 
+**Duplicate collapse, before the merge.** `MediaListCollection` groups entries,
+and a media in custom lists appears once per group it belongs to, so the flat
+list can hold several rows for one id. Whether those copies can carry divergent
+progress is unevidenced here in either direction, so this rule is **defensive**:
+it decides what happens if they ever disagree, through an API change, a partial
+response, or a tampered one.
+
+They collapse to one pair per id by **`(updatedAt, progress)`**. Recency
+decides; progress only breaks a tie. Collapsing by progress first would re-raise
+exactly what the merge below exists to lower, a correction being by definition
+the smaller number, and would let one stale copy pin the old value.
+
+Two limits on that guarantee, both worth stating:
+
+- A group with **no usable stamps** falls through to the progress tiebreak
+  alone, which is plain max-progress: order-independent, but carrying the upward
+  bias this section otherwise rejects. AniList nulls `updatedAt` on entries
+  untouched since the field landed, and null maps to `0`, so a whole library can
+  land there.
+- Order-independence covers **progress only**. Copies alike in stamp and
+  progress but differing in status still resolve by wire order; nothing
+  distinguishes them.
+
+Deviation from zigoku, which dedupes at ingest by **unconditional last-wins wire
+order** (`anilist.zig:605-611`) and never requested `updatedAt`
+(`anilist.zig:560`). The max-progress collapse this replaced was sabigoku's own
+invention, not a ported rule, and cited a 06 clause that did not exist
+(ROD-497; see the backport ledger).
+
 **Pure merge (`reconcile`), the total matrix.** `eff_base` = snapshot status,
 or `planning` when the snapshot is null (first contact). `local_moved` =
 local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
@@ -248,8 +277,50 @@ local ≠ eff_base; `remote_moved` = remote ≠ eff_base:
 | yes | yes, same target | keep local (converged) | no |
 | yes | yes, different | **keep local** | **yes** (stays dirty for push) |
 
-- **progress** = `max(local, remote)` in every cell, unconditionally.
-- `REPEATING` is folded to `watching` at ingest, before the merge; progress still maxes.
+- **progress** runs its own matrix against the snapshot's **progress** half
+  (`0` on first contact). `local_progress_moved` = local progress ≠ base
+  progress; likewise for remote. These are independent of the status flags in
+  the table above and are evaluated separately:
+
+| local_progress_moved | remote_progress_moved | progress outcome |
+|---|---|---|
+| no | no | unchanged |
+| no | yes | **adopt remote, downward included** |
+| yes | no | keep local |
+| yes | yes | `max(local, remote)` |
+
+  Deviation from zigoku, which maxes in every cell unconditionally (ROD-497; see
+  the backport ledger). A raise-only rule cannot represent a corrected entry: the
+  merge keeps the stale high local value, the snapshot re-baselines to the lower
+  remote, and the resulting mismatch queues the row to push the stale value back
+  over the correction. `max` survives only where it earns its keep, the
+  both-moved race, so no watched episode is lost.
+- **No status special-case, `completed` included.** The two halves merge
+  independently, so a kept-local `completed` can pair with a progress adopted
+  from behind it. That pair is **accepted**: every rule tried for "correcting" it
+  reduced to overriding the one cell where local progress did not move and the
+  remote lowered it, which is precisely the correction this section exists to let
+  through (ROD-497).
+
+  `OPEN`: this assumes `SaveMediaListEntry` stores a `completed` entry at the
+  progress we send rather than coercing it up to the episode count. Unverified
+  against the live API. If it coerces, the push succeeds, the snapshot records
+  what we sent, and the next pull adopts the server's raised value through the
+  adopt-remote cell with no conflict raised. Not destructive, but it would make
+  the correction fail to stick on completed rows; worth one captured round trip
+  to settle.
+
+  In particular the merge must never snap progress to `total_episodes`. That is
+  what `setListStatus` does (02 §4b), but `setListStatus` is a deliberate user
+  gesture on one row while reconcile runs unattended over the whole library.
+  Cached totals drift, so the snap mints watch data, pushes it, and re-mints it
+  on every later pull without ever draining.
+
+  A local status edit still wins on the status half and still leaves the row
+  dirty, so it reaches the server on the next push. It simply does not carry
+  local's progress with it.
+- `REPEATING` is folded to `watching` at ingest, before the merge; the progress
+  matrix runs the same either way.
 
 After merge write:
 

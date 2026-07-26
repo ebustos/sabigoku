@@ -479,6 +479,9 @@ pub struct RemoteEntry {
     pub anilist_id: i64,
     pub status: ListStatus,
     pub progress: u32,
+    /// Server edit time, the tiebreak when one media appears in several custom
+    /// lists (06 §5.4). 0 when the wire omitted it.
+    pub updated_at: i64,
     pub import_seed: Option<Enrichment>,
 }
 
@@ -512,7 +515,7 @@ fn viewer_body() -> serde_json::Value {
 
 fn list_collection_body(user_id: i64) -> serde_json::Value {
     json!({
-        "query": "query($userId:Int!){MediaListCollection(userId:$userId,type:ANIME){lists{entries{mediaId status progress media{title{romaji english native} episodes}}}}}",
+        "query": "query($userId:Int!){MediaListCollection(userId:$userId,type:ANIME){lists{entries{mediaId status progress updatedAt media{title{romaji english native} episodes}}}}}",
         "variables": { "userId": user_id },
     })
 }
@@ -573,6 +576,8 @@ struct ListEntryNode {
     status: Option<String>,
     #[serde(default)]
     progress: u32,
+    #[serde(default)]
+    updated_at: Option<i64>,
     media: Option<ListMediaNode>,
 }
 
@@ -629,6 +634,8 @@ fn list_import_seed(media_id: i64, m: ListMediaNode) -> Enrichment {
 
 /// MediaListCollection body -> flat remote entries. Duplicate ids across custom
 /// lists are possible; collapsing them is the reconcile join's job (06 §5.4).
+/// A null `updatedAt` maps to 0 so it loses every tiebreak against a stamped
+/// sibling rather than winning one on an absent field.
 fn classify_list(raw: &[u8]) -> Result<Vec<RemoteEntry>, CatalogError> {
     let resp: ListCollectionResp =
         serde_json::from_slice(raw).map_err(|e| CatalogError::Decode(e.to_string()))?;
@@ -644,6 +651,7 @@ fn classify_list(raw: &[u8]) -> Result<Vec<RemoteEntry>, CatalogError> {
                 anilist_id: e.media_id,
                 status: list_status_from_anilist(e.status.as_deref()),
                 progress: e.progress,
+                updated_at: e.updated_at.unwrap_or(0),
                 import_seed,
             });
         }
@@ -1106,7 +1114,7 @@ mod tests {
     fn classify_list_flattens_groups_and_folds_repeating() {
         let raw = br#"{"data":{"MediaListCollection":{"lists":[
             {"entries":[
-                {"mediaId":101,"status":"CURRENT","progress":3},
+                {"mediaId":101,"status":"CURRENT","progress":3,"updatedAt":700},
                 {"mediaId":102,"status":"REPEATING","progress":12}
             ]},
             {"entries":[
@@ -1121,18 +1129,21 @@ mod tests {
                     anilist_id: 101,
                     status: ListStatus::Watching,
                     progress: 3,
+                    updated_at: 700,
                     import_seed: None
                 },
                 RemoteEntry {
                     anilist_id: 102,
                     status: ListStatus::Watching,
                     progress: 12,
+                    updated_at: 0,
                     import_seed: None
                 },
                 RemoteEntry {
                     anilist_id: 103,
                     status: ListStatus::Completed,
                     progress: 24,
+                    updated_at: 0,
                     import_seed: None
                 },
             ]
@@ -1179,6 +1190,7 @@ mod tests {
                 anilist_id: 9,
                 status: ListStatus::Planning,
                 progress: 0,
+                updated_at: 0,
                 import_seed: None
             }]
         );

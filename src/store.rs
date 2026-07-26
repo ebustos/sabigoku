@@ -1529,20 +1529,25 @@ impl Store {
         &self,
         remote: &[crate::anilist::RemoteEntry],
     ) -> Result<ReconcilePlan, Error> {
-        // Collapse the flat remote list (duplicate ids across custom lists,
-        // 06 §5.4) to one pair per id, keeping the highest progress. Seeds are
-        // per-media, so the first non-empty one per id is kept for import (O3).
-        let mut remote_map: HashMap<i64, (ListStatus, u32)> = HashMap::new();
+        // Collapse duplicate ids across groups (06 §5.4) by (updatedAt,
+        // progress): recency decides, magnitude only breaks a tie. Defensive;
+        // real copies are views of one record and agree. Collapsing by
+        // progress first would re-raise the correction the merge exists to land.
+        // An entirely unstamped group (AniList nulls updatedAt on rows untouched
+        // since the field landed, and null maps to 0) falls back to plain max,
+        // which is order-independent but carries that same upward bias.
+        // Seeds are per-media; the first non-empty one per id wins (O3).
+        let mut remote_map: HashMap<i64, (ListStatus, u32, i64)> = HashMap::new();
         let mut seeds: HashMap<i64, Enrichment> = HashMap::new();
         for e in remote {
             remote_map
                 .entry(e.anilist_id)
                 .and_modify(|cur| {
-                    if e.progress > cur.1 {
-                        *cur = (e.status, e.progress);
+                    if (e.updated_at, e.progress) > (cur.2, cur.1) {
+                        *cur = (e.status, e.progress, e.updated_at);
                     }
                 })
-                .or_insert((e.status, e.progress));
+                .or_insert((e.status, e.progress, e.updated_at));
             if let Some(seed) = &e.import_seed {
                 seeds.entry(e.anilist_id).or_insert_with(|| seed.clone());
             }
@@ -1577,10 +1582,10 @@ impl Store {
         let matched: HashSet<i64> = candidates.iter().map(|c| c.id).collect();
         let mut plan = Vec::new();
         for c in &candidates {
-            let Some(&remote_pair) = remote_map.get(&c.id) else {
+            let Some(&(rstatus, rprogress, _)) = remote_map.get(&c.id) else {
                 continue; // library row absent from the remote list; nothing to merge
             };
-            let r = reconcile(c.base, c.local, remote_pair);
+            let r = reconcile(c.base, c.local, (rstatus, rprogress));
             let merged = (r.status, r.progress);
             let snapshot = (r.snapshot_status, r.snapshot_progress);
             // Skip entirely when neither the local pair nor the snapshot moves.
@@ -1600,7 +1605,7 @@ impl Store {
         // carries a usable seed (O3); everything else is counted, not imported.
         let mut imports: Vec<ImportRow> = Vec::new();
         let mut unmatched: Vec<i64> = Vec::new();
-        for (&id, &(status, progress)) in &remote_map {
+        for (&id, &(status, progress, _)) in &remote_map {
             if matched.contains(&id) {
                 continue;
             }
@@ -1654,11 +1659,14 @@ impl Store {
         for r in imports {
             let tx = immediate_tx(&self.conn)?;
             add_to_library_on(&tx, &r.seed, now)?;
+            // The CAS pins the pre-mint progress at 0, so rise-only and
+            // any-change are equivalent here; kept in the rise-only form the
+            // merge apply below requires.
             let changed = tx.execute(
                 "UPDATE show SET
                     list_status = :status,
                     progress = :progress,
-                    progress_stamped_at = CASE WHEN progress <> :progress
+                    progress_stamped_at = CASE WHEN progress < :progress
                         THEN :now ELSE progress_stamped_at END,
                     synced_status = :status,
                     synced_progress = :progress
@@ -1681,12 +1689,15 @@ impl Store {
             tx.commit()?;
             out.imported += 1;
         }
+        // Stamps on a RISE only. The stamp means "the frontier moved past this
+        // partial, so it is dead" (05 §10.7); a downward adopt moves the
+        // frontier behind the partial, which cannot retire it (ROD-497).
         for p in plan {
             let changed = self.conn.execute(
                 "UPDATE show SET
                     list_status = :status,
                     progress = :progress,
-                    progress_stamped_at = CASE WHEN progress <> :progress
+                    progress_stamped_at = CASE WHEN progress < :progress
                         THEN :now ELSE progress_stamped_at END,
                     synced_status = :snap_status,
                     synced_progress = :snap_progress
@@ -1769,8 +1780,9 @@ struct Reconciled {
 }
 
 /// The reconcile matrix (06 §5.4). `base` is the snapshot, `None` on first
-/// contact (treated as Planning). Progress is `max(local, remote)`; the
-/// snapshot re-baselines to the raw remote pair when remote differs from base.
+/// contact (Planning / 0). Status and progress run the same three-way matrix
+/// against their own half of the base; the snapshot re-baselines to the raw
+/// remote pair when remote differs from base.
 fn reconcile(
     base: Option<(ListStatus, u32)>,
     local: (ListStatus, u32),
@@ -1791,10 +1803,33 @@ fn reconcile(
     };
     Reconciled {
         status,
-        progress: local.1.max(remote.1),
+        // No status special-case here, `completed` included: every rule tried
+        // reduced to overriding the remote-lowered-progress cell, which is the
+        // one this ticket exists to preserve (06 §5.4).
+        progress: merge_progress(base.map_or(0, |(_, p)| p), local.1, remote.1),
         snapshot_status: snapshot.0,
         snapshot_progress: snapshot.1,
         conflict,
+    }
+}
+
+/// Progress half of the 06 §5.4 matrix. `max` only in the both-moved cell:
+/// anywhere else it would re-raise a correction.
+///
+/// INVARIANT the `(false, true)` cell rests on: the snapshot never leads the
+/// server. `local == base` is read as "local never edited progress", which is
+/// only sound while `base` holds a value the server confirmed. Two things keep
+/// it true and both must stay true: `mark_synced` fires only after `save_entry`
+/// returns Ok (no optimistic stamp), and the born-clean seeds that snapshot from
+/// LOCAL progress (`record_engagement`, `adopt_orphaned_progress`) are gated on
+/// `library_added_at IS NULL`, which every writer that can raise progress above
+/// zero stamps in the same statement. Break either and this cell silently
+/// discards a real local watch.
+fn merge_progress(base: u32, local: u32, remote: u32) -> u32 {
+    match (local != base, remote != base) {
+        (false, true) => remote,
+        (true, false) => local,
+        _ => local.max(remote),
     }
 }
 
@@ -3372,7 +3407,14 @@ mod tests {
     use crate::anilist::RemoteEntry;
 
     fn remote(id: i64, status: ListStatus, progress: u32) -> RemoteEntry {
+        remote_at(id, status, progress, 0)
+    }
+
+    /// A remote entry with an explicit server edit time, for the duplicate
+    /// collapse (06 §5.4).
+    fn remote_at(id: i64, status: ListStatus, progress: u32, updated_at: i64) -> RemoteEntry {
         RemoteEntry {
+            updated_at,
             anilist_id: id,
             status,
             progress,
@@ -3391,6 +3433,7 @@ mod tests {
             anilist_id: id,
             status,
             progress,
+            updated_at: 0,
             import_seed,
         }
     }
@@ -3424,7 +3467,7 @@ mod tests {
 
     #[test]
     fn reconcile_matrix_covers_every_cell() {
-        // no/no: unchanged status, progress still maxes.
+        // no/no status, remote-only progress bump: adopted.
         let r = reconcile(
             Some((ListStatus::Watching, 5)),
             (ListStatus::Watching, 5),
@@ -3506,6 +3549,281 @@ mod tests {
             (r.snapshot_status, r.snapshot_progress),
             (ListStatus::Watching, 2)
         );
+    }
+
+    #[test]
+    fn reconcile_adopts_a_remote_only_progress_correction_downward() {
+        // ROD-497: the entry carried an impossible progress (14 of a season
+        // with 4 aired) and the user fixed it on AniList. Local never moved off
+        // the snapshot, so the correction is the only edit in play.
+        let r = reconcile(
+            Some((ListStatus::Watching, 14)),
+            (ListStatus::Watching, 14),
+            (ListStatus::Watching, 4),
+        );
+        assert_eq!(
+            (r.status, r.progress, r.conflict),
+            (ListStatus::Watching, 4, false)
+        );
+        // Both halves agree, so nothing is left dirty to push back.
+        assert_eq!(
+            (r.snapshot_status, r.snapshot_progress),
+            (ListStatus::Watching, 4)
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_local_progress_when_only_local_moved() {
+        // The raise-only rule's real job, unchanged: a local watch that has not
+        // reached AniList yet survives a pull that carries the stale value.
+        let r = reconcile(
+            Some((ListStatus::Watching, 4)),
+            (ListStatus::Watching, 7),
+            (ListStatus::Watching, 4),
+        );
+        assert_eq!(r.progress, 7);
+    }
+
+    #[test]
+    fn pull_does_not_push_a_remote_progress_correction_back() {
+        // The whole ROD-497 failure in one pass: before the fix the merge kept
+        // 14, re-baselined the snapshot to 4, and the mismatch queued the row
+        // to shove 14 back onto the corrected entry.
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            97,
+            ListStatus::Watching,
+            14,
+            Some((ListStatus::Watching, 14)),
+        );
+        let out = store
+            .reconcile_pull(&[remote(97, ListStatus::Watching, 4)], 0)
+            .unwrap();
+        assert_eq!(out.reconciled, 1);
+        assert_eq!(
+            state(&store, 97),
+            (ListStatus::Watching, 4, Some(ListStatus::Watching), Some(4))
+        );
+        assert!(store.list_dirty_for_sync().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_remote_that_completed_at_its_own_progress_is_adopted_whole() {
+        // Both sides converged on completed and only the remote moved progress,
+        // so the progress half adopts it whole. Local reaching completed
+        // independently is not a licence to overwrite the progress the remote
+        // completed at.
+        let r = reconcile(
+            Some((ListStatus::Watching, 20)),
+            (ListStatus::Completed, 20),
+            (ListStatus::Completed, 5),
+        );
+        assert_eq!((r.status, r.progress), (ListStatus::Completed, 5));
+
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            92,
+            ListStatus::Completed,
+            10,
+            Some((ListStatus::Watching, 10)),
+        );
+        store
+            .reconcile_pull(&[remote(92, ListStatus::Completed, 3)], 800)
+            .unwrap();
+        assert_eq!(state(&store, 92).1, 3, "remote correction landed");
+        assert!(
+            store.list_dirty_for_sync().unwrap().is_empty(),
+            "nothing queued to push the stale value back"
+        );
+    }
+
+    #[test]
+    fn a_settled_completed_row_still_takes_a_downward_correction() {
+        // The ticket's headline case on a completed show: nothing local moved,
+        // so the remote correction is the only edit in play and it lands. Any
+        // status special-case here reverts it silently, with conflict false,
+        // and pushes the stale value back.
+        let r = reconcile(
+            Some((ListStatus::Completed, 24)),
+            (ListStatus::Completed, 24),
+            (ListStatus::Completed, 12),
+        );
+        assert_eq!((r.status, r.progress), (ListStatus::Completed, 12));
+
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            93,
+            ListStatus::Completed,
+            24,
+            Some((ListStatus::Completed, 24)),
+        );
+        store
+            .reconcile_pull(&[remote(93, ListStatus::Completed, 12)], 700)
+            .unwrap();
+        assert_eq!(state(&store, 93).1, 12, "correction landed");
+        assert!(
+            store.list_dirty_for_sync().unwrap().is_empty(),
+            "nothing queued to push the stale value back"
+        );
+    }
+
+    #[test]
+    fn completing_locally_does_not_make_local_progress_authoritative() {
+        // A local status move to completed must NOT override the progress half.
+        // The user pressed `c` on the device and lowered progress on the server;
+        // both edits survive, and the resulting pair is legal on AniList. Every
+        // status special-case tried here reduced to overriding this one cell.
+        let r = reconcile(
+            Some((ListStatus::Watching, 24)),
+            (ListStatus::Completed, 24),
+            (ListStatus::Watching, 4),
+        );
+        assert_eq!((r.status, r.progress), (ListStatus::Completed, 4));
+
+        // The same shape under any other status always behaved this way. The
+        // point of the assertion above is that completed is not special.
+        let r = reconcile(
+            Some((ListStatus::Planning, 24)),
+            (ListStatus::Watching, 24),
+            (ListStatus::Planning, 4),
+        );
+        assert_eq!((r.status, r.progress), (ListStatus::Watching, 4));
+
+        // 06 §5.4 promises the local status edit still reaches the server. It
+        // survives the merge and leaves the row dirty, so the push carries it.
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            91,
+            ListStatus::Completed,
+            24,
+            Some((ListStatus::Watching, 24)),
+        );
+        store
+            .reconcile_pull(&[remote(91, ListStatus::Watching, 4)], 900)
+            .unwrap();
+        assert_eq!(
+            state(&store, 91),
+            (
+                ListStatus::Completed,
+                4,
+                Some(ListStatus::Watching),
+                Some(4)
+            )
+        );
+        let dirty = store.list_dirty_for_sync().unwrap();
+        assert_eq!(
+            dirty
+                .iter()
+                .find(|r| r.anilist_id == 91)
+                .map(|r| (r.list_status, r.progress)),
+            Some((ListStatus::Completed, 4)),
+            "the local completion pushes, carrying the corrected progress"
+        );
+    }
+
+    #[test]
+    fn a_settled_completed_row_is_not_touched_by_a_pull() {
+        // The merge must never reach for the episode total. A settled row where
+        // all three agree comes out untouched whatever its total says; snapping
+        // to the total minted watch data, pushed it, and re-minted it next run.
+        let store = Store::open_memory().unwrap();
+        // sample() carries total_episodes = 12; the row sits at 10.
+        lib_row(
+            &store,
+            94,
+            ListStatus::Completed,
+            10,
+            Some((ListStatus::Completed, 10)),
+        );
+        let out = store
+            .reconcile_pull(&[remote(94, ListStatus::Completed, 10)], 500)
+            .unwrap();
+        assert_eq!(out, PullOutcome::default(), "a settled row is not touched");
+        assert_eq!(
+            state(&store, 94),
+            (
+                ListStatus::Completed,
+                10,
+                Some(ListStatus::Completed),
+                Some(10)
+            )
+        );
+        assert!(
+            store.list_dirty_for_sync().unwrap().is_empty(),
+            "nothing fabricated, so nothing to push back"
+        );
+        // Completed is not a licence to ignore the remote either: a genuine
+        // remote-only advance still lands.
+        store
+            .reconcile_pull(&[remote(94, ListStatus::Completed, 11)], 600)
+            .unwrap();
+        assert_eq!(state(&store, 94).1, 11);
+    }
+
+    #[test]
+    fn a_downward_pull_keeps_a_live_resume_point() {
+        // The stamp retires partials the frontier has passed. A correction moves
+        // the frontier BEHIND the partial, so it must not stamp: the user is
+        // mid-episode and the marker is what gets them back there.
+        let store = Store::open_memory().unwrap();
+        lib_row(
+            &store,
+            96,
+            ListStatus::Watching,
+            4,
+            Some((ListStatus::Watching, 4)),
+        );
+        store
+            .save_progress(96, Translation::Sub, "5", 600.0, 1400.0, None, 150)
+            .unwrap();
+        assert!(
+            store.latest_resume(96, Translation::Sub).unwrap().is_some(),
+            "partial is live before the pull"
+        );
+        store
+            .reconcile_pull(&[remote(96, ListStatus::Watching, 3)], 200)
+            .unwrap();
+        assert_eq!(state(&store, 96).1, 3, "correction landed");
+        assert!(
+            store.latest_resume(96, Translation::Sub).unwrap().is_some(),
+            "a downward frontier must not retire the partial ahead of it"
+        );
+        // A rise past the partial still retires it: the stamp keeps its meaning.
+        store
+            .reconcile_pull(&[remote(96, ListStatus::Watching, 9)], 300)
+            .unwrap();
+        assert!(store.latest_resume(96, Translation::Sub).unwrap().is_none());
+    }
+
+    #[test]
+    fn duplicate_remote_entries_collapse_to_the_freshest_not_the_largest() {
+        // AniList emits one entry per custom list a show is tagged in. Collapsing
+        // by magnitude pins the stale copy and silently defeats every correction,
+        // which is the smaller number by definition.
+        let corrected = remote_at(95, ListStatus::Watching, 4, 900);
+        let stale_duplicate = remote_at(95, ListStatus::Watching, 14, 100);
+        // Order-independent: the fold compares stamps, not arrival.
+        for payload in [
+            vec![corrected.clone(), stale_duplicate.clone()],
+            vec![stale_duplicate, corrected],
+        ] {
+            let store = Store::open_memory().unwrap();
+            lib_row(
+                &store,
+                95,
+                ListStatus::Watching,
+                14,
+                Some((ListStatus::Watching, 14)),
+            );
+            let out = store.reconcile_pull(&payload, 0).unwrap();
+            assert_eq!(out.reconciled, 1);
+            assert_eq!(state(&store, 95).1, 4);
+            assert!(store.list_dirty_for_sync().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -3733,6 +4051,7 @@ mod tests {
         // that as no title, not a present one (chaos pass).
         let store = Store::open_memory().unwrap();
         let entry = RemoteEntry {
+            updated_at: 0,
             anilist_id: 706,
             status: ListStatus::Watching,
             progress: 1,
@@ -3767,7 +4086,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_collapses_duplicate_remote_ids_keeping_max_progress() {
+    fn pull_collapses_duplicate_remote_ids_keeping_the_freshest() {
         let store = Store::open_memory().unwrap();
         lib_row(
             &store,
@@ -3776,18 +4095,52 @@ mod tests {
             0,
             Some((ListStatus::Watching, 0)),
         );
-        // Same id twice (custom-list duplication); the higher progress wins.
+        // Same id twice (custom-list duplication); the later edit wins.
         let out = store
             .reconcile_pull(
                 &[
-                    remote(5, ListStatus::Watching, 2),
-                    remote(5, ListStatus::Watching, 7),
+                    remote_at(5, ListStatus::Watching, 2, 100),
+                    remote_at(5, ListStatus::Watching, 7, 200),
                 ],
                 0,
             )
             .unwrap();
         assert_eq!(out.reconciled, 1);
         assert_eq!(state(&store, 5).1, 7);
+    }
+
+    #[test]
+    fn equally_stamped_duplicates_collapse_order_independently() {
+        // One edit fanning across custom lists stamps every copy alike, and a
+        // library old enough predates updatedAt entirely (null maps to 0). With
+        // no recency to separate them the fold must still not depend on the
+        // order the wire listed the groups in.
+        for stamp in [500, 0] {
+            for pair in [(2u32, 7u32), (7, 2)] {
+                let store = Store::open_memory().unwrap();
+                lib_row(
+                    &store,
+                    6,
+                    ListStatus::Watching,
+                    0,
+                    Some((ListStatus::Watching, 0)),
+                );
+                store
+                    .reconcile_pull(
+                        &[
+                            remote_at(6, ListStatus::Watching, pair.0, stamp),
+                            remote_at(6, ListStatus::Watching, pair.1, stamp),
+                        ],
+                        0,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    state(&store, 6).1,
+                    7,
+                    "stamp {stamp}, wire order {pair:?}: tie breaks on progress, not arrival"
+                );
+            }
+        }
     }
 
     #[test]

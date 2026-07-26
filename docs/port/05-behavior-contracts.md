@@ -336,8 +336,14 @@ History auto-open target). Round-1 review: previously uncited.
 | Completed show defaults cursor to episode one | `history detail completed show defaults cursor to episode one` |
 
 **ROD-477 sharpening (sabigoku law, no zigoku cite exists):** the resume
-position is the freshest partial watched **since the frontier last moved**, from
-any writer (play ratchet, recompute, AniList adoption, import). zigoku's
+position is the freshest partial watched **since the frontier last rose**, from
+any writer (play ratchet, recompute, AniList adoption, import). The stamp means
+"the frontier moved **past** this partial, so it is dead"; only a rise can do
+that, so only a rise stamps. A sync correction that lowers progress (06 §5.4)
+moves the frontier *behind* the partial, which cannot retire it: the user is
+mid-episode and the marker is what returns them there (ROD-497). `recompute` is
+the deliberate exception and stamps in either direction, because resetting
+progress from local rows is a request to discard the markers too. zigoku's
 frontier-anchored `resumeSeed` could not represent a partial behind the
 high-water, so the freeze has no test for it; the recency-anchored store must
 enforce it explicitly (`show.progress_stamped_at`, 02 §4b). A partial written
