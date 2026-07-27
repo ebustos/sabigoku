@@ -27,6 +27,10 @@ const SOURCE_UNBOUND: &str = "unbound";
 /// Consent-line read cap; a real answer is a few bytes.
 const ANSWER_CAP: u64 = 256;
 
+/// Reprompt ceiling, same rationale as main's pick loop: a human never
+/// fumbles y/n this often, a stdin flood must not spin forever.
+const MAX_ANSWER_ATTEMPTS: usize = 1000;
+
 /// Startup gate: silent return unless a zigoku db exists, the offer is still
 /// open, and both stdio ends are a terminal (a piped launch must not hang on
 /// the prompt). A store that won't open is the TUI's failure to report.
@@ -76,9 +80,13 @@ fn run(store: &Store, zig_db: &Path) {
     println!("sabigoku can bring over your shows, watch states, and resume points.");
     println!("This is a one-time offer; decline and we won't ask again.");
     println!();
-    print!("bring it over? [y/N] ");
+    print!("bring it over? [y/n] ");
     flush_stdout();
-    if !accepted(&read_answer(&mut std::io::stdin().lock())) {
+    let Some(yes) = read_consent(&mut std::io::stdin().lock()) else {
+        // Stream ended without an answer; the offer stays open.
+        return;
+    };
+    if !yes {
         return finish(store, outcome(None, 0));
     }
 
@@ -187,14 +195,34 @@ fn zigoku_db_path(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     Some(dir.join("zigoku.db"))
 }
 
-fn read_answer(input: &mut impl BufRead) -> String {
-    let mut line = String::new();
-    let _ = input.take(ANSWER_CAP).read_line(&mut line);
-    line
+/// Explicit consent, no default: anything but y/yes or n/no re-asks, so an
+/// accidental Enter cannot answer a prompt that writes to the library.
+/// None = EOF, flood, or attempts exhausted without an answer.
+fn read_consent(input: &mut impl BufRead) -> Option<bool> {
+    for _ in 0..MAX_ANSWER_ATTEMPTS {
+        let mut line = String::new();
+        match (&mut *input).take(ANSWER_CAP).read_line(&mut line) {
+            Ok(0) => return None,
+            Ok(n) if n as u64 == ANSWER_CAP && !line.ends_with('\n') => return None,
+            Ok(_) => match answer(&line) {
+                Some(v) => return Some(v),
+                None => {
+                    print!("  y or n: ");
+                    flush_stdout();
+                }
+            },
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
-fn accepted(line: &str) -> bool {
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+fn answer(line: &str) -> Option<bool> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 /// One zigoku `anime` row carrying user state (canonical_id present).
@@ -892,12 +920,28 @@ mod tests {
     }
 
     #[test]
-    fn consent_accepts_y_and_yes_only() {
+    fn consent_requires_an_explicit_y_or_n() {
         for yes in ["y\n", "Y\n", "yes\n", "  YES  \n"] {
-            assert!(accepted(yes), "{yes:?}");
+            assert_eq!(answer(yes), Some(true), "{yes:?}");
         }
-        for no in ["\n", "n\n", "no\n", "yeah\n", "", "y u askin\n"] {
-            assert!(!accepted(no), "{no:?}");
+        for no in ["n\n", "N\n", "no\n", "  NO  \n"] {
+            assert_eq!(answer(no), Some(false), "{no:?}");
         }
+        for neither in ["\n", "yeah\n", "", "y u askin\n", "ny\n"] {
+            assert_eq!(answer(neither), None, "{neither:?}");
+        }
+    }
+
+    #[test]
+    fn consent_reprompts_past_blanks_and_none_on_eof() {
+        let mut input = std::io::Cursor::new(&b"\nmaybe\nY\n"[..]);
+        assert_eq!(read_consent(&mut input), Some(true));
+        let mut input = std::io::Cursor::new(&b"\n\nn\n"[..]);
+        assert_eq!(read_consent(&mut input), Some(false));
+        // An accidental Enter alone never answers: EOF leaves it open.
+        let mut input = std::io::Cursor::new(&b"\n"[..]);
+        assert_eq!(read_consent(&mut input), None);
+        let mut input = std::io::Cursor::new(&b""[..]);
+        assert_eq!(read_consent(&mut input), None);
     }
 }
