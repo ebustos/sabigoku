@@ -634,6 +634,8 @@ fn run_tui(debug: bool) -> ExitCode {
         }
     };
 
+    sabigoku::zimport::maybe_run(&paths);
+
     if let Err(e) = sabigoku::tui::run(&paths, &config) {
         eprintln!("sabigoku: {e}");
         return ExitCode::FAILURE;

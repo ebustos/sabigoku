@@ -27,5 +27,6 @@ pub(crate) mod testutil;
 pub mod tui;
 pub mod update;
 pub mod updatecheck;
+pub mod zimport;
 
 pub use error::Error;
