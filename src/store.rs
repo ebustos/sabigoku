@@ -1882,8 +1882,12 @@ impl Store {
                 )?;
             }
             for (provider, provider_id) in &show.bindings {
-                // OR IGNORE also covers UNIQUE(provider, provider_id): a pair
-                // already bound to another show stays where it is.
+                // OR IGNORE covers both constraints: UNIQUE(provider,
+                // provider_id) keeps a pair already bound to another show
+                // where it is, and the (anilist_id, provider) PK no-ops a
+                // corrupt source with two siblings on one provider.
+                // bound_at inherits the historic added_at on purpose: the
+                // bind predates sabigoku, and no consumer needs a fresh clock.
                 tx.execute(
                     "INSERT OR IGNORE INTO provider_binding
                         (anilist_id, provider, provider_id, bound_at)
@@ -4751,6 +4755,8 @@ mod tests {
         assert_eq!(show.enrichment.title_romaji, "Real Title");
         assert_eq!(show.list_status, ListStatus::Watching);
         assert_eq!(show.library_added_at, Some(111));
+        assert_eq!(show.synced_status, None);
+        assert_eq!(show.synced_progress, None);
         // The pre-existing resume row wins over the imported one.
         let resume = store.get_resume(7, Translation::Sub, "3").unwrap().unwrap();
         assert_eq!(resume.position_secs, 500.0);

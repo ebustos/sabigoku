@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags};
 
 use crate::domain::{self, Enrichment, ListStatus, Translation};
+use crate::error::Error;
 use crate::paths::Paths;
-use crate::store::{LegacyEpisode, LegacyShow, Store};
+use crate::store::{LegacyEpisode, LegacyImportCounts, LegacyShow, Store};
 
 const PROMPT_FLAG: &str = "zigoku_import_prompted";
 
@@ -57,17 +58,18 @@ fn run(store: &Store, zig_db: &Path) {
         Ok(v) => v,
         Err(e) => return print_unreadable(&e),
     };
-    if version != ZIGOKU_SCHEMA_VERSION {
-        println!("  ✗ this zigoku library is older than sabigoku can import.");
-        println!("  update zigoku and run it once, then relaunch sabigoku to try again.");
-        return;
-    }
     let total: i64 = match zig.query_row("SELECT COUNT(*) FROM anime", [], |r| r.get(0)) {
         Ok(n) => n,
         Err(e) => return print_unreadable(&e),
     };
-    if total == 0 {
-        return;
+    match gate(version, total) {
+        Gate::Outdated => {
+            println!("  ✗ this zigoku library is older than sabigoku can import.");
+            println!("  update zigoku and run it once, then relaunch sabigoku to try again.");
+            return;
+        }
+        Gate::Empty => return,
+        Gate::Offer => {}
     }
 
     println!("Found an existing zigoku library.");
@@ -77,9 +79,7 @@ fn run(store: &Store, zig_db: &Path) {
     print!("bring it over? [y/N] ");
     flush_stdout();
     if !accepted(&read_answer(&mut std::io::stdin().lock())) {
-        println!("  import skipped; won't ask again.");
-        let _ = store.meta_set(PROMPT_FLAG, "1");
-        return;
+        return finish(store, outcome(None, 0));
     }
 
     println!("  importing your zigoku library…");
@@ -88,33 +88,79 @@ fn run(store: &Store, zig_db: &Path) {
         Ok(out) => out,
         Err(e) => return print_unreadable(&e),
     };
-    match store.import_legacy(&shows) {
+    finish(store, outcome(Some(store.import_legacy(&shows)), unmatched));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    Offer,
+    Outdated,
+    Empty,
+}
+
+/// Exact-version gate: 18 is the frozen final, older never ran the last
+/// zigoku binary, newer cannot exist. An empty library gets no offer (and no
+/// burned flag: rows may yet appear, zigoku still runs).
+fn gate(version: i64, total: i64) -> Gate {
+    if version != ZIGOKU_SCHEMA_VERSION {
+        Gate::Outdated
+    } else if total == 0 {
+        Gate::Empty
+    } else {
+        Gate::Offer
+    }
+}
+
+/// Lines for an answered prompt (`None` = declined) plus whether the
+/// one-time offer burns. Decline and a successful import burn it; a failed
+/// write leaves it open to retry next launch. Zero counts hide their lines.
+fn outcome(
+    import: Option<Result<LegacyImportCounts, Error>>,
+    unmatched: i64,
+) -> (Vec<String>, bool) {
+    let Some(result) = import else {
+        return (vec!["  import skipped; won't ask again.".into()], true);
+    };
+    match result {
         Ok(c) => {
+            let mut lines = Vec::new();
             if c.shows > 0 {
-                println!("  imported {} show(s) from zigoku.", c.shows);
+                lines.push(format!("  imported {} show(s) from zigoku.", c.shows));
             }
             if c.episodes > 0 {
-                println!("  brought over {} resume point(s).", c.episodes);
+                lines.push(format!("  brought over {} resume point(s).", c.episodes));
             }
             if c.shows == 0 {
-                println!("  nothing new to import.");
+                lines.push("  nothing new to import.".into());
             }
             if unmatched > 0 {
-                println!("  ({unmatched} show(s) skipped: no AniList id in zigoku.)");
+                lines.push(format!(
+                    "  ({unmatched} show(s) skipped: no AniList id in zigoku.)"
+                ));
             }
             if c.conflicts > 0 {
-                println!(
+                lines.push(format!(
                     "  ({} show(s) already in sabigoku; left as-is.)",
                     c.conflicts
-                );
+                ));
             }
-            let _ = store.meta_set(PROMPT_FLAG, "1");
+            (lines, true)
         }
-        Err(e) => {
-            println!(
+        Err(e) => (
+            vec![format!(
                 "  ✗ import failed: couldn't update the local library ({e}); nothing was changed."
-            );
-        }
+            )],
+            false,
+        ),
+    }
+}
+
+fn finish(store: &Store, (lines, burn): (Vec<String>, bool)) {
+    for line in &lines {
+        println!("{line}");
+    }
+    if burn {
+        let _ = store.meta_set(PROMPT_FLAG, "1");
     }
 }
 
@@ -283,7 +329,9 @@ fn extract(zig: &Connection) -> rusqlite::Result<(Vec<LegacyShow>, i64)> {
         entry.added_at = entry.added_at.min(row.added_at);
         entry.last_watched_at = entry.last_watched_at.max(row.last_watched_at);
         if row.source != SOURCE_UNBOUND {
-            entry.bindings.push((row.source, row.source_id));
+            entry
+                .bindings
+                .push((scrub(row.source), scrub(row.source_id)));
         }
     }
     shows.retain(|id, _| visible.contains(id));
@@ -327,7 +375,7 @@ fn extract(zig: &Connection) -> rusqlite::Result<(Vec<LegacyShow>, i64)> {
             duration_secs,
             fully_watched: watched,
             updated_at,
-            last_provider: (source != SOURCE_UNBOUND).then_some(source),
+            last_provider: (source != SOURCE_UNBOUND).then(|| scrub(source)),
         };
         let key = (canonical_id, translation, ep.episode.clone());
         match episodes.entry(key) {
@@ -352,7 +400,7 @@ fn extract(zig: &Connection) -> rusqlite::Result<(Vec<LegacyShow>, i64)> {
     for row in rows {
         let (canonical_id, provider) = row?;
         if let Some(show) = shows.get_mut(&canonical_id) {
-            show.pin = Some(provider);
+            show.pin = Some(scrub(provider));
         }
     }
 
@@ -645,8 +693,8 @@ mod tests {
         add_canonical(&zig, 200, None);
         add_show(
             &zig,
-            "senshi",
-            "88",
+            "sen\u{200B}shi",
+            "8\u{7}8",
             Some(200),
             "Fallback\u{202E} Title",
             "watching",
@@ -657,13 +705,34 @@ mod tests {
             None,
             Some("no\u{200B}te"),
         );
-        add_ep(&zig, "senshi", "88", "sub", "1\u{FEFF}", 10.0, 1);
+        add_ep(
+            &zig,
+            "sen\u{200B}shi",
+            "8\u{7}8",
+            "sub",
+            "1\u{FEFF}",
+            10.0,
+            1,
+        );
+        zig.execute(
+            "INSERT INTO provider_pins (canonical_id, provider) VALUES (200, 'sen\u{200B}shi')",
+            [],
+        )
+        .unwrap();
 
         let (shows, _) = extract(&zig).unwrap();
         let show = &shows[0];
         assert_eq!(show.enrichment.title_romaji, "Fallback Title");
         assert_eq!(show.notes.as_deref(), Some("note"));
         assert_eq!(show.episodes[0].episode, "1");
+        // Provider-shaped text is render-bound too: bindings, last_provider,
+        // and the pin all scrub like every other zigoku string.
+        assert_eq!(
+            show.bindings,
+            vec![("senshi".to_string(), "88".to_string())]
+        );
+        assert_eq!(show.episodes[0].last_provider.as_deref(), Some("senshi"));
+        assert_eq!(show.pin.as_deref(), Some("senshi"));
     }
 
     #[test]
@@ -765,6 +834,61 @@ mod tests {
             Some(PathBuf::from("/h/.local/share/zigoku/zigoku.db"))
         );
         assert_eq!(with(&[]), None);
+    }
+
+    #[test]
+    fn gate_is_exact_version_and_empty_aware() {
+        assert_eq!(gate(17, 5), Gate::Outdated);
+        assert_eq!(gate(19, 5), Gate::Outdated);
+        assert_eq!(gate(18, 0), Gate::Empty);
+        assert_eq!(gate(18, 1), Gate::Offer);
+    }
+
+    #[test]
+    fn outcome_burns_the_flag_on_answers_never_on_failure() {
+        let (lines, burn) = outcome(None, 9);
+        assert!(burn);
+        assert_eq!(
+            lines,
+            vec!["  import skipped; won't ask again.".to_string()]
+        );
+
+        let counts = LegacyImportCounts {
+            shows: 2,
+            episodes: 3,
+            conflicts: 1,
+        };
+        let (lines, burn) = outcome(Some(Ok(counts)), 4);
+        assert!(burn);
+        assert_eq!(
+            lines,
+            vec![
+                "  imported 2 show(s) from zigoku.".to_string(),
+                "  brought over 3 resume point(s).".to_string(),
+                "  (4 show(s) skipped: no AniList id in zigoku.)".to_string(),
+                "  (1 show(s) already in sabigoku; left as-is.)".to_string(),
+            ]
+        );
+
+        // All-conflicts: zero counts hide their lines, the lead stays truthful.
+        let all_conflicts = LegacyImportCounts {
+            shows: 0,
+            episodes: 0,
+            conflicts: 5,
+        };
+        let (lines, burn) = outcome(Some(Ok(all_conflicts)), 0);
+        assert!(burn);
+        assert_eq!(
+            lines,
+            vec![
+                "  nothing new to import.".to_string(),
+                "  (5 show(s) already in sabigoku; left as-is.)".to_string(),
+            ]
+        );
+
+        let (lines, burn) = outcome(Some(Err(Error::from(rusqlite::Error::InvalidQuery))), 0);
+        assert!(!burn);
+        assert!(lines[0].starts_with("  ✗ import failed"));
     }
 
     #[test]
