@@ -1762,6 +1762,152 @@ impl Store {
     }
 }
 
+/// One zigoku show pre-mapped to sabigoku shape (ROD-507). The caller owns
+/// identity mapping and text scrubbing; this layer only lands rows.
+#[derive(Debug, Clone, Default)]
+pub struct LegacyShow {
+    pub enrichment: Enrichment,
+    pub list_status: ListStatus,
+    pub user_rating: Option<f64>,
+    pub notes: Option<String>,
+    pub play_count: u32,
+    pub progress: u32,
+    pub added_at: i64,
+    pub last_watched_at: Option<i64>,
+    pub episodes: Vec<LegacyEpisode>,
+    /// (provider, provider_id) pairs.
+    pub bindings: Vec<(String, String)>,
+    pub pin: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LegacyEpisode {
+    pub translation: Translation,
+    pub episode: String,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub fully_watched: bool,
+    pub updated_at: i64,
+    pub last_provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyImportCounts {
+    pub shows: usize,
+    pub episodes: usize,
+    pub conflicts: usize,
+}
+
+impl Store {
+    /// Land pre-mapped zigoku rows where absent, one transaction (ROD-507).
+    /// A show already in the library is skipped whole: state, episodes,
+    /// bindings, pin; never a half-import. An identity-only row gains user
+    /// state and membership but keeps its enrichment; the incoming one is a
+    /// display seed, never fresher. Minted rows leave enrichment_fetched_at
+    /// NULL so refresh-on-view re-enriches (zigoku's genres/studios encoding
+    /// differs; they arrive then). Existing episode rows win over incoming.
+    pub fn import_legacy(&self, shows: &[LegacyShow]) -> Result<LegacyImportCounts, Error> {
+        let tx = immediate_tx(&self.conn)?;
+        let mut out = LegacyImportCounts::default();
+        for show in shows {
+            let in_library: Option<bool> = tx
+                .query_row(
+                    "SELECT library_added_at IS NOT NULL FROM show WHERE anilist_id = ?1",
+                    [show.enrichment.anilist_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let status = show.list_status.as_str();
+            match in_library {
+                Some(true) => {
+                    out.conflicts += 1;
+                    continue;
+                }
+                Some(false) => {
+                    tx.execute(
+                        "UPDATE show SET
+                            list_status = :list_status, user_rating = :user_rating,
+                            notes = :notes, play_count = :play_count,
+                            progress = :progress, library_added_at = :added_at,
+                            last_watched_at = :last_watched_at
+                         WHERE anilist_id = :anilist_id",
+                        named_params! {
+                            ":anilist_id": show.enrichment.anilist_id,
+                            ":list_status": status,
+                            ":user_rating": show.user_rating,
+                            ":notes": show.notes,
+                            ":play_count": show.play_count,
+                            ":progress": show.progress,
+                            ":added_at": show.added_at,
+                            ":last_watched_at": show.last_watched_at,
+                        },
+                    )?;
+                }
+                None => {
+                    let bind = EnrichBind::new(&show.enrichment);
+                    let mut params = enrich_params(&show.enrichment, &bind);
+                    params.push((":list_status", &status));
+                    params.push((":user_rating", &show.user_rating));
+                    params.push((":notes", &show.notes));
+                    params.push((":play_count", &show.play_count));
+                    params.push((":progress", &show.progress));
+                    params.push((":added_at", &show.added_at));
+                    params.push((":last_watched_at", &show.last_watched_at));
+                    let sql = format!(
+                        "INSERT INTO show ({ENRICH_COLS}, list_status, user_rating, notes,
+                            play_count, progress, library_added_at, last_watched_at)
+                         VALUES ({ENRICH_VALS}, :list_status, :user_rating, :notes,
+                            :play_count, :progress, :added_at, :last_watched_at)"
+                    );
+                    tx.execute(&sql, params.as_slice())?;
+                }
+            }
+            out.shows += 1;
+            for ep in &show.episodes {
+                out.episodes += tx.execute(
+                    "INSERT OR IGNORE INTO episode_progress
+                        (anilist_id, translation, episode, position_secs,
+                         duration_secs, fully_watched, updated_at, last_provider)
+                     VALUES (:id, :tt, :episode, :pos, :dur, :watched, :at, :last_provider)",
+                    named_params! {
+                        ":id": show.enrichment.anilist_id,
+                        ":tt": ep.translation.as_str(),
+                        ":episode": ep.episode,
+                        ":pos": ep.position_secs,
+                        ":dur": ep.duration_secs,
+                        ":watched": ep.fully_watched,
+                        ":at": ep.updated_at,
+                        ":last_provider": ep.last_provider,
+                    },
+                )?;
+            }
+            for (provider, provider_id) in &show.bindings {
+                // OR IGNORE also covers UNIQUE(provider, provider_id): a pair
+                // already bound to another show stays where it is.
+                tx.execute(
+                    "INSERT OR IGNORE INTO provider_binding
+                        (anilist_id, provider, provider_id, bound_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    (
+                        show.enrichment.anilist_id,
+                        provider,
+                        provider_id,
+                        show.added_at,
+                    ),
+                )?;
+            }
+            if let Some(pin) = &show.pin {
+                tx.execute(
+                    "INSERT OR IGNORE INTO provider_pin (anilist_id, provider) VALUES (?1, ?2)",
+                    (show.enrichment.anilist_id, pin),
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+}
+
 /// One planned reconcile write. `guard` is the pre-merge local pair the CAS
 /// UPDATE is conditioned on.
 struct PlanRow {
@@ -4477,5 +4623,136 @@ mod tests {
             ENRICH_TTL_DEFAULT_SECS
         );
         assert_eq!(enrichment_ttl_secs(None), ENRICH_TTL_DEFAULT_SECS);
+    }
+
+    fn legacy_show(id: i64) -> LegacyShow {
+        LegacyShow {
+            enrichment: sample(id),
+            list_status: ListStatus::Watching,
+            user_rating: Some(8.5),
+            notes: Some("keeper".into()),
+            play_count: 3,
+            progress: 5,
+            added_at: 111,
+            last_watched_at: Some(222),
+            episodes: vec![LegacyEpisode {
+                translation: Translation::Sub,
+                episode: "3".into(),
+                position_secs: 431.0,
+                duration_secs: 1440.0,
+                fully_watched: false,
+                updated_at: 200,
+                last_provider: Some("senshi".into()),
+            }],
+            bindings: vec![("senshi".into(), "77".into())],
+            pin: Some("senshi".into()),
+        }
+    }
+
+    #[test]
+    fn legacy_import_mints_membership_state_and_children() {
+        let store = Store::open_memory().unwrap();
+        let counts = store.import_legacy(&[legacy_show(7)]).unwrap();
+        assert_eq!(
+            counts,
+            LegacyImportCounts {
+                shows: 1,
+                episodes: 1,
+                conflicts: 0
+            }
+        );
+        let show = store.get_show(7).unwrap().unwrap();
+        assert_eq!(show.list_status, ListStatus::Watching);
+        assert_eq!(show.progress, 5);
+        assert_eq!(show.play_count, 3);
+        assert_eq!(show.library_added_at, Some(111));
+        assert_eq!(show.last_watched_at, Some(222));
+        assert_eq!(show.synced_status, None);
+        // NULL stamp: the seed re-enriches on view, healing what zigoku
+        // couldn't carry (genres/studios encoding).
+        assert_eq!(show.enrichment_fetched_at, None);
+        assert!(store.enrichment_stale(7, 0).unwrap());
+        let resume = store.get_resume(7, Translation::Sub, "3").unwrap().unwrap();
+        assert_eq!(resume.position_secs, 431.0);
+        let bindings = store.bindings_for(7).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].provider, "senshi");
+        assert_eq!(bindings[0].provider_id, "77");
+        assert_eq!(
+            store.get_provider_pin(7).unwrap().as_deref(),
+            Some("senshi")
+        );
+    }
+
+    #[test]
+    fn legacy_import_skips_a_library_show_whole() {
+        let store = Store::open_memory().unwrap();
+        store.import_legacy(&[legacy_show(7)]).unwrap();
+        let mut again = legacy_show(7);
+        again.progress = 9;
+        again.list_status = ListStatus::Dropped;
+        again.episodes[0].position_secs = 999.0;
+        again.episodes.push(LegacyEpisode {
+            translation: Translation::Sub,
+            episode: "4".into(),
+            position_secs: 10.0,
+            duration_secs: 1440.0,
+            fully_watched: false,
+            updated_at: 300,
+            last_provider: None,
+        });
+        let counts = store.import_legacy(&[again]).unwrap();
+        assert_eq!(
+            counts,
+            LegacyImportCounts {
+                shows: 0,
+                episodes: 0,
+                conflicts: 1
+            }
+        );
+        let show = store.get_show(7).unwrap().unwrap();
+        assert_eq!(show.list_status, ListStatus::Watching);
+        assert_eq!(show.progress, 5);
+        let resume = store.get_resume(7, Translation::Sub, "3").unwrap().unwrap();
+        assert_eq!(resume.position_secs, 431.0);
+        // The whole show skipped means its fresh episode never landed either.
+        assert_eq!(store.get_resume(7, Translation::Sub, "4").unwrap(), None);
+    }
+
+    #[test]
+    fn legacy_import_promotes_identity_row_keeping_its_enrichment() {
+        let store = Store::open_memory().unwrap();
+        let mut real = sample(7);
+        real.title_romaji = "Real Title".into();
+        store.bind_provider(&real, "megaplay", "m1", 50).unwrap();
+        store
+            .save_progress(
+                7,
+                Translation::Sub,
+                "3",
+                500.0,
+                1440.0,
+                Some("megaplay"),
+                60,
+            )
+            .unwrap();
+        let mut incoming = legacy_show(7);
+        incoming.enrichment.title_romaji = "Zigoku Seed".into();
+        let counts = store.import_legacy(&[incoming]).unwrap();
+        assert_eq!(
+            counts,
+            LegacyImportCounts {
+                shows: 1,
+                episodes: 0,
+                conflicts: 0
+            }
+        );
+        let show = store.get_show(7).unwrap().unwrap();
+        assert_eq!(show.enrichment.title_romaji, "Real Title");
+        assert_eq!(show.list_status, ListStatus::Watching);
+        assert_eq!(show.library_added_at, Some(111));
+        // The pre-existing resume row wins over the imported one.
+        let resume = store.get_resume(7, Translation::Sub, "3").unwrap().unwrap();
+        assert_eq!(resume.position_secs, 500.0);
     }
 }
