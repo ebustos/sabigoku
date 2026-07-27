@@ -34,7 +34,7 @@ play episodes in `mpv`, with real cover art and AniList sync.
 ![Demo: live watchlist cover art, filtered down to a title's detail](https://raw.githubusercontent.com/vantroy/sabigoku/master/docs/media/demo.gif)
 
 *Hero: real cover art, painted straight to the framebuffer via the Kitty
-graphics protocol. No halfblocks, no ASCII. The watchlist's cover repaints on
+graphics protocol, no halfblocks or ASCII. The watchlist's cover repaints on
 every selection, a filter narrows the list to one title, and its detail rests
 on cover, kanji chips, and synopsis.*
 
@@ -49,8 +49,8 @@ from the AniList rankings.*
 
 ![Discover detail: cover, kanji chips, score, synopsis, and episode grid](https://raw.githubusercontent.com/vantroy/sabigoku/master/docs/media/detail-cover.png)
 
-*Discover detail: one result opened. Real cover art, kanji metadata chips,
-AniList score, synopsis, and the episode grid, in a single pane.*
+*Discover detail: one result opened, with real cover art, kanji metadata
+chips, AniList score, synopsis, and the episode grid in a single pane.*
 
 ---
 
@@ -76,49 +76,37 @@ already applied app-wide.*
 ## What it does today
 
 - **Full TUI** (ratatui): two-pane shell with live catalogue search, a detail
-  pane (kanji metadata chips, synopsis, episode grid with resume `▸` and
-  watched markers), grouped watchlist, ranked Discover feed, toasts, and a
-  status bar that always shows the keys that work right now.
+  pane, grouped watchlist, ranked Discover feed, toasts, and a status bar that
+  always shows the keys that work right now.
 - **Watchlist & watch-state**: planning / watching / paused / dropped /
-  completed, grouped headers, live filtering. Add from Browse or Discover with
-  `P`; move state with `w`/`p`/`c`/`x`; recompute progress with `r`; undo with
-  `u`; hard-delete with `X` then `y`. The list refreshes in-session after
+  completed, with live filtering; the list refreshes automatically after
   playback.
 - **Discover**: an AniList-backed ranked feed across `Trending` / `Popular` /
-  `Top Rated` / `This Season`, with real cover art, score badges, and airing
-  chips; save a pick straight to the watchlist.
-- **Cover art** as real pixels in terminals that answer the graphics capability
-  query (kitty, ghostty, WezTerm, iTerm2), halfblock cells everywhere else;
-  fetched asynchronously behind a disk cache.
-- **Search → resolve → play**: catalogue search and metadata come from AniList;
-  picking a result resolves it to a streaming source, lists episodes, and plays
-  in `mpv`.
-- **Multiple streaming sources, with automatic fallback**: if an episode fails
-  to load from one source, the next is tried automatically. A source-order
-  preference in Settings controls which is tried first, a per-show pin locks a
-  title to one source, and `v` flips a show to another on demand. The detail
-  view shows which source is serving the current show and which others have it.
-- **History & exact resume** (SQLite): watch history and resume positions via
-  mpv's IPC socket, checkpointed during playback and persisted on quit, plus a
-  status-aware episode-list cache.
-- **AniList account sync**: connect from Settings or `sabigoku login`, and the
-  watchlist syncs both ways in the background. Your existing AniList list is
-  imported on connect, progress logged locally pushes up, changes made on
-  AniList pull down. A toggle in Settings keeps the list local instead.
-- **Config & settings**: a live-editable Settings tab (mpv path, quality,
-  language, skip mode, cover art, palettes), persisted to
-  `~/.config/sabigoku/config.toml`. Four palettes: `terminal_ghost` (default),
+  `Top Rated` / `This Season`, with real cover art and score badges.
+- **Cover art**: real pixels in terminals that support the graphics protocol
+  (kitty, ghostty, WezTerm, iTerm2), halfblock cells elsewhere.
+- **Search → resolve → play**: catalogue search and metadata come from
+  AniList; a result resolves to a streaming source and plays in `mpv`.
+- **Multiple streaming sources, with automatic fallback**: if one source
+  fails, the next is tried automatically, with a source-order preference and
+  per-show pins.
+- **History & exact resume** (SQLite): watch history and resume positions,
+  checkpointed during playback.
+- **AniList account sync**: connect from Settings or `sabigoku login`; the
+  watchlist syncs both ways in the background, or stays local by choice.
+- **Config & settings**: a live-editable Settings tab, persisted to
+  `~/.config/sabigoku/config.toml`. Four palettes: `terminal_ghost`,
   `phosphor`, `nord`, `tokyonight`.
-- **Self-updating**: a boot check toasts when a newer release exists (Settings
-  has the off-switch), and `sabigoku update` upgrades in place.
+- **Self-updating**: a boot check toasts when a newer release exists;
+  `sabigoku update` upgrades in place.
 - **Scriptable CLI**: `sabigoku <query>` runs a search → pick → play flow,
   headless-friendly.
 
 ## Install
 
-**One hard runtime dependency across all install methods: `mpv`.**
-The binary shells out to whatever `mpv` is on your `PATH` to play video.
-Without it, you get a browser. A very nice browser, but still.
+One hard runtime dependency across every install method: `mpv`. The binary
+shells out to whatever `mpv` is on your `PATH` to play video; without it, you
+get a browser.
 
 ### Quick install (Linux & macOS)
 
@@ -126,34 +114,18 @@ Without it, you get a browser. A very nice browser, but still.
 curl -fsSL https://raw.githubusercontent.com/vantroy/sabigoku/master/install.sh | sh
 ```
 
-Detects your OS and architecture, downloads the matching release tarball,
-verifies it against the published `sha256sums.txt`, and installs the `sabigoku`
-binary to `~/.local/bin`. Linux x86_64 and aarch64, macOS Apple Silicon (an
-Intel Mac gets pointed at `cargo install` instead).
-
-Knobs (all optional) go on `sh`, not on `curl`, since that's the process the
-script runs in:
+Detects your OS and architecture, verifies the download against the published
+`sha256sums.txt`, and installs `sabigoku` to `~/.local/bin`. Covers Linux
+x86_64/aarch64 and macOS Apple Silicon; Intel Macs get pointed at
+`cargo install`.
 
 ```sh
-# pin a release instead of taking the latest:
+# pin a release instead of the latest:
 curl -fsSL https://raw.githubusercontent.com/vantroy/sabigoku/master/install.sh | SABIGOKU_VERSION=0.1.1 sh
 
-# install somewhere other than ~/.local/bin (PREFIX is also honored):
+# install somewhere other than ~/.local/bin:
 curl -fsSL https://raw.githubusercontent.com/vantroy/sabigoku/master/install.sh | BINDIR=/usr/local/bin sh
 ```
-
-Piping a script into a shell is trust-on-first-use, so if you'd rather read it
-first, download and run it in two steps:
-
-```sh
-curl -fsSLO https://raw.githubusercontent.com/vantroy/sabigoku/master/install.sh
-less install.sh && sh install.sh
-```
-
-The installer checks the download against the published `sha256sums.txt` before
-it unpacks anything: a mismatch aborts and nothing installs. As with other
-`curl | sh` installers, that verifies integrity in transit, not source
-authenticity, since the checksums ride the same channel as the release.
 
 ### AUR (Arch Linux)
 
@@ -161,10 +133,9 @@ authenticity, since the checksums ride the same channel as the release.
 paru -S sabigoku       # or: yay -S sabigoku
 ```
 
-A from-source package: it compiles the tagged release with cargo and shells out
-to `mpv` at runtime. Prefer to read the
-[`PKGBUILD`](https://github.com/vantroy/sabigoku/blob/master/packaging/aur/PKGBUILD)
-first, or build without a helper?
+Source build: compiles the tagged release with cargo, shells out to `mpv` at
+runtime. Recipe:
+[`PKGBUILD`](https://github.com/vantroy/sabigoku/blob/master/packaging/aur/PKGBUILD).
 
 ```sh
 git clone https://aur.archlinux.org/sabigoku.git
@@ -177,11 +148,9 @@ cd sabigoku && makepkg -si
 brew install vantroy/sabigoku/sabigoku
 ```
 
-The fully-qualified name taps
-[`vantroy/homebrew-sabigoku`](https://github.com/vantroy/homebrew-sabigoku)
-implicitly, no separate `brew tap` needed. You get the prebuilt Apple Silicon
-binary, and Homebrew pulls `mpv` as a dependency. Upgrades ride `brew upgrade`.
-The formula is arm64-only; an Intel Mac builds from source via `cargo install`.
+Taps [`vantroy/homebrew-sabigoku`](https://github.com/vantroy/homebrew-sabigoku)
+automatically. Installs the prebuilt Apple Silicon binary and pulls `mpv` as a
+dependency; upgrades via `brew upgrade`. Intel Macs: `cargo install` instead.
 
 ### crates.io
 
@@ -189,14 +158,13 @@ The formula is arm64-only; an Intel Mac builds from source via `cargo install`.
 cargo install sabigoku
 ```
 
-Builds from source on any platform with a Rust toolchain (1.90+), which is
-also the route for Intel Macs. SQLite is compiled in and TLS is rustls, so
-there is nothing to link against.
+Builds from source on any platform with Rust 1.90+. SQLite and TLS (rustls)
+are compiled in; nothing to link against.
 
 ### Prebuilt binary
 
-The Linux tarballs are fully static musl builds: no shared-lib deps, not even
-glibc, with SQLite compiled in. macOS ships an Apple Silicon binary.
+Linux tarballs are static musl builds (no glibc); macOS ships an Apple
+Silicon binary.
 
 1. Download the tarball for your machine from the
    [latest release](https://github.com/vantroy/sabigoku/releases/latest):
@@ -207,7 +175,7 @@ glibc, with SQLite compiled in. macOS ships an Apple Silicon binary.
    | aarch64 Linux (ARM64) | `sabigoku-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz` |
    | macOS Apple Silicon | `sabigoku-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
 
-2. Verify it against `sha256sums.txt` from the same release page (encouraged):
+2. Verify against `sha256sums.txt` from the same release page:
 
    ```sh
    sha256sum -c --ignore-missing sha256sums.txt
@@ -218,7 +186,6 @@ glibc, with SQLite compiled in. macOS ships an Apple Silicon binary.
    ```sh
    tar -xzf sabigoku-vX.Y.Z-<target>.tar.gz
    mv sabigoku ~/.local/bin/       # or wherever your PATH points
-   # no chmod needed; tar preserves the executable bit
    ```
 
 ### From source
@@ -248,12 +215,11 @@ sabigoku --debug             # diagnostics: stderr (CLI) or the log file (TUI)
 
 ## Staying up to date
 
-On boot the TUI checks for a newer release (a cached check, at most once an
-hour) and shows a small toast when one exists; the Settings tab has the
-off-switch. `sabigoku update` does a fresh check and acts on the answer: an
-installer-managed binary is replaced in place, and a package-managed one
-(AUR, Homebrew, cargo) gets the right upgrade command printed instead of a
-side-channel overwrite.
+On boot, the TUI checks for a newer release (cached, at most once an hour)
+and shows a toast when one exists; the Settings tab has the off-switch.
+`sabigoku update` does a fresh check: an installer-managed binary is replaced
+in place, and a package-managed one (AUR, Homebrew, cargo) gets the right
+upgrade command printed instead of a side-channel overwrite.
 
 ## Development
 
@@ -266,10 +232,9 @@ cargo test                    # offline-safe; live-network suites are opt-in (--
 ```
 
 The spikes in
-[`examples/`](https://github.com/vantroy/sabigoku/tree/master/examples) are
-self-contained throwaway programs that de-risked the hard unknowns before the
-real architecture existed: HTTP + JSON, SQLite, threads + a channel, the stream
-resolver, mpv playback, and cover rendering. Each runs on its own:
+[`examples/`](https://github.com/vantroy/sabigoku/tree/master/examples)
+de-risked the hard unknowns before the real architecture existed. Each runs
+on its own:
 
 ```sh
 cargo run --example spike_http          # AniList HTTP search
