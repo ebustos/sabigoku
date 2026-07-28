@@ -920,8 +920,8 @@ fn meta_line(fields: &[MetaField], palette: &Palette) -> Line<'static> {
 ///
 /// The pin boost is gated on a confirmed marker (`▸` or `+`): a pin on an
 /// unchecked or absent provider gets no lift, so `?` can never visually
-/// outrank a `+`. That gate is also what keeps the nothing-known row honest,
-/// since every token there is `?` and none can qualify.
+/// outrank a `+`. The gate reads the derived marker, not the raw availability,
+/// so a provider serving off a still-unchecked entry promotes correctly.
 fn provider_line(session: &EpisodeSession, palette: &Palette) -> Option<Line<'static>> {
     let (tokens, dim) = provider_value(session)?;
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1481,6 +1481,14 @@ mod tests {
             "hint bold is its own register"
         );
 
+        // Both registers bold in one row: the §1.3 carve-out, asserted where it
+        // actually happens rather than inferred across two cases.
+        let line = provider_line(&split, palette).unwrap();
+        assert!(
+            is_bold(token_style(&line, "+senshi")) && is_bold(token_style(&line, "v")),
+            "state bold and hint bold coexist"
+        );
+
         // No engaged session: the whole row is skipped.
         assert!(provider_line(&EpisodeSession::default(), palette).is_none());
     }
@@ -1528,6 +1536,21 @@ mod tests {
         let token = token_style(&line, "?megaplay");
         assert_eq!(token.fg, Some(palette.fg3));
         assert!(!is_bold(token), "the dim row admits no boost");
+
+        // Serving off a still-unchecked entry: the gate reads the derived
+        // marker, so `▸` promotes even though the availability says otherwise.
+        let racing = EpisodeSession::seeded(
+            1,
+            Some("megaplay"),
+            Some("megaplay"),
+            vec![("megaplay".into(), Unchecked)],
+            vec!["1".into()],
+        );
+        let line = provider_line(&racing, palette).unwrap();
+        assert_eq!(line_text(&line), "▸megaplay · [v]");
+        let token = token_style(&line, "▸megaplay");
+        assert_eq!(token.fg, Some(palette.fg), "serving is never the dim row");
+        assert!(is_bold(token), "a serving pin target is confirmed");
 
         // A pin outside the registry renders nowhere at all.
         let retired = EpisodeSession::seeded(
