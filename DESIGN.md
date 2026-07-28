@@ -1114,7 +1114,7 @@ short name keeps these within the 36-column budget, and a long-named provider is
 truncated by the toast push. `network unreachable` carries no `{provider}`; it
 names the user's own connectivity, not a provider. `can't reach AniList` names
 AniList directly: the catalog brain is a single fixed dependency and sits outside
-the provider registry. The provider row's Pinned field shows `name()`, not
+the provider registry. The provider row's tokens show `name()`, not
 `display_name()` (§5.3a; §10 logs the split).
 
 The four provider cause classes (`network-down`, `blocked`, `server-down`,
@@ -1262,7 +1262,7 @@ episode grid, not the show info:
                              An elf mage who once defeated the Demon King now            [m synopsis, word-wrapped]
                              wanders the continent without purpose, until she
                              meets a young girl named Fern…
-                            ▸megaplay ?senshi ?allanime · [v]                            [provider row atop the grid; m, [v] cycle hint]
+                            ▸megaplay ?senshi ?allanime · [v]                            [provider row atop the grid; serving fg, rest m, [v] cycle hint]
                             [1][2][3][4][5][6][▸7][8][9][10][11][12]               [d watched, h▸ resume, m unwatched]
                             [13][14][15][16][17][18][19][20][21][22][23][24]
                             [25][26][27][28]
@@ -1296,7 +1296,7 @@ Notes:
   `left_w = max(20, pane_w * 38 / 100)` formula. At ≥ 160-col the layout gains
   density (§5.4a) with `right_w ≈ 96` giving ≈ 19 grid columns.
 - The metadata is the compact `· `-joined line (§5.3a): Episodes, Format, Source,
-  Duration, Studios, Rank. Provider and Pinned are not on it; they ride the top of
+  Duration, Studios, Rank. Provider and pin are not on it; they ride the top of
   the episode grid as the `▸{serving} … · [v]` row. The `nextAiringEpisode`
   countdown lands on the chips row (§4.4), not here. `v
   provider` in the help line cycles the provider pin; it is live on this zoom
@@ -1305,29 +1305,54 @@ Notes:
 ### 5.3a Detail Metadata: The Compact Line
 
 One ordered field list, one density at every width and origin. `detail_meta_fields()`
-(`src/tui/view/detail.rs`) returns an ordered list of `MetaField` (`{label, value,
-unit, dim, rail_only}`), highest-priority field first: **Episodes**, **Format**,
-**Source**, **Duration**, **Studios**, **Rank**, **Provider**, **Pinned**. The
-first six are AniList metadata about the show; Provider and Pinned are not:
-Provider reads the provider bindings (`anime` binding rows + `provider_absences`)
-plus the live session's serving provider, Pinned reads the `provider_pins` table.
+(`src/tui/view/detail.rs`) returns an ordered list of `MetaField` (`{value, unit,
+dim}`), highest-priority field first: **Episodes**, **Format**, **Source**,
+**Duration**, **Studios**, **Rank**. All six are AniList metadata about the show.
 
-The six show fields render on the **compact line** (`meta_line`), values joined
+These six render on the **compact line** (`meta_line`), values joined
 with ` · ` on one row (separator `fg3`, values `fg2`, `fg3` when a value's `dim`
 flag is set). A unit suffix renders here (`13 eps`; Format carries no unit), and a
 separator sits only *between* two emitted fields, so an absent field never leaves
 an orphan `·` (§8.1). **Rank rides last**, so it is the first field the line sheds
 when width tightens.
 
-**Provider and Pinned ride the grid, not the show info.** They carry the
-`rail_only` flag (kept off `meta_line`) and render as a dedicated row at the top
-of the episode grid via `provider_line`: `▸{serving} {bindings} · pin {pinned} ·
-[v]`, where `[v]` is the cycle-provider affordance (the `v` key, §7.5
-keybind-hint styling). The row appears only when the grid is engaged (a focused
-detail surface), because the provider/pin state is a "how this will play"
-affordance that belongs with the grid you play from, not the show metadata.
-(This replaces the earlier compact-line-vs-labeled-rail design; the §5.3a rail and
-its `bloom`/`two_col` gating are gone. ROD-458.)
+**Provider and pin ride the grid, not the show info,** and are not fields at all:
+`provider_line` derives them straight from the live session, reading the provider
+bindings (`anime` binding rows + `provider_absences`) plus the serving provider,
+and the pin from the `provider_pins` table. They render as a dedicated row at the
+top of the episode grid, `{tokens} · [v]`, where `[v]` is the cycle-provider
+affordance (the `v` key, §7.5 keybind-hint styling). The row appears only when the
+grid is engaged (a focused detail surface), because the provider/pin state is a
+"how this will play" affordance that belongs with the grid you play from, not the
+show metadata. (This replaces the earlier compact-line-vs-labeled-rail design; the
+§5.3a rail and its `bloom`/`two_col` gating are gone. ROD-458.)
+
+**Serving and pin are encoded on the fg ladder, not as text** (ROD-484). Each
+token is `{marker}{name}` in fixed registry order; the boosts are per token and
+independent, so a pin-flip miss (pin and serving on different providers) renders
+as two elevated tokens:
+
+| Token | Treatment |
+|---|---|
+| Non-serving, unpinned | `fg2` |
+| Serving | `fg` |
+| Pinned | `fg` + bold |
+
+`fg3` stays reserved for the nothing-known row (every provider unchecked), which
+dims whole; a healthy non-serving token never drops to it.
+
+- **The pin boost is gated on a confirmed marker** (`▸` or `+`). A pin on a still
+  `?` or a confirmed `-` provider gets no lift: an unchecked provider must never
+  visually outrank a bound one. The gate is also what keeps the dim row flat,
+  since a `?`-only row qualifies nowhere.
+- **A pin naming a provider no longer in the registry renders nowhere.** The
+  signal now exists only as a boosted token, so it has nothing to land on. This is
+  an accepted regression against the old `· pin {name}` text form, which could
+  name a provider the row did not list.
+- **Keybind-hint bold and state bold are different registers** and may coexist in
+  one row: the `[v]` hint is bold per §7.5 while a pinned token is bold per this
+  section, which is the carve-out to §1.3's "use it once per visual unit". Bold
+  alone is the ratified differentiator here and stays phosphor-safe (§1.4).
 
 **Episodes is the floor.** It always renders, never omitted: when `total_episodes`
 is unknown (no show focused, or a show with no metadata yet) it degrades to a dim
@@ -1376,10 +1401,10 @@ underlying value is null (§8.1: no orphan separator).
     7-day TTL), or is neither known (never probed, or the negative went stale)
   - **serving**: which provider the *currently loaded* episode grid was actually
     fetched from (`episodes.for_source`, the fetch identity plays fire on),
-    routing truth, distinct from the Pinned field's intent
+    routing truth, distinct from the pin's intent
 
-  Each provider renders as one marker glyph plus its raw name (same raw-name
-  convention as Pinned, not `display_name()`): `▸name` if that provider is
+  Each provider renders as one marker glyph plus its raw name (raw, not
+  `display_name()`): `▸name` if that provider is
   serving the open grid (implies bound, since a fetch can't succeed against an
   unbound provider), `+name` if bound but not the one serving right now, `-name`
   if a fresh negative exists, `?name` if unchecked. At most one `▸` ever appears
@@ -1397,7 +1422,7 @@ underlying value is null (§8.1: no orphan separator).
   least one provider is bound or confirmed absent, since a fresh negative is real
   information, not a gap.
 
-  Gated on canonical identity only, the same floor as Pinned's pin-target check:
+  Gated on canonical identity only, the same floor as the pin's target check:
   omitted outright when the show has no AniList id (no `provider_pins` /
   `provider_absences` FK target either), emitted otherwise even if every provider
   comes back `?` (a genuinely fresh, unresolved identity). A grid loaded from a
@@ -1405,7 +1430,7 @@ underlying value is null (§8.1: no orphan separator).
   silently: no registry slot to hang a `▸` on, so the line renders the live
   providers' availability with no serving marker at all until a later resolve
   lands on a still-registered one. Not an error, not a crash, just a plain
-  "nothing current is confirmed serving." Nav-state only, same rule as Pinned
+  "nothing current is confirmed serving." Nav-state only, same rule as the pin
   below and for the same reason: `detail_meta_fields_for` (fed an explicit
   record, e.g. the History list preview) never appends it, because the serving
   half needs the live session's `episodes.for_source`, which belongs to the
@@ -1415,18 +1440,21 @@ underlying value is null (§8.1: no orphan separator).
   than splitting Provider's two halves across two availability rules. The design
   targets a registry of 2–4 providers; a longer registry needs a fresh look at
   this line's width budget.
-- **Pinned**: surfaces the per-show provider pin (`Store::get_provider_pin`, the
-  `provider_pins` table), set via the `v` key on any detail surface (§7.5). Rail
-  label `Pinned`, value the pin's raw provider name (`allanime`), matching the
-  Settings `provider` row's convention (§5.5, which echoes the stored preference
-  string verbatim) rather than `display_name()`'s title case (reserved for
-  user-facing toast prose, §4.10; §10 logs the split). Omitted outright when the
-  show is unpinned: presence or absence, not a §8.1 degrade; there is no "still
-  fetching" state for a pin. Nav-state only, per the Provider note above. Pinned
-  stays the lowest-priority field (first to shed) because it is pure per-show
-  user override; Provider ranks one step above it because it reflects real
-  DB/session state rather than a manual choice, but both sit below the AniList
-  sextet, which describes the show itself.
+- **Pin**: surfaces the per-show provider pin (`Store::get_provider_pin`, the
+  `provider_pins` table), set via the `v` key on any detail surface (§7.5).
+  ~~Rail label `Pinned`, value the pin's raw provider name (`allanime`), matching
+  the Settings `provider` row's convention (§5.5, which echoes the stored
+  preference string verbatim) rather than `display_name()`'s title case (reserved
+  for user-facing toast prose, §4.10; §10 logs the split).~~ The pin has no text
+  of its own: it is a bold boost on the token for the provider it names
+  (ROD-484), so it inherits the token's raw-name convention rather than setting
+  one. Absent when the show is unpinned: presence or absence, not a §8.1 degrade;
+  there is no "still fetching" state for a pin. Nav-state only, per the Provider
+  note above. ~~Pinned stays the lowest-priority field (first to shed) because it
+  is pure per-show user override; Provider ranks one step above it because it
+  reflects real DB/session state rather than a manual choice, but both sit below
+  the AniList sextet, which describes the show itself.~~ Neither is a field any
+  more, so neither carries a shed rank; the AniList sextet is the whole list.
 
 ~~**Compact form: Provider and Pinned get their own dedicated row.** Below
 `DETAIL_TWO_COL_MIN` the rail never blooms, so a `rail_only` Provider and Pinned
@@ -1468,10 +1496,10 @@ line. Current grammar and omission rule are stated above. ROD-458.)
 The `nextAiringEpisode` countdown does **not** join this field list; it renders on
 the **chips row** (`state.now`, §4.4) instead, because it is a live,
 clock-relative signal, not a stored snapshot ~~the rail's~~ (the compact line's,
-ROD-458) static model fits. Both renderers iterate the field list generically
-(plus the one shared `rail_only` skip in ~~`draw_meta_line`~~ `meta_line`), so a
-new field is a `detail_meta_fields` data change
-only, no further renderer edits. The full survey of AniList fields considered and
+ROD-458) static model fits. ~~Both renderers iterate~~ `meta_line` iterates the
+field list generically ~~(plus the one shared `rail_only` skip in
+`draw_meta_line`)~~ with no per-field special cases left (ROD-484), so a new
+field is a `detail_meta_fields` data change only, no further renderer edits. The full survey of AniList fields considered and
 rejected for this list is in §10 (metadata field survey).
 
 ### 5.4 History / Watchlist: Narrow (w < 60) or No Records
@@ -1652,7 +1680,7 @@ Notes:
   doesn't bloom here; it does once the pane clears 100 (`term ≥ 168`, below). The
   dedicated Provider/Pinned row (§5.3a) renders below this compact line; this mock
   keeps the two-field baseline for brevity.~~ This is the only form, at every
-  width and origin; the Provider/Pinned row rides the top of the episode grid
+  width and origin; the provider row rides the top of the episode grid
   instead of the header (ROD-458). `v provider` in the help line cycles the
   provider pin; it is live on this in-pane surface, same as the zoom.
 
@@ -2434,7 +2462,9 @@ string at all two-pane widths (`w ≥ 60`); `enter play` and `space zoom` are al
 present. The in-pane grid renders at every two-pane width (narrower at
 `60 ≤ w < 100`: `detail_w ≈ 25` at `w = 60` → ≈ 5 columns); `Enter` plays the
 focused episode and `Space` promotes to the full-screen zoom. `v` cycles the open
-show's provider pin (§5.3a). Episodes load on detail entry, not on list hover
+show's provider pin (§5.3a); the pin has no word on the provider row, so the bold
+token there is the pinned provider and this hint is the only place the key is
+named. Episodes load on detail entry, not on list hover
 (scrolling Browse never fires a fetch; parity with History). At 80 cols the string
 fits comfortably within the ~74-char budget: it is 68 characters.
 
@@ -2601,7 +2631,7 @@ tokens reference §1.2 aliases.
 | **Detail · score line** | AniList `averageScore` | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
 | **Detail · genres** | AniList `genres` | ` · Genre · Genre` appended to the score line | omitted; no row, no `·` separator |
 | **Detail · cover art** | AniList `coverImage` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when the URL is null; the block keeps its reserved cell dimensions |
-| **Detail · metadata line**~~/rail~~ | AniList `episodes` / `format` / `source` / `duration` / `studios` / `rankings`; DB `provider_pins`; DB binding rows + `provider_absences` + live `episodes.for_source` | `detail_meta_fields()` (§5.3a) emits the ordered eight-field list; the six AniList fields render on the one compact `N eps · kind · …` line at every width and origin (Rank last, sheds first) ~~or the `Label  Value` rail (two-column surfaces, all eight)~~; Provider/Pinned are excluded from that line and instead draw `provider_line`, ~~the compact form's dedicated Provider/Pinned row beneath the joined line~~ a dedicated row atop the episode grid (ROD-458) | Episodes is the floor: `? eps` ~~/ `Episodes  ?` in `[d]`~~ when no count is known, never omitted, so the line is never empty. Format/Source/Duration/Studios/Rank each omit outright when null; no orphan `·`~~, no bare rail row~~. Provider omits its row outright when the show has no canonical identity, otherwise always renders (even all-`?`), dimming only when every provider is unchecked. Pinned omits its segment when the show carries no pin: absence, not a degrade. The `nextAiringEpisode` countdown renders on the **chips row** (§4.4) instead: a live signal, not a stored snapshot |
+| **Detail · metadata line**~~/rail~~ | AniList `episodes` / `format` / `source` / `duration` / `studios` / `rankings`; DB `provider_pins`; DB binding rows + `provider_absences` + live `episodes.for_source` | `detail_meta_fields()` (§5.3a) emits the ordered six-field list, rendered on the one compact `N eps · kind · …` line at every width and origin (Rank last, sheds first) ~~or the `Label  Value` rail (two-column surfaces, all eight)~~; provider and pin are not fields and instead draw `provider_line` ~~, the compact form's dedicated Provider/Pinned row beneath the joined line~~ , a dedicated row atop the episode grid, straight off the session (ROD-458, ROD-484) | Episodes is the floor: `? eps` ~~/ `Episodes  ?` in `[d]`~~ when no count is known, never omitted, so the line is never empty. Format/Source/Duration/Studios/Rank each omit outright when null; no orphan `·`~~, no bare rail row~~. The provider row omits outright when the show has no canonical identity, otherwise always renders (even all-`?`), dimming only when every provider is unchecked. The pin is a bold boost on its own token, so an unpinned show simply has no bold token, and a pin on a retired or unconfirmed provider shows nothing (§5.3a). The `nextAiringEpisode` countdown renders on the **chips row** (§4.4) instead: a live signal, not a stored snapshot |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
 | **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar, not duplicated in row 1 (the richer row-1 right-meta is an open question, §5.4/§11) | count degrades to `N / ? eps` on the bar when `total_episodes` is null |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
@@ -3151,11 +3181,12 @@ that history). Logged here so they can be revisited without archaeology.
 | Airing countdown collapses to one coarsest unit and omits itself once stale, rather than showing a negative/zero value (ROD-261) | A combined `Nd Nh` value doesn't fit the chips row's terse register, and a countdown that has silently lapsed (a stale `nextAiringEpisode` in the window between the real airing time and the next metadata refresh) would read as a bug if shown as `-2h` or `0d`. Omitting it instead degrades to the same "no countdown" state a show without airing data already renders: a known-good degrade (§8.1), not a new one. | If users want confirmation an episode aired without waiting for refresh, consider a distinct "just aired" state instead of silent omission. |
 | Non-JP origin marker is a bare two-letter country code in `text.dim`, trailing last on the chips row, not a flag glyph (ROD-261) | An actual flag emoji is a Supplementary-Plane regional-indicator pair, outside the §2 "glyphs must fall inside the BMP" contract, and wouldn't render deterministically across this app's terminal targets. The dimmest available tier plus last-in-order placement keeps a rare, static fact from competing with the row's live status/season/countdown information; the common JP case shows nothing. | If CN/KR-origin shows are common enough in a user's library that the marker starts carrying real signal rather than being incidental, promote it to `text.muted` or a small dedicated icon. |
 | Italic stays pinned to the native-language title field, not to "whichever row is currently an alt" (ROD-205, §1.3/§8.2) | Generalizing italic to "any non-primary title row" would make the English alt row render italic under the default `romaji` preference, a visual change with no benefit. Keeping italic keyed to the native/Japanese-script field specifically preserves italic's §1.3 meaning (foreign script, not row position) while generalizing correctly for all three preferences: native gets italic whenever it lands in an alt slot and loses the treatment once it becomes primary (every primary line is bold, never italic). | If an English alt row reads too flat next to an italic native row in practice, reconsider as a fresh value judgment. |
-| ~~Rail's~~ Pinned field shows the raw provider name, not `display_name()` (ROD-345) | Matches the Settings `provider` row (§5.5), which renders the raw stored preference string. Pinned is the same persisted identifier, just scoped per-show instead of globally, so consistency with that precedent outranks matching the toast-prose convention (`{provider}` = `display_name()` everywhere a sentence names a provider, §4.10). The split is deliberate: config-surface rows echo the stored identifier; user-facing prose speaks the display name. | If a provider's stored name and display name diverge enough to confuse users ~~in the rail~~ on `provider_line`, reconsider as a ~~rail-specific~~ `provider_line`-specific formatting fix, not by changing the Settings row's convention. |
+| ~~Rail's~~ ~~Pinned field~~ The provider row shows the raw provider name, not `display_name()` (ROD-345; ROD-484 moved the rule from the pin's own segment onto the tokens, which already followed it) | Matches the Settings `provider` row (§5.5), which renders the raw stored preference string. It is the same persisted identifier, just scoped per-show instead of globally, so consistency with that precedent outranks matching the toast-prose convention (`{provider}` = `display_name()` everywhere a sentence names a provider, §4.10). The split is deliberate: config-surface rows echo the stored identifier; user-facing prose speaks the display name. | If a provider's stored name and display name diverge enough to confuse users ~~in the rail~~ on `provider_line`, reconsider as a ~~rail-specific~~ `provider_line`-specific formatting fix, not by changing the Settings row's convention. |
 | Provider field folds availability and serving into one ~~rail~~ row, ASCII markers (`▸ + - ?`) instead of a new pictographic set (ROD-348/356) | A separate serving row plus a separate availability row would put three provider-ish rows next to each other (Pinned already there) for information that is really one axis per provider (what's known, what's active): one row reads as one fact family. The `◆`/`◈` and `◐`/`◎` glyph pairs have an unresolved dim-legibility question (§11); rather than risk a fourth confusable pair, the tri-state (plus "serving") uses plain ASCII shapes and reuses the already-proven `▸` resume glyph for "serving", a genuinely different glyph family. Shape carries the state rather than color because the Phosphor theme (§1.4) is monochrome, so a color-only distinction would be illegible there. | Even if the dim-legibility question resolves, the ASCII set stands on its own reasons (font-independence, zero substitution risk). |
 | Provider field lists providers in fixed registry (construction) order, not the per-walk preference order (ROD-348) | The preference order is a resolve-order hint, recomputed per preference and per walk; using it here would make the same show's ~~rail~~ line read in a different order across sessions as the user's global or per-show preference changes, breaking "scan the same column, same order, every show." ~~The rail is~~ This field is a status display of what's out there, not a queue of what to try next, so it wants a stable reference order. | If the registry grows past 4-5 providers and scanning a long fixed-order row gets noisy, consider grouping bound-first rather than reordering by preference: preference and "what's out there" are still different questions. |
 | Provider and Pinned surface on their own dedicated row, not as segments of the joined `·` meta line (ROD-348/356) | ~~A `rail_only` field never blooms below `DETAIL_TWO_COL_MIN`, which would leave Provider and Pinned invisible on every compact-width detail pane, exactly the width most terminals run at day to day.~~ Folding them into the joined line itself was rejected: routing/session state is a different category of fact from the AniList metadata the joined line otherwise carries, and interleaving muddies both. ~~The fix lives entirely in a bespoke compact-form row drawn beneath the joined line (`draw_provider_line`), outside the generic field-list iteration either renderer uses.~~ The fix lives entirely in `provider_line`, a dedicated row atop the episode grid, outside the generic field-list iteration `meta_line` uses (ROD-458: this row is now unconditional, not a compact-width special case). | If a third field ever needs the same "own row" treatment, generalize `provider_line` into a small family of bespoke rows rather than routing a third concept through it by special case. |
-| Pinned's dedicated-row segment gets a `pin ` prefix; Provider's does not (ROD-348/356) | Pinned's value is a bare raw provider name, ambiguous once it sits next to Provider's own token list on the same unlabeled row (a trailing bare name reads as an unmarked provider token, not the pin). Provider's value already carries its own marker glyphs (`▸ + - ?`), which self-disambiguate without a label. The `pin ` marker is a literal composed inside ~~`draw_provider_line`~~ `provider_line`, not a generic `MetaField` mechanism; `MetaField` stays `{label, value, unit, dim, rail_only}` with no `prefix` field. Folding Pinned into Provider's token list instead (a marker on the pinned token) was rejected: a pin can target a provider independent of its bound/absent/unchecked state, so a folded marker would need to represent combinations the tri-state grammar was not designed for, for a marginal width saving, and it would lose Pinned's independent omit-when-unset behavior. | If a similar disambiguation need comes up for a future bespoke row, prefer a literal composed in that row's own renderer over adding a generic `MetaField.prefix`, unless a third bespoke row needs the exact same decoration. |
+| ~~Pinned's dedicated-row segment gets a `pin ` prefix; Provider's does not (ROD-348/356)~~ **Overturned by ROD-484, below.** | Pinned's value is a bare raw provider name, ambiguous once it sits next to Provider's own token list on the same unlabeled row (a trailing bare name reads as an unmarked provider token, not the pin). Provider's value already carries its own marker glyphs (`▸ + - ?`), which self-disambiguate without a label. The `pin ` marker is a literal composed inside ~~`draw_provider_line`~~ `provider_line`, not a generic `MetaField` mechanism; `MetaField` stays `{label, value, unit, dim, rail_only}` with no `prefix` field. Folding Pinned into Provider's token list instead (a marker on the pinned token) was rejected: a pin can target a provider independent of its bound/absent/unchecked state, so a folded marker would need to represent combinations the tri-state grammar was not designed for, for a marginal width saving, and it would lose Pinned's independent omit-when-unset behavior. | If a similar disambiguation need comes up for a future bespoke row, prefer a literal composed in that row's own renderer over adding a generic `MetaField.prefix`, unless a third bespoke row needs the exact same decoration. |
+| The pin is an emphasis boost on its own provider token, not a `pin {name}` text segment (ROD-484) | The row's job is "how this will play", and a name repeated in a second segment made the reader match two strings to answer one question. Bold on the pinned token answers it in place. The two costs the ROD-348/356 rejection cited are paid explicitly rather than dodged: the combinations problem is settled by gating the boost on a confirmed `▸`/`+` marker, so an unchecked pin target simply gets no lift instead of needing a grammar for it; and the independent omit-when-unset behavior is not lost but narrowed, since a pin naming a provider outside the registry now renders nowhere at all (§5.3a owns that regression). An emphasis boost rather than a fifth marker glyph keeps the `▸ + - ?` set describing availability only, one axis per shape. | If the retired-pin blind spot ever bites in practice, the fix is a token for the retired provider, not a return of the text segment. |
 | `X` is History's one destructive key with **no undo path**, so it gets an armed-confirm layer with a separate confirm key (ROD-220) | Every other History key, including the uppercase `P` ("plan it") and the view switches, is additive or navigational: reversible by another keypress or covered by `u`'s single-level undo (§6.1). Hard-delete cascades the DB row and its episode history; there is nothing for `u` to restore. That is a step change in severity, so it gets its own confirmation layer (§4.2, §6.5) instead of the toast-and-undo pattern the rest of History relies on. Splitting execution onto a separate `y`/`Y` key rather than "press `X` twice" specifically defeats key-repeat: a held or auto-repeating `X` keeps delivering `X` (a no-op once armed, §6.5), never `y`, so a repeat storm cannot self-confirm the delete. | If a second no-undo destructive action is ever added, reuse this pattern (armed state plus distinct confirm key) rather than inventing a fresh one. |
 | Bold, not underline, is the keybind-hint treatment everywhere (ROD-220) | Underline was the original spec for hint keys and was retired: it would be a one-off treatment nothing else uses, while bold-as-promotion (§1.3) already carries the identical role in the confirm prompt, the help lines, and the top-bar strip. One treatment, everywhere. | No revisit expected. |
 | Any non-`y` key cancels the armed confirm; it does not absorb-and-stay-armed (ROD-220) | The forgiving reading: a stray keypress (typo, accidental arrow) drops back to idle rather than trapping the user in a frozen bottom bar they didn't mean to enter, at the cost of a re-press of `X` to retry. `X` itself is the one carve-out (no-op, stays armed, §6.5); that exception exists purely to block key-repeat self-confirm, not to generalize into a broader absorb list. | If testing shows accidental cancels are common, reconsider a narrow allowlist of truly inert keys before reopening "absorb" more broadly. |
@@ -3245,6 +3276,15 @@ any of them as settled by implication.
    or the blink needs a manual timer (which §6.4 currently rules out).
 
 ## Changelog
+
+**2026-07-28 (ROD-484):** The §5.3a provider row encodes serving and pin on the
+fg ladder instead of naming the pin in text: the `· pin {pinned}` segment is gone,
+serving takes `fg`, pinned takes `fg` + bold, everything else stays `fg2`, and the
+`[v]` cycle hint still trails. The pin boost is gated on a confirmed `▸`/`+`
+marker so `?` can never outrank `+`; a pin on a provider outside the registry now
+renders nowhere. Provider and Pinned left `detail_meta_fields` entirely (six
+fields, all show metadata), `provider_line` reads the session directly, and
+`MetaField` dropped `label` and `rail_only` with them: `{value, unit, dim}`.
 
 **2026-07-20 (ROD-458):** Removed the §5.3a labeled metadata rail and its
 `bloom`/`two_col` gating. The detail metadata is now one compact `·`-joined
