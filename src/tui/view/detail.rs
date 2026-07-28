@@ -412,7 +412,7 @@ fn draw_content(
     // Section rule between the score line and the compact meta line (DESIGN
     // 3.6). The provider row rides with the episode grid, not the show info.
     y = draw_hairline(frame, area, palette, y);
-    let fields = detail_meta_fields(entry, &state.episodes);
+    let fields = detail_meta_fields(entry);
     let meta = [meta_line(&fields, palette)];
     for line in &meta {
         if y >= area.height {
@@ -512,7 +512,7 @@ fn draw_split(
         y += 1;
     }
 
-    let fields = detail_meta_fields(entry, &state.episodes);
+    let fields = detail_meta_fields(entry);
     y = draw_hairline(frame, content, palette, y);
     // One compact meta line at every width; the provider row rides with the
     // episode grid, not the show info.
@@ -573,8 +573,7 @@ fn draw_body(
     });
     let cols = grid_cols(area.width);
     let grid_rows = (session.grid().len().div_ceil(cols).max(1)) as u16;
-    let fields = detail_meta_fields(entry, session);
-    let provider = provider_line(&fields, palette);
+    let provider = provider_line(session, palette);
     let (syn_rows, show_provider) =
         body_budget(remaining, syn_natural, grid_rows, provider.is_some());
     draw_synopsis(frame, area, palette, entry, state.scroll, y, syn_rows);
@@ -757,72 +756,50 @@ pub(crate) fn aired_count(entry: &Enrichment) -> Option<u32> {
     entry.next_airing_episode.map(|n| n.saturating_sub(1))
 }
 
-/// One §5.3a metadata field; both render densities consume the same list so
-/// the forms can never drift apart.
+/// One §5.3a metadata field. Show metadata only: the provider row is derived
+/// straight from the session by `provider_line`, never routed through here.
 struct MetaField {
-    label: &'static str,
     value: String,
-    /// Rendered only by the compact line (`13 eps`), never the rail.
     unit: Option<&'static str>,
     dim: bool,
-    rail_only: bool,
 }
 
-/// The ordered eight-field list (§5.3a), highest priority first. Episodes is
+/// The ordered six-field list (§5.3a), highest priority first. Episodes is
 /// the floor and never omitted; every other field omits outright when its
-/// value is null. Provider and Pinned are session-derived (nav-state only)
-/// and gated on an engaged session.
-fn detail_meta_fields(entry: &Enrichment, session: &EpisodeSession) -> Vec<MetaField> {
+/// value is null.
+fn detail_meta_fields(entry: &Enrichment) -> Vec<MetaField> {
     let mut out = Vec::new();
     let (value, dim) = match entry.total_episodes {
         Some(n) => (n.to_string(), false),
         None => ("?".to_string(), true),
     };
     out.push(MetaField {
-        label: "Episodes",
         value,
         unit: Some("eps"),
         dim,
-        rail_only: false,
     });
-    let plain = |label, value: String, rail_only| MetaField {
-        label,
+    let plain = |value: String| MetaField {
         value,
         unit: None,
         dim: false,
-        rail_only,
     };
     if let Some(label) = render::format_label(entry.kind.as_deref()) {
-        out.push(plain("Format", label.to_string(), false));
+        out.push(plain(label.to_string()));
     }
     if let Some(src) = entry.source_material.as_deref() {
-        out.push(plain("Source", title_case(src), false));
+        out.push(plain(title_case(src)));
     }
     // A 0-minute runtime is a missing value, not a fact (§5.3a).
     if let Some(minutes) = entry.duration_minutes.filter(|m| *m > 0) {
-        out.push(plain("Duration", format!("{minutes} min"), false));
+        out.push(plain(format!("{minutes} min")));
     }
     if let Some(studios) = studios_value(&entry.studios) {
-        out.push(plain("Studios", studios, false));
+        out.push(plain(studios));
     }
     // Rank rides the compact line last (§5.3a), so it is the first field the
     // line sheds when width tightens.
     if let Some(rank) = rank_value(entry) {
-        out.push(plain("Rank", rank, false));
-    }
-    if session.engaged_for(entry.anilist_id) {
-        if let Some((value, dim)) = provider_value(session) {
-            out.push(MetaField {
-                label: "Provider",
-                value,
-                unit: None,
-                dim,
-                rail_only: true,
-            });
-        }
-        if let Some(pin) = session.pin() {
-            out.push(plain("Pinned", pin.to_string(), true));
-        }
+        out.push(plain(rank));
     }
     out
 }
@@ -862,20 +839,33 @@ fn rank_value(entry: &Enrichment) -> Option<String> {
     })
 }
 
+/// One token on the §5.3a provider row. `marker` carries availability as
+/// shape; `serving`/`pinned` are independent and each drive their own fg boost
+/// in `provider_line`, so a pin-flip miss renders as two elevated tokens.
+struct ProviderToken {
+    marker: char,
+    name: String,
+    serving: bool,
+    pinned: bool,
+}
+
 /// Provider tokens in fixed registry order (§5.3a): `▸` serving, `+` bound,
 /// `-` fresh negative, `?` unchecked; shape carries the state, not color.
-/// Dim only when nothing is known about any provider.
-fn provider_value(session: &EpisodeSession) -> Option<(String, bool)> {
+/// Dim only when nothing is known about any provider. A pin naming a provider
+/// outside the registry lands on no token and renders nowhere (§5.3a).
+fn provider_value(session: &EpisodeSession) -> Option<(Vec<ProviderToken>, bool)> {
     let avail = session.avail();
     if avail.is_empty() {
         return None;
     }
     let serving = session.serving();
+    let pin = session.pin();
     let mut informative = false;
-    let tokens: Vec<String> = avail
+    let tokens: Vec<ProviderToken> = avail
         .iter()
         .map(|(name, availability)| {
-            let marker = if serving == Some(name.as_str()) {
+            let is_serving = serving == Some(name.as_str());
+            let marker = if is_serving {
                 informative = true;
                 '▸'
             } else {
@@ -891,17 +881,22 @@ fn provider_value(session: &EpisodeSession) -> Option<(String, bool)> {
                     ProviderAvailability::Unchecked => '?',
                 }
             };
-            format!("{marker}{name}")
+            ProviderToken {
+                marker,
+                name: name.clone(),
+                serving: is_serving,
+                pinned: pin == Some(name.as_str()),
+            }
         })
         .collect();
-    Some((tokens.join(" "), !informative))
+    Some((tokens, !informative))
 }
 
 /// The compact `·`-joined form (§5.3a): non-rail fields only, unit suffixes,
 /// separators only between emitted fields (no orphan `·`).
 fn meta_line(fields: &[MetaField], palette: &Palette) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for f in fields.iter().filter(|f| !f.rail_only) {
+    for f in fields {
         if !spans.is_empty() {
             spans.push(Span::styled(" · ", Style::new().fg(palette.fg3)));
         }
@@ -919,25 +914,37 @@ fn meta_line(fields: &[MetaField], palette: &Palette) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The dedicated Provider/Pinned row under the compact line (§5.3a). The
-/// `pin ` prefix is required: a bare trailing name would read as an unmarked
-/// provider token.
-fn provider_line(fields: &[MetaField], palette: &Palette) -> Option<Line<'static>> {
-    let provider = fields.iter().find(|f| f.label == "Provider")?;
-    let style = if provider.dim {
-        Style::new().fg(palette.fg3)
-    } else {
-        Style::new().fg(palette.fg2)
-    };
-    let mut spans = vec![Span::styled(provider.value.clone(), style)];
-    if let Some(pin) = fields.iter().find(|f| f.label == "Pinned") {
-        spans.push(Span::styled(" · ", Style::new().fg(palette.fg3)));
+/// The dedicated provider row under the compact line (§5.3a). Pin and serving
+/// are per-token boosts on the luminance ladder, never a text segment: serving
+/// takes `fg`, pinned takes `fg` + bold, every other token stays `fg2`.
+///
+/// The pin boost is gated on a confirmed marker (`▸` or `+`): a pin on an
+/// unchecked or absent provider gets no lift, so `?` can never visually
+/// outrank a `+`. The gate reads the derived marker, not the raw availability,
+/// so a provider serving off a still-unchecked entry promotes correctly.
+fn provider_line(session: &EpisodeSession, palette: &Palette) -> Option<Line<'static>> {
+    let (tokens, dim) = provider_value(session)?;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for token in tokens {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        let style = if dim {
+            Style::new().fg(palette.fg3)
+        } else if token.pinned && matches!(token.marker, '▸' | '+') {
+            Style::new().fg(palette.fg).add_modifier(Modifier::BOLD)
+        } else if token.serving {
+            Style::new().fg(palette.fg)
+        } else {
+            Style::new().fg(palette.fg2)
+        };
         spans.push(Span::styled(
-            format!("pin {}", pin.value),
-            Style::new().fg(palette.fg2),
+            format!("{}{}", token.marker, token.name),
+            style,
         ));
     }
     // Cycle-provider affordance (the `v` key), keybind-hint styling (§7.5).
+    // Hint bold and state bold are separate registers and coexist here (§1.3).
     spans.push(Span::styled(" · [", Style::new().fg(palette.fg3)));
     spans.push(Span::styled(
         "v",
@@ -1320,6 +1327,37 @@ mod tests {
 
     #[test]
     fn meta_fields_walk_the_priority_order() {
+        let fields = detail_meta_fields(&rich_entry());
+        let values: Vec<&str> = fields.iter().map(|f| f.value.as_str()).collect();
+        assert_eq!(
+            values,
+            [
+                "28",
+                "TV",
+                "Light novel",
+                "24 min",
+                "Madhouse",
+                "#12 rated 2023"
+            ],
+            "Episodes, Format, Source, Duration, Studios, Rank"
+        );
+        assert!(
+            fields.iter().all(|f| !f.value.contains("megaplay")),
+            "the provider row is session-derived and never enters the field list"
+        );
+    }
+
+    #[test]
+    fn meta_fields_floor() {
+        // Bare entry: only the dim Episodes floor.
+        let fields = detail_meta_fields(&entry(1));
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, "?");
+        assert!(fields[0].dim);
+    }
+
+    #[test]
+    fn provider_tokens_carry_shape_and_boost_flags() {
         use crate::store::ProviderAvailability::{Absent, Bound, Unchecked};
         let session = EpisodeSession::seeded(
             1,
@@ -1332,67 +1370,40 @@ mod tests {
             ],
             vec!["1".into()],
         );
-        let fields = detail_meta_fields(&rich_entry(), &session);
-        let labels: Vec<&str> = fields.iter().map(|f| f.label).collect();
-        assert_eq!(
-            labels,
-            [
-                "Episodes", "Format", "Source", "Duration", "Studios", "Rank", "Provider", "Pinned"
-            ]
-        );
-        assert_eq!(fields[2].value, "Light novel");
-        assert_eq!(fields[3].value, "24 min");
-        assert_eq!(fields[5].value, "#12 rated 2023");
+        let (tokens, dim) = provider_value(&session).unwrap();
         // Serving outranks bound; absence and unchecked keep their shapes.
-        assert_eq!(fields[6].value, "▸megaplay -senshi ?allanime");
-        assert!(!fields[6].dim);
-        assert_eq!(fields[7].value, "senshi");
-        // Rank (field 5) now rides the compact line; only Provider/Pinned are
-        // excluded from it (they ride the grid).
-        assert!(fields.iter().skip(6).all(|f| f.rail_only));
-        assert!(fields.iter().take(6).all(|f| !f.rail_only));
-    }
+        let shapes: Vec<String> = tokens
+            .iter()
+            .map(|t| format!("{}{}", t.marker, t.name))
+            .collect();
+        assert_eq!(shapes, ["▸megaplay", "-senshi", "?allanime"]);
+        assert!(!dim);
+        assert!(tokens[0].serving && !tokens[0].pinned);
+        assert!(
+            tokens[1].pinned && !tokens[1].serving,
+            "pin rides its own token"
+        );
 
-    #[test]
-    fn meta_fields_floor_and_session_gate() {
-        // Bare entry, unengaged session: only the dim Episodes floor.
-        let fields = detail_meta_fields(&entry(1), &EpisodeSession::default());
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].value, "?");
-        assert!(fields[0].dim);
-
-        // Engaged but nothing known anywhere: Provider still emits, dimmed.
-        use crate::store::ProviderAvailability::Unchecked;
-        let session = EpisodeSession::seeded(
+        // Nothing known anywhere: tokens still emit, row dims.
+        let bare = EpisodeSession::seeded(
             1,
             None,
             None,
             vec![("megaplay".into(), Unchecked)],
             vec!["1".into()],
         );
-        let fields = detail_meta_fields(&entry(1), &session);
-        let provider = fields.iter().find(|f| f.label == "Provider").unwrap();
-        assert_eq!(provider.value, "?megaplay");
-        assert!(provider.dim, "all-unchecked dims the line");
-        assert!(
-            !fields.iter().any(|f| f.label == "Pinned"),
-            "unpinned omits"
-        );
+        let (tokens, dim) = provider_value(&bare).unwrap();
+        assert_eq!(tokens[0].marker, '?');
+        assert!(dim, "all-unchecked dims the row");
+        assert!(!tokens[0].pinned, "unpinned");
     }
 
     #[test]
     fn meta_line_joins_without_orphan_separators() {
         let palette = &crate::tui::theme::TERMINAL_GHOST;
-        let session = EpisodeSession::default();
-        let sparse = line_text(&meta_line(
-            &detail_meta_fields(&entry(1), &session),
-            palette,
-        ));
+        let sparse = line_text(&meta_line(&detail_meta_fields(&entry(1)), palette));
         assert_eq!(sparse, "? eps", "single field carries no separator");
-        let full = line_text(&meta_line(
-            &detail_meta_fields(&rich_entry(), &session),
-            palette,
-        ));
+        let full = line_text(&meta_line(&detail_meta_fields(&rich_entry()), palette));
         assert_eq!(
             full, "28 eps · TV · Light novel · 24 min · Madhouse · #12 rated 2023",
             "Rank rides the compact line, last"
@@ -1403,22 +1414,54 @@ mod tests {
         );
     }
 
+    /// The style of the span rendering `text`, for the fg-ladder asserts.
+    fn token_style(line: &Line<'_>, text: &str) -> Style {
+        line.spans
+            .iter()
+            .find(|s| s.content == text)
+            .unwrap_or_else(|| panic!("no span {text:?} in {:?}", line_text(line)))
+            .style
+    }
+
+    fn is_bold(style: Style) -> bool {
+        style.add_modifier.contains(Modifier::BOLD)
+    }
+
     #[test]
-    fn provider_row_composes_with_and_without_pin() {
+    fn provider_row_encodes_pin_and_serving_on_the_ladder() {
         use crate::store::ProviderAvailability::Bound;
         let palette = &crate::tui::theme::TERMINAL_GHOST;
-        let pinned = EpisodeSession::seeded(
+        // Pin/serving divergence: two elevated tokens, no pin text anywhere.
+        let split = EpisodeSession::seeded(
             1,
             Some("megaplay"),
             Some("senshi"),
             vec![("megaplay".into(), Bound), ("senshi".into(), Bound)],
             vec!["1".into()],
         );
-        let fields = detail_meta_fields(&entry(1), &pinned);
-        assert_eq!(
-            line_text(&provider_line(&fields, palette).unwrap()),
-            "▸megaplay +senshi · pin senshi · [v]"
+        let line = provider_line(&split, palette).unwrap();
+        assert_eq!(line_text(&line), "▸megaplay +senshi · [v]");
+        let serving = token_style(&line, "▸megaplay");
+        assert_eq!(serving.fg, Some(palette.fg));
+        assert!(!is_bold(serving), "serving lifts fg only");
+        let pinned = token_style(&line, "+senshi");
+        assert_eq!(pinned.fg, Some(palette.fg));
+        assert!(is_bold(pinned), "the pin is the bold token");
+
+        // Serving and pinned on one token: one boosted span, still bold.
+        let together = EpisodeSession::seeded(
+            1,
+            Some("megaplay"),
+            Some("megaplay"),
+            vec![("megaplay".into(), Bound), ("senshi".into(), Bound)],
+            vec!["1".into()],
         );
+        let line = provider_line(&together, palette).unwrap();
+        assert_eq!(line_text(&line), "▸megaplay +senshi · [v]");
+        assert!(is_bold(token_style(&line, "▸megaplay")));
+        assert_eq!(token_style(&line, "+senshi").fg, Some(palette.fg2));
+
+        // Unpinned: the serving token lifts, nothing goes bold but the hint.
         let unpinned = EpisodeSession::seeded(
             1,
             Some("megaplay"),
@@ -1426,15 +1469,100 @@ mod tests {
             vec![("megaplay".into(), Bound)],
             vec!["1".into()],
         );
-        let fields = detail_meta_fields(&entry(1), &unpinned);
+        let line = provider_line(&unpinned, palette).unwrap();
         assert_eq!(
-            line_text(&provider_line(&fields, palette).unwrap()),
+            line_text(&line),
             "▸megaplay · [v]",
-            "cycle hint always trails; no pin segment when unpinned"
+            "cycle hint always trails"
         );
+        assert!(!is_bold(token_style(&line, "▸megaplay")));
+        assert!(
+            is_bold(token_style(&line, "v")),
+            "hint bold is its own register"
+        );
+
+        // Both registers bold in one row: the §1.3 carve-out, asserted where it
+        // actually happens rather than inferred across two cases.
+        let line = provider_line(&split, palette).unwrap();
+        assert!(
+            is_bold(token_style(&line, "+senshi")) && is_bold(token_style(&line, "v")),
+            "state bold and hint bold coexist"
+        );
+
         // No engaged session: the whole row is skipped.
-        let fields = detail_meta_fields(&entry(1), &EpisodeSession::default());
-        assert!(provider_line(&fields, palette).is_none());
+        assert!(provider_line(&EpisodeSession::default(), palette).is_none());
+    }
+
+    #[test]
+    fn pin_boost_needs_a_confirmed_marker() {
+        use crate::store::ProviderAvailability::{Absent, Bound, Unchecked};
+        let palette = &crate::tui::theme::TERMINAL_GHOST;
+        // A pin on a still-unchecked provider must never outrank the bound one.
+        let unchecked = EpisodeSession::seeded(
+            1,
+            None,
+            Some("senshi"),
+            vec![("megaplay".into(), Bound), ("senshi".into(), Unchecked)],
+            vec!["1".into()],
+        );
+        let line = provider_line(&unchecked, palette).unwrap();
+        let pin = token_style(&line, "?senshi");
+        assert!(!is_bold(pin), "? never lifts");
+        assert_eq!(pin.fg, Some(palette.fg2));
+        assert_eq!(token_style(&line, "+megaplay").fg, Some(palette.fg2));
+
+        // Same gate on a provider confirmed absent.
+        let absent = EpisodeSession::seeded(
+            1,
+            None,
+            Some("senshi"),
+            vec![("senshi".into(), Absent)],
+            vec!["1".into()],
+        );
+        assert!(!is_bold(token_style(
+            &provider_line(&absent, palette).unwrap(),
+            "-senshi"
+        )));
+
+        // Nothing known: the row dims whole and the gate leaves it flat.
+        let bare = EpisodeSession::seeded(
+            1,
+            None,
+            Some("megaplay"),
+            vec![("megaplay".into(), Unchecked)],
+            vec!["1".into()],
+        );
+        let line = provider_line(&bare, palette).unwrap();
+        let token = token_style(&line, "?megaplay");
+        assert_eq!(token.fg, Some(palette.fg3));
+        assert!(!is_bold(token), "the dim row admits no boost");
+
+        // Serving off a still-unchecked entry: the gate reads the derived
+        // marker, so `▸` promotes even though the availability says otherwise.
+        let racing = EpisodeSession::seeded(
+            1,
+            Some("megaplay"),
+            Some("megaplay"),
+            vec![("megaplay".into(), Unchecked)],
+            vec!["1".into()],
+        );
+        let line = provider_line(&racing, palette).unwrap();
+        assert_eq!(line_text(&line), "▸megaplay · [v]");
+        let token = token_style(&line, "▸megaplay");
+        assert_eq!(token.fg, Some(palette.fg), "serving is never the dim row");
+        assert!(is_bold(token), "a serving pin target is confirmed");
+
+        // A pin outside the registry renders nowhere at all.
+        let retired = EpisodeSession::seeded(
+            1,
+            Some("megaplay"),
+            Some("gone"),
+            vec![("megaplay".into(), Bound)],
+            vec!["1".into()],
+        );
+        let line = provider_line(&retired, palette).unwrap();
+        assert_eq!(line_text(&line), "▸megaplay · [v]");
+        assert!(!is_bold(token_style(&line, "▸megaplay")));
     }
 
     #[test]
