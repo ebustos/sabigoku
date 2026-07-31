@@ -17,6 +17,37 @@ release.yml refuses to build a tag whose section is missing or empty, and
 publishes that section verbatim as the release body.
 -->
 
+## [0.1.2] - 2026-07-31
+
+Self-updating, a one-time zigoku import, and a transparent background option.
+
+### Added
+
+- **Self-updating**: a boot-time check (cached, at most once an hour) toasts
+  when a newer release is out, and the Settings tab carries the current
+  version plus an on/off switch (`check for updates`, on by default).
+  `sabigoku update` is no longer a stub: it runs a fresh check and acts on
+  the answer. A standalone install gets replaced in place; a package-managed
+  one (AUR, Homebrew, cargo) gets the right upgrade command printed instead
+  of a side-channel overwrite; a root-owned install is refused rather than
+  silently failing.
+- **Bring over your zigoku library**: sabigoku notices an existing zigoku
+  library on launch and offers to bring in your shows, watch states, and
+  resume points. Shows already in sabigoku are left untouched.
+  Declining, or a completed import, means it won't ask again; a failed
+  import changes nothing and retries on the next launch.
+- **Transparent background**: every palette (`terminal_ghost`, `phosphor`,
+  `nord`, `tokyonight`) now has an optional transparent background that lets
+  the terminal's own opacity or blur show through; highlights, popups, and
+  toasts stay opaque. Off by default; toggle it in Settings.
+
+### Fixed
+
+- **Browse search now pages past the first screen**: scrolling to the last
+  loaded result and continuing down fetches the next page instead of
+  stopping cold; a "more" marker, and a spinner while it loads, shows there's
+  more to see.
+
 ## [0.1.1] - 2026-07-26
 
 Bug fixes and four new install channels.
@@ -99,5 +130,6 @@ Licensed GPL-3.0-or-later.
 - **`sabigoku update` is not implemented**: it prints a message saying so. There
   is no self-update yet.
 
+[0.1.2]: https://github.com/vantroy/sabigoku/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vantroy/sabigoku/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vantroy/sabigoku/releases/tag/v0.1.0

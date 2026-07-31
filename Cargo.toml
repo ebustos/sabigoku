@@ -1,6 +1,6 @@
 [package]
 name = "sabigoku"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # Not edition 2024's 1.85: quantette (via icy_sixel, via ratatui-image) needs 1.90.
 rust-version = "1.90"
