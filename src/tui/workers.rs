@@ -255,6 +255,7 @@ pub fn spawn_search(
                 query,
                 page,
                 results: result.entries,
+                has_next: result.has_next,
             },
             Err(cause) => Event::SearchFailed {
                 query,

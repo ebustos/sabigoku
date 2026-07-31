@@ -116,6 +116,7 @@ pub enum Event {
         query: String,
         page: u32,
         results: Vec<Enrichment>,
+        has_next: bool,
     },
     SearchFailed {
         query: String,
