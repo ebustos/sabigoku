@@ -1,11 +1,18 @@
 # Sabigoku · 錆獄: Design System
 ## Terminal Ghost
 
-> **Status: spec.** Nothing in this document is built. It gates the sabigoku TUI
-> build: every color, glyph, layout rule, and component state here is a concrete
-> buildable thing. Where the design had gaps, this doc fills them with a deliberate
-> call and labels it as such. Do not leave states unimplemented because "the design
-> didn't say."
+> **Status: living spec.** sabigoku is built and released; this document describes
+> a shipped app and stays the authority over it. Every color, glyph, layout rule,
+> and component state here is a concrete buildable thing, and where the design had
+> gaps this doc fills them with a deliberate call and labels it as such. Do not
+> leave states unimplemented because "the design didn't say." Where code and doc
+> disagree, that is drift: one of them is a bug, and the fix belongs in the same
+> pass that found it. §10 records the settled calls with their revisit triggers;
+> §11 keeps the resolved questions struck in place.
+>
+> **zigoku is retired (2026-07-27); sabigoku supersedes it.** Nothing here defers
+> to the original any more. A deliberate divergence is a design call like any
+> other: log it in §10 with a trigger. Parity is not a reason on its own.
 >
 > **Data rendering is governed by §8.** AniList is the catalog, search, and
 > metadata brain: Browse search and the Discover feed query it directly and get
@@ -717,8 +724,13 @@ returned order).
 | Supernatural | ☽ | U+263D | Crescent moon |
 | Thriller | ↯ | U+21AF | Lightning |
 
-Dim-glyph legibility of the `◆`/`◈` and `◐`/`◎` pairs at `text.dim` is an open
-question (§11).
+The `◆`/`◈`/`❖` and `◐`/`◎` shapes are legible at `text.dim` (ratified ROD-509,
+§11.4). They separate at silhouette level (fill, mass, outline weight), which
+dimming preserves, never by internal fine detail, which it erases; the single
+separator space is what stops two adjacent glyphs merging into one shape
+(ROD-247). A glyph added here inherits both rules and the test that established
+them: render it at `fg3` on `bg.base` beside its nearest neighbour in this
+table (§11.4's conditions). A codepoint chart is not the test.
 
 ---
 
@@ -1236,7 +1248,7 @@ Terminal width: 120 cols. List col: 44 cols. Detail col: 74 cols.
                                                        continent without purpose, until
                                                        she meets a young girl…
                                                                                          [spacer]
-  ▌  hjkl · / search · : command · q quit                                               [h▌ blink, d text, m+bold keys]
+  ▌  hjkl · / search · : command · q quit                                               [h▌ steady, d text, m+bold keys]
 ```
 
 > **Score tokens in the Browse wireframes (§5.1, §5.2) are drawn in the long
@@ -1272,7 +1284,7 @@ The user pressed `/`. The bottom bar becomes the search prompt. The list filters
 
 Notes:
 - The list filtered from 12 to 6 results immediately on keystroke.
-- The `▌` blink is gone; the `/` takes its visual position, static, `state.focus`.
+- The `▌` is gone; the `/` takes its visual position, static, `state.focus`.
 - The `_` character after `fr` is the text cursor: `state.focus`.
 - Result count is right-aligned in `text.muted`, with the `catalogue` scope tag
   (§8.4).
@@ -1457,9 +1469,10 @@ underlying value is null (§8.1: no orphan separator).
   +altsrc` (allanime serving, altsrc also bound elsewhere) or `▸allanime ?altsrc`
   (altsrc never probed). `▸` is the existing resume/active glyph (§4.6), already
   proven legible dim; `+`/`-`/`?` are deliberately plain ASCII rather than a new
-  pictographic set (§11 flags the dim-legibility risk of the diamond/circle glyph
-  pairs this sidesteps). Shape, not color, carries the state: the Phosphor theme
-  is monochrome (§1.4, `focus`/`fg` share one hue), so any UI state that only
+  pictographic set (chosen while the diamond/circle pairs' dim legibility was
+  still open, §11.4; the ASCII set stands on font-independence regardless).
+  Shape, not color, carries the state: the Phosphor theme is monochrome (§1.4,
+  `focus`/`fg` share one hue), so any UI state that only
   color could tell apart is illegible there by construction, and the four markers
   are distinct shapes for exactly this reason. The whole value dims to `fg3` only
   when every provider is `?` (nothing known about any of them, mirroring the
@@ -1593,10 +1606,11 @@ Notes:
   their de-emphasis.
 - The resume indicator `[▸12]` in the row header is the episode the user will
   resume from: `state.now` + bold.
-- **Open question (§11):** the row-1 right-meta shown here (`[▸12] 冬 2024 放映中`,
-  resume indicator + season + status chips) is the authored target but is not
-  ratified. The ratified baseline is a title-only row 1, with the episode count
-  riding the row-2 progress bar (§8.1); the count is never duplicated into row 1.
+- **Not built (§11.3):** the row-1 right-meta drawn here (`[▸12] 冬 2024 放映中`,
+  resume indicator + season + status chips) was the authored target and was never
+  ratified. Shipped row 1 is title-only, with the episode count riding the row-2
+  progress bar (§8.1); the count is never duplicated into row 1. Read the rest of
+  this mock as the spec and that column as a comp.
 - `l` or `Enter` from list focus moves to the detail pane (same grammar as
   Browse). At `w < 60` single-column, `l` is a no-op (no pane to move to), but
   `Enter` (or `Space`) opens the full-screen zoom, the only detail surface at this
@@ -1716,7 +1730,7 @@ Notes:
   (`active_pane = .detail`) when there's room, else to the list (`w < 60`); `q`
   quits the app (Esc/Space/`h` own the demote, §7.4).
 - Row 1 of a list entry is title-only at every width, so the title takes full
-  `list_w`; the richer row-1 right-meta is an open question (§5.4 note, §11).
+  `list_w`; the richer row-1 right-meta was never built (§5.4 note, §11.3).
 - Null-degrade rules from §8.1 apply in full: `no art yet` in [d]+italic when the
   cover URL is null; `[--/100]` in [d] when score is null; `no synopsis yet` in
   [m]+italic when synopsis is null; chips omitted when null.
@@ -1885,8 +1899,8 @@ Notes:
   never writing back to it. The pin cycles the same construction order as this
   row (unpinned → each registry provider → unpinned); there is no
   Settings-surface control for the per-show pin, only the in-grid key.
-- **landing view** cycles `history · browse · last_watched`, default `history`
-  (§8.3).
+- **landing view** cycles `history · browse · last_watched`, default
+  `last_watched` (§8.3).
 - **title language** cycles `romaji · english · native`
   (`config.title_language`), default `romaji`. A live-preview cycle row like
   `palette` and `landing view`: cycling it re-resolves every visible title on the
@@ -2207,9 +2221,9 @@ does not persist history between sessions (can be added later).
 
 - **No transitions.** Terminal cell grids do not have smooth animation. State
   changes are immediate: no easing, no slide, no fade.
-- **The one exception: the `▌` blink.** 500ms on, 500ms off. This is implemented
-  via the terminal's own blink attribute, not manual timing. It is the only
-  temporal effect.
+- **No exceptions.** The `▌` cursor was the one temporal effect (a terminal-side
+  ~1hz blink, never a manual timer) until ROD-481 retired it; nothing has claimed
+  the channel since (§4.9, §10).
 - **Spinner frames** at ~100ms/frame are not "animation"; they are a progress
   signal. Use the braille sequence for minimum visual noise.
 - **Cover art loading:** image appears immediately when data is available. No
@@ -2237,7 +2251,7 @@ Arming replaces the bottom bar with the §4.2 confirm prompt: a fourth
 bottom-command-line mode alongside idle/search/command, reusing the Settings
 edit-mode hijack pattern (§5.5). The list pane stays visible but **frozen**.
 Cursor keys, pane switches, and view switches (including `q`) do not reach it
-while armed. The `▌` blink is suppressed for the same reason it is suppressed in
+while armed. The `▌` is suppressed for the same reason it is suppressed in
 search: the `[!]` glyph takes its position.
 
 **Key handling while armed:**
@@ -2284,7 +2298,7 @@ Sabigoku has four base views plus the full-screen Detail zoom as a fifth
 | View | Identifier | Default | Layout |
 |---|---|---|---|
 | Browse | `active_view = .browse` | Optional (config `landing = "browse"`, §8.3) | Two-pane: list column + detail column (§3.2). `w < 60` collapses to list only. |
-| History | `active_view = .history` | Default (config `landing = "history"`, §8.3) | Two-pane: list + detail, identical grammar to Browse (§5.4a). `w < 60` collapses to list only. |
+| History | `active_view = .history` | Default (the `landing` config lands here directly on `"history"`, and via the resume open on the shipped `"last_watched"` default, §8.3) | Two-pane: list + detail, identical grammar to Browse (§5.4a). `w < 60` collapses to list only. |
 | Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History**, or `Enter` from a Discover card, at any width; or directly from the History list at `w < 60` (no pane to focus). The universal grid surface: the in-pane detail also carries its own (narrower) grid from `PANE_SPLIT_MIN` up, so `Enter` there plays instead of promoting. |
 | Discover | `active_view = .discover` | No | Single-pane: full-canvas card grid (§3.8, §5.7). No `active_pane` semantics. Reached with `D` or `F3` from any view. |
 | Settings | `active_view = .settings` | No | Single-pane: full-width settings rows (§5.5) |
@@ -2479,13 +2493,13 @@ where there is no pane to land on, so Esc returns to the single-column list.
 ### 7.5 Bottom Bar Help Strings
 
 The help line is the idle state of the bottom bar (§3.5 State 1). It updates per
-view. The `▌` blink and rendering rules from §3.5 are unchanged; only the text
+view. The `▌` and the rendering rules from §3.5 are unchanged; only the text
 content varies.
 
 Each per-view help line is modelled as an array of styled segments: keybind
 characters render `color.fg2` + bold (§1.3), surrounding words render `color.fg3`.
-The `▌` uses `color.hot` + blink as always. Rendered by the idle-help branch of
-the bottom bar in `src/tui/chrome.rs`.
+The `▌` uses `color.hot`, steady as always (§4.9). Rendered by the idle-help
+branch of the bottom bar in `src/tui/chrome.rs`.
 
 **Character budget:** at 80 cols, the help line has ~74 chars after the `▌` and
 its padding. The strings below are written to fit that budget.
@@ -2592,7 +2606,7 @@ strip letters (`B`/`H`/`D`), which also persist; `S` is a no-op inside Settings.
 
 Bold: `enter`, `esc`.
 
-The `▌` blink is suppressed in this mode; the field edit cursor takes that visual
+The `▌` is suppressed in this mode; the field edit cursor takes that visual
 slot. However this help string still displays to confirm what keys are available.
 The `▌` reappears when the edit is committed or cancelled.
 
@@ -2682,7 +2696,7 @@ tokens reference §1.2 aliases.
 | **Detail · cover art** | AniList `coverImage` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when the URL is null; the block keeps its reserved cell dimensions |
 | **Detail · metadata line**~~/rail~~ | AniList `episodes` / `format` / `source` / `duration` / `studios` / `rankings`; DB `provider_pins`; DB binding rows + `provider_absences` + live `episodes.for_source` | `detail_meta_fields()` (§5.3a) emits the ordered six-field list, rendered on the one compact `N eps · kind · …` line at every width and origin (Rank last, sheds first) ~~or the `Label  Value` rail (two-column surfaces, all eight)~~; provider and pin are not fields and instead draw `provider_line` ~~, the compact form's dedicated Provider/Pinned row beneath the joined line~~ , a dedicated row atop the episode grid, straight off the session (ROD-458, ROD-484) | Episodes is the floor: `? eps` ~~/ `Episodes  ?` in `[d]`~~ when no count is known, never omitted, so the line is never empty. Format/Source/Duration/Studios/Rank each omit outright when null; no orphan `·`~~, no bare rail row~~. The provider row omits outright when the show has no canonical identity, otherwise always renders (even all-`?`), dimming only when every provider is unchecked. The pin is a bold boost on its own token, so an unpinned show simply has no bold token, and a pin on a retired or unconfirmed provider shows nothing (§5.3a). The `nextAiringEpisode` countdown renders on the **chips row** (§4.4) instead: a live signal, not a stored snapshot |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
-| **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar, not duplicated in row 1 (the richer row-1 right-meta is an open question, §5.4/§11) | count degrades to `N / ? eps` on the bar when `total_episodes` is null |
+| **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar, not duplicated in row 1 (the richer row-1 right-meta was never built, §5.4/§11.3) | count degrades to `N / ? eps` on the bar when `total_episodes` is null |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
 | **History · season chip** | - | not rendered in rows | the history row is title + progress bar + meta; no chip (the detail pane carries the chips) |
 | **History · score badge** | - | not rendered in rows | the `[NN]` badge is omitted; the space is reclaimed by the title |
@@ -2711,8 +2725,9 @@ only**, row 2 is the §4.5 progress bar carrying the episode count
 (`[████░░]  N / M eps`; `N / ? eps` when `total_episodes` is null). The count is
 **not** duplicated into a row-1 meta column: it already rides the bar, and the
 status is already carried by the group header plus the row glyph. §5.4's richer
-row-1 right-meta (resume indicator `[▸N]`, season chip, status kanji) is an open
-question (§11) and would return in the title's row when ratified.
+row-1 right-meta (resume indicator `[▸N]`, season chip, status kanji) was never
+ratified and never built (§11.3); the no-duplication rule is the standing one
+(§10).
 
 ### 8.2 Title Language Preference
 
@@ -2781,18 +2796,19 @@ alt slots against whichever form is primary. Per-field italic styling is unchang
 by this generalization (§1.3, §4.4): native is italic whenever it is an alt row,
 romaji and English never are.
 
-### 8.3 History as the Default Landing View
+### 8.3 The Landing View: History Is the Floor
 
-The app opens to the History/Watchlist view **by default**. The landing view is a
-config setting (`landing`, surfaced as the Settings "landing view" cycle row);
-History stays the default and the fallback for any unrecognized value. History is
-home because it is the only configured landing backed by real data on launch: a
-Browse landing shows its idle search prompt (Browse is catalogue *search*, not a
-feed). The cycle offers three landings: **History**, **Browse**, and **last
-watched**. The last opens the most-recently-watched show's detail pane parked on
-its resume episode, and falls back to History whenever there is nothing to resume
-(empty history, every row never played, or a failed episode fetch; see below).
-Surfacing Discover as a fourth landing option is an open question (§11).
+The landing view is a config setting (`landing`, surfaced as the Settings
+"landing view" cycle row) offering three values: **History**, **Browse**, and
+**last watched**. `last_watched` is the shipped default (ROD-458). History is the
+fallback for any unrecognized value and the degrade target for a landing that
+cannot resolve, so it is the floor under all three: it is the only landing backed
+by real data on launch, where a Browse landing shows its idle search prompt
+(Browse is catalogue *search*, not a feed). `last_watched` opens the
+most-recently-watched show's detail pane parked on its resume episode, and falls
+back to History whenever there is nothing to resume (empty history, every row
+never played, or a failed episode fetch; see below). Discover is not a landing
+option (§11.5).
 
 **Resume landing (`last_watched`).** Resolved once, on the *initial* history load
 only, never on a mid-session reload after playback. The most-recently-watched show
@@ -2844,7 +2860,7 @@ Rendering rules:
   doesn't yet know what to watch, so the first action is the zero-input Discover
   feed, not Browse's blank `/` prompt (§10). Bold alone marks the keybind here;
   it is the same treatment the help line uses (§1.3).
-- Bottom bar: idle help line as normal (§3.5 State 1), including the `▌` blink.
+- Bottom bar: idle help line as normal (§3.5 State 1), including the `▌`.
   The empty state does not suppress navigation.
 - The message block is treated as a unit for centering: headline at `mid -2`, the
   `D` hint at `mid`, the `B` hint at `mid +2` (the §8.4 spacing Browse uses), each
@@ -3114,9 +3130,9 @@ In `Search` mode, printable characters append to `search_query`. On each
 keystroke, recompute the filtered result set and re-render the list column (the
 live AniList fetch itself is debounced; §4.10).
 
-The `▌` blink is `Modifier::SLOW_BLINK` on that cell. Blink timing is delegated to
-the terminal; no manual timer. (Some terminals suppress blink; §11 notes the
-question of whether a steady cursor is an acceptable degrade there.)
+The `▌` carries no blink modifier: it is a steady `color.hot` cell (§4.9,
+ROD-481). A bottom-bar test asserts no cell in any bar state carries
+`SLOW_BLINK`/`RAPID_BLINK`.
 
 ### 9.5 Resize Handling
 
@@ -3151,9 +3167,10 @@ struct AppState {
 }
 ```
 
-Defaults: `active_view` seeds from the `landing` config at startup (History
-default, §8.3); `active_pane = List`; `detail_origin = Browse`. This maps directly
-to the component state specs in §4. Each render pass reads from this state and
+Defaults: `active_view` seeds from the `landing` config at startup (History for
+both `"history"` and the default `"last_watched"`, which then auto-opens the
+resume detail, §8.3); `active_pane = List`; `detail_origin = Browse`. This maps
+directly to the component state specs in §4. Each render pass reads from this state and
 writes cells; no retained rendering state.
 
 ### 9.7 Color Token Constants File
@@ -3181,18 +3198,15 @@ This file is the single source of truth. Render code reads the active `Palette`'
 fields (§1.4), so tweaking a color, or switching themes, happens in exactly one
 place.
 
-### 9.8 Event Loop and Runtime: Deliberately Open
+### 9.8 Event Loop and Runtime
 
-The async runtime is an open decision (§11) and **this document does not bind
-it**. Two candidate shapes:
+The runtime is **`std::thread` + mpsc** (ROD-431/433, §11.1, §10): a blocking
+crossterm event reader thread, worker threads for network and playback, and one
+mpsc channel into a tick-driven render loop. reqwest's own runtime stays
+contained behind `blocking`. tokio was the rejected alternative; §10 holds the
+reasoning and the trigger that would reopen it.
 
-- **tokio:** async tasks for HTTP (AniList, cover fetches, provider calls) and
-  the mpv child process, feeding a UI channel; crossterm's `EventStream` for
-  input.
-- **threads + mpsc:** a blocking crossterm event reader thread, worker threads
-  for network/playback, one mpsc channel into a select/tick render loop.
-
-What the doc *does* bind, runtime-agnostically:
+What the doc binds independently of that choice, and what would survive a swap:
 
 - The **event vocabulary** of §4.10: the named in-progress flags, terminal-outcome
   events, and deliberate silences must exist regardless of runtime.
@@ -3216,7 +3230,7 @@ that history). Logged here so they can be revisited without archaeology.
 | Cover art crops (no letterbox) | A cropped image reads like a cover; letterboxed reads like a viewer with empty bars. The poster aspect ratio is the content. | If key art is consistently cropped badly, add letterbox as a toggle. |
 | Cover image footprint fill only: no `bg_surface` matte around the rendered image (ROD-164) | The slot geometry (fixed cell dimensions vs the poster's pixel aspect) produces unavoidable non-zero fit-matte at arbitrary terminal sizes; the cover math is rebuilt each frame from reported pixel/cell metrics that don't divide cleanly. Filling the full slot with `bg_surface` exposes this as a contrasting matte whose size varies with terminal geometry, and `bg_surface` means "elevated layer" (§1.1); mounting hero content in it is a semantic collision. Instead only the image footprint is painted; the leftover slot inherits `bg_base`, so the mismatch has nothing to contrast against (§0 "panes float in the void", §3.3 "no border"). `bg_surface` is preserved for placeholder states (loading spinner, "no art yet") where the panel itself is the content. PNG alpha composites onto `bg_base`. | If covers with heavy alpha transparency look wrong on `bg_base`, add a `bg_surface` fill scoped to the fit rect only (not the full slot). |
 | Single magenta cursor, not per-pane focus indicators | Two simultaneous magenta elements dilute the "pointer" semantic. The `·` dot in the top bar handles pane focus in `state.focus` (cyan) only. | If pane focus proves unclear, move the active pane label to a more prominent position. |
-| No animation on state transitions | Terminal Ghost's identity is restraint. The blink cursor already claims the one temporal channel. | If feedback identifies a specific transition that needs clarification, add a single-frame flash (not a slide). |
+| No animation on state transitions | Terminal Ghost's identity is restraint. Since the cursor blink was retired (ROD-481) nothing claims the temporal channel at all, and a transition is a poor candidate to be the first thing that does. | If feedback identifies a specific transition that needs clarification, add a single-frame flash (not a slide). |
 | Transparent mode resets only the `bg` tier; `surface`/`elevated` stay painted (ROD-511) | The base tier is the whole canvas (list and detail pane alike, ROD-458 F4), which is exactly what the user opted to see through; focused rows, cards, and toasts keep §1.1 contrast as opaque islands. No app-side alpha: the backdrop is unreadable and no opacity query exists, so `Color::Reset` is the only hook (§1.4a). | If painted islands over a blurred backdrop read as floating patches rather than layers, consider resetting `surface` too and carrying depth on borders and fg tiers alone. |
 | Kanji season/status chips without box borders | Box around kanji chips adds visual noise against an already dense detail pane. Color alone is sufficient on dark. | If user testing shows the chips are missed, add a dim `[` `]` wrap in `border.hair` color. |
 | Help line updates contextually per view | The bottom bar doubles as a contextual hint line. Fewer permanent labels means less to ignore. | If users report confusion about available keys, add a `?` keybind that shows a full key reference in `bg.elevated` overlay. |
@@ -3224,7 +3238,7 @@ that history). Logged here so they can be revisited without archaeology.
 | List column 38% / detail 62% at default width | Tested against 120-col and 160-col terminals. 38% gives ~45 chars for the list: enough for most anime titles without truncation. Detail gets the rest. | Adjust if common terminal widths expose truncation problems. |
 | `state.focus` (cyan) gated to the selected, list-focused row; status colors step off it (ROD-194) | One token can't mean both "the cursor" and "this show is airing/watching": a fully-filled watching bar in `state.focus` out-shouts the selected row, and pane focus becomes invisible when the selection looks identical focused or not. Reserving cyan for `selected and list_focused` fixes both: unselected watching/paused step down to `text.muted` (the `▸`/`◐` glyph still carries the status), and losing list focus visibly recedes the selected row (band drops, `▸` dims, title un-bolds). The `·` dot stays as low-weight orientation; the list itself carries the focus signal. Magenta remains reserved for the status-bar cursor. | If watchlist scanning suffers because watching rows no longer read as a cyan "heat signature" at a glance, trial `state.focus` dim (not full) for unselected watching, or widen the `text.muted`↔`text.dim` gap so watching vs completed bars stay distinct. |
 | `r` (not `:reset`) for progress recompute in History (ROD-193) | Single-level undo (`u`) goes stale after any subsequent key; the recovery window is one action, so the recompute deserves a direct key rather than waiting on `:` command mode. `r` is non-adjacent to `c` on Colemak-DH, so it can't be mis-keyed in the same motion. Recompute uses the sorted-index, translation-scoped strategy: `progress` = 1-based ordinal of the last fully-watched row among the `episode_progress` rows present, sorted by episode sort key. Intentionally under-counts gap-watching (only rows that were started are present). `Store::recompute_progress` is the single source of truth for these semantics. | If users want a "reset to 0" shortcut independent of the strategy, note that a show with no fully-watched rows already recomputes to 0; suggest deleting episode_progress rows via a future `:clear progress` command. |
-| Genre glyphs stay `text.dim` (`fg3`), single-space separated (ROD-247) | The glyphs are ambient texture, not a label; `text.dim` is the register for "present but not asking to be read." The real legibility problem was the two glyphs smushing into one shape, not brightness: a single space between them fixed that. `text.muted` (`fg2`) was tried and reverted: brighter made the glyphs compete with the format and episode count for attention, which own that row (`TV · 24ep`, §3.8). The spatial split (count left-anchored, glyphs right-anchored at the cover edge) plus the dim tier keeps each in its lane. | If the glyphs prove invisible in practice, widen the inter-glyph gap or drop to one before re-dimming. |
+| Genre glyphs stay `text.dim` (`fg3`), single-space separated (ROD-247) | The glyphs are ambient texture, not a label; `text.dim` is the register for "present but not asking to be read." The real legibility problem was the two glyphs smushing into one shape, not brightness: a single space between them fixed that. `text.muted` (`fg2`) was tried and reverted: brighter made the glyphs compete with the format and episode count for attention, which own that row (`TV · 24ep`, §3.8). The spatial split (count left-anchored, glyphs right-anchored at the cover edge) plus the dim tier keeps each in its lane. Legibility ratified at `fg3` (ROD-509, §11.4): the confusable pairs separate by fill, which dimming preserves, so the separator space is the mechanism holding them apart and every glyph added to §3.8a inherits it. | If the glyphs prove invisible in practice, widen the inter-glyph gap or drop to one before re-dimming. |
 | Nord `focus` stays hue-shift, **not** a luminance lift (ROD-184) | Nord violates the §1.1 focus-clears-`fg`-luminance rule: `focus` (nord8 frost, L 0.475) reads dimmer than `fg` (nord4 snow, L 0.727). The alternative was overdriving `focus` to a snow-storm value (nord6, L≈0.83) so the rule stays universal. Rejected: Nord's `fg` already sits the brightest of the four dark palettes, and lifting `focus` past it would push Nord toward a light-theme read, fighting §0's dark-only constraint. The nord8 hue-shift + bold carries focus distinction without adding luminance, faithful to Nord's own palette relationships. So the focus-clears-`fg`-luminance rule stays non-universal (§1.4): Terminal Ghost / Phosphor / TokyoNight honour it; Nord trades it for hue. A deliberate call, not a deferred fix. | If testing shows the Nord focused row is genuinely hard to locate (hue-shift + bold insufficient), revisit the lift, but bound it so Nord's `focus` does not cross into light-theme luminance. |
 | Studios collapse-format caps at 2 named studios, `+N` beyond (ROD-261) | Mirrors the §3.8a genre-glyph cap (≤2, ambient rather than exhaustive) and keeps ~~the rail's 8-col gutter from being blown out by~~ the compact line's width budget safe from a multi-studio co-production credit list. The full list still lives in the persisted column for any future full-detail surface; ~~this only caps the rail's render~~ this only caps the compact line's render (ROD-458). | If a 3-studio credit is the common case rather than the outlier, raise the cap to 3 before reaching for a wrap. |
 | Rank prefers a contextual RATED ranking over POPULAR when both exist, and drops the season name even for a season-scoped rank (ROD-261) | RATED reads closer to Rank's quality-signal intent: raw popularity was rejected as noise (§10.1), and a contextual *rank* needs to read as a different, sharper signal than that rejected field, not a rebrand of it. The season name is dropped from the render even when AniList scoped the ranking to a season, because the header's own season/year chip (§4.4) already carries that context on the same screen; repeating it would waste space Rank's 8-col gutter doesn't have. | If a season-scoped rank without the season name reads ambiguous in testing (e.g. a show that spans two cours), reconsider a compact season glyph. |
@@ -3232,7 +3246,7 @@ that history). Logged here so they can be revisited without archaeology.
 | Non-JP origin marker is a bare two-letter country code in `text.dim`, trailing last on the chips row, not a flag glyph (ROD-261) | An actual flag emoji is a Supplementary-Plane regional-indicator pair, outside the §2 "glyphs must fall inside the BMP" contract, and wouldn't render deterministically across this app's terminal targets. The dimmest available tier plus last-in-order placement keeps a rare, static fact from competing with the row's live status/season/countdown information; the common JP case shows nothing. | If CN/KR-origin shows are common enough in a user's library that the marker starts carrying real signal rather than being incidental, promote it to `text.muted` or a small dedicated icon. |
 | Italic stays pinned to the native-language title field, not to "whichever row is currently an alt" (ROD-205, §1.3/§8.2) | Generalizing italic to "any non-primary title row" would make the English alt row render italic under the default `romaji` preference, a visual change with no benefit. Keeping italic keyed to the native/Japanese-script field specifically preserves italic's §1.3 meaning (foreign script, not row position) while generalizing correctly for all three preferences: native gets italic whenever it lands in an alt slot and loses the treatment once it becomes primary (every primary line is bold, never italic). | If an English alt row reads too flat next to an italic native row in practice, reconsider as a fresh value judgment. |
 | ~~Rail's~~ ~~Pinned field~~ The provider row shows the raw provider name, not `display_name()` (ROD-345; ROD-484 moved the rule from the pin's own segment onto the tokens, which already followed it) | Matches the Settings `provider` row (§5.5), which renders the raw stored preference string. It is the same persisted identifier, just scoped per-show instead of globally, so consistency with that precedent outranks matching the toast-prose convention (`{provider}` = `display_name()` everywhere a sentence names a provider, §4.10). The split is deliberate: config-surface rows echo the stored identifier; user-facing prose speaks the display name. | If a provider's stored name and display name diverge enough to confuse users ~~in the rail~~ on `provider_line`, reconsider as a ~~rail-specific~~ `provider_line`-specific formatting fix, not by changing the Settings row's convention. |
-| Provider field folds availability and serving into one ~~rail~~ row, ASCII markers (`▸ + - ?`) instead of a new pictographic set (ROD-348/356) | A separate serving row plus a separate availability row would put three provider-ish rows next to each other (Pinned already there) for information that is really one axis per provider (what's known, what's active): one row reads as one fact family. The `◆`/`◈` and `◐`/`◎` glyph pairs have an unresolved dim-legibility question (§11); rather than risk a fourth confusable pair, the tri-state (plus "serving") uses plain ASCII shapes and reuses the already-proven `▸` resume glyph for "serving", a genuinely different glyph family. Shape carries the state rather than color because the Phosphor theme (§1.4) is monochrome, so a color-only distinction would be illegible there. | Even if the dim-legibility question resolves, the ASCII set stands on its own reasons (font-independence, zero substitution risk). |
+| Provider field folds availability and serving into one ~~rail~~ row, ASCII markers (`▸ + - ?`) instead of a new pictographic set (ROD-348/356) | A separate serving row plus a separate availability row would put three provider-ish rows next to each other (Pinned already there) for information that is really one axis per provider (what's known, what's active): one row reads as one fact family. The `◆`/`◈` and `◐`/`◎` glyph pairs carried an open dim-legibility question at the time (since resolved in their favour, §11.4); rather than risk a fourth confusable pair, the tri-state (plus "serving") uses plain ASCII shapes and reuses the already-proven `▸` resume glyph for "serving", a genuinely different glyph family. Shape carries the state rather than color because the Phosphor theme (§1.4) is monochrome, so a color-only distinction would be illegible there. | The dim-legibility question resolved in the pairs' favour and the ASCII set still stands on its own reasons (font-independence, zero substitution risk); a future marker set does not get to cite the pairs' legibility as licence to go pictographic here. |
 | Provider field lists providers in fixed registry (construction) order, not the per-walk preference order (ROD-348) | The preference order is a resolve-order hint, recomputed per preference and per walk; using it here would make the same show's ~~rail~~ line read in a different order across sessions as the user's global or per-show preference changes, breaking "scan the same column, same order, every show." ~~The rail is~~ This field is a status display of what's out there, not a queue of what to try next, so it wants a stable reference order. | If the registry grows past 4-5 providers and scanning a long fixed-order row gets noisy, consider grouping bound-first rather than reordering by preference: preference and "what's out there" are still different questions. |
 | Provider and Pinned surface on their own dedicated row, not as segments of the joined `·` meta line (ROD-348/356) | ~~A `rail_only` field never blooms below `DETAIL_TWO_COL_MIN`, which would leave Provider and Pinned invisible on every compact-width detail pane, exactly the width most terminals run at day to day.~~ Folding them into the joined line itself was rejected: routing/session state is a different category of fact from the AniList metadata the joined line otherwise carries, and interleaving muddies both. ~~The fix lives entirely in a bespoke compact-form row drawn beneath the joined line (`draw_provider_line`), outside the generic field-list iteration either renderer uses.~~ The fix lives entirely in `provider_line`, a dedicated row atop the episode grid, outside the generic field-list iteration `meta_line` uses (ROD-458: this row is now unconditional, not a compact-width special case). | If a third field ever needs the same "own row" treatment, generalize `provider_line` into a small family of bespoke rows rather than routing a third concept through it by special case. |
 | ~~Pinned's dedicated-row segment gets a `pin ` prefix; Provider's does not (ROD-348/356)~~ **Overturned by ROD-484, below.** | ~~Pinned's value is a bare raw provider name, ambiguous once it sits next to Provider's own token list on the same unlabeled row (a trailing bare name reads as an unmarked provider token, not the pin). Provider's value already carries its own marker glyphs (`▸ + - ?`), which self-disambiguate without a label. The `pin ` marker is a literal composed inside `draw_provider_line` / `provider_line`, not a generic `MetaField` mechanism; `MetaField` stays `{label, value, unit, dim, rail_only}` with no `prefix` field. Folding Pinned into Provider's token list instead (a marker on the pinned token) was rejected: a pin can target a provider independent of its bound/absent/unchecked state, so a folded marker would need to represent combinations the tri-state grammar was not designed for, for a marginal width saving, and it would lose Pinned's independent omit-when-unset behavior.~~ | ~~If a similar disambiguation need comes up for a future bespoke row, prefer a literal composed in that row's own renderer over adding a generic `MetaField.prefix`, unless a third bespoke row needs the exact same decoration.~~ |
@@ -3244,7 +3258,7 @@ that history). Logged here so they can be revisited without archaeology.
 | Score placeholder `[--/100]` (detail) / `[--]` (list) in [d] rather than omitting the score field | Preserving the score reservation keeps column alignment stable whether or not a score is present. A missing field would shift the surrounding layout when scores arrive. | If the placeholder is visually noisy across a full list of null scores, omit it and accept the reflow. |
 | Kanji chips fully omitted when null (not a placeholder) | An empty chip `[ ]` or a dim `放映中?` is worse than nothing. The chip's meaning is the kanji; without data it is just noise. The detail header still reads clearly without it. | The omission is the per-anime fallback for shows with no status/season data. |
 | No watchlist status glyph on Browse / search-result rows | History rows are loaded **from** the local store, so their watch-state is already in hand: that is why History ships status chips (§5.4). Browse results come from AniList over the network and carry no watch-state; a glyph there would mean a per-row local-DB (or cache) lookup the search path doesn't otherwise do. Adding that to the fast search path for a glyph isn't a trade Terminal Ghost makes. | If watch-state is ever cheap to have at search time (results joined against the store in one pass, or membership held in an in-memory cache) the glyph becomes nearly free; revisit then. |
-| History is the **default** landing view; the landing is configurable (ROD-228/229) | A Browse landing has no auto-populated content: Browse is catalogue *search*, so it lands on its idle search prompt. History is therefore the right default (and the fallback for any unrecognized value). The setting also offers `last_watched`, which opens the most-recently-watched show on its resume episode, falling back to History when there is nothing to resume. | Surfacing Discover as a landing-cycle choice is an open question (§11). |
+| The landing is configurable; `last_watched` ships as the default and History is the floor under every landing (ROD-228/229, ROD-458) | A Browse landing has no auto-populated content: Browse is catalogue *search*, so it lands on its idle search prompt. That leaves History as the fallback for an unrecognized value and as the degrade for `last_watched`, which opens the most-recently-watched show on its resume episode and drops to History whenever there is nothing to resume. `last_watched` is the shipped default because the common session starts by continuing something, and its worst case is the History landing anyway. | If the resume auto-open proves noisy on cold boots (a failed grid fetch toasting on every launch), flip the default back to `history`; the config value is the only thing that changes. |
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading: it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change reflects the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing: it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | `PANE_SPLIT_MIN = 60` is the single detail-surface threshold; no mid-tier zoom gate (ROD-170 → ROD-259) | 60 is the minimum useful list + detail column pair (`detail_w ≈ 25`), so users get the persistent preview on common 80-col terminals. The in-pane grid renders at every two-pane width: a mid-tier gate that withheld it (forcing `Enter`/`Space` to drill into the zoom just to reach the grid at 60–99 cols) was tried and retired as a dead step. `Enter` from a focused detail pane plays; `Space` promotes to the roomier zoom. | If the preview stack is too cramped at 60–79 cols, raise `PANE_SPLIT_MIN` to 80, but test first; the goal is a useful preview, not a perfect one. A new mid-tier gate would need a new reason. |
@@ -3262,6 +3276,10 @@ that history). Logged here so they can be revisited without archaeology.
 | `Space` as zoom toggle (promote + demote) (ROD-170) | Enter already plays episodes from the detail pane, so Enter-to-zoom would collide with Enter-to-play. `Space` is unused in Browse/History (Settings-only as a toggle), and "spacebar previews/expands" is a familiar idiom. A symmetric toggle (same key promotes and demotes) is more learnable than an asymmetric promote-only with Esc-only demote. `Esc` still demotes as the canonical "back" key. Rejected alternatives: `z` (vim `zt`/`zb` ambiguity), `o` (less obvious), `Tab` (reserved for future pane cycling). | If `Space` collides with a future keybind, `z` is the next candidate. |
 | Zoom Esc demotes to `.detail` pane, not `.list` (ROD-170) | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step; demoting to the detail pane is the precise inverse, and jumping straight to `.list` would skip a level, jarring on a long episode list the user was navigating. `Space`/`h` demote identically. (Exception: at `w < 60` there is no pane to land on, so they demote to the single-column list.) `q` is not a back key; it quits. | No revisit expected. |
 | The grid is always reachable: `Enter` drills toward wherever the grid is visible (ROD-170/259) | Play and zoom must be tied to where the grid is actually visible, or narrow terminals dead-end (no detail surface reachable) and mid widths can fire play against episodes the user can't see. Corrected model: the grid lives in the in-pane view (`w ≥ 60`) or the full-screen zoom (any width); `Enter` "drills toward the grid, then plays": `<60` list opens the zoom, `≥60` pane plays, zoom plays; `Space` opens the zoom from any detail context (and from the `<60` list directly). Episodes fetch on detail-pane entry at any two-pane width, so the zoom's grid is always ready once the pane has been entered. Demote is width-aware: back to the pane (`w ≥ 60`) or the list (`w < 60`). | No revisit expected; a future mid-tier gate would need a new reason. |
+| Runtime is `std::thread` + mpsc, not tokio (ROD-431/433; §11.1) | The 04 worker model is thread-and-channel shaped, every M0 spike ran on blocking reqwest plus threads, and `ratatui-image`'s `ThreadProtocol` works on plain mpsc; reqwest's own runtime stays contained behind `blocking`. §9.8's bindings (event vocabulary, spinner clock, debounces, render purity) are runtime-agnostic and survive a swap. | If a feature needs concurrency the thread model can't express (cancellation trees, thousands of in-flight requests), reopen it as a fresh call rather than smuggling an executor in beside the threads. |
+| Kitty-graphics covers must render in ghostty, kitty and wezterm; every other terminal degrades to halfblocks (ROD-417; §11.2) | ghostty is the daily driver and is visually ratified; kitty and wezterm ride the same `ratatui-image` protocol branch, so they are spot-checks of one implementation, not three. tmux gets halfblocks plus fixed fallback heights, which is what makes headless and self-driven runs (the capture rig, the drive-tui skill) work at all. | If a fourth terminal becomes a daily driver, ratify it visually before adding it to the matrix: sharing the protocol branch is what makes a spot-check sufficient, and a terminal outside it is a new claim. |
+| The `▌` is steady, never SGR blink (ROD-481; §11.6) | ghostty never rendered SGR blink and kitty did, so one spec produced two different cursors; where it did render, a blinking block in the corner read as a stray terminal cursor rather than a status marker. Nothing else in the UI uses the temporal channel, so the retirement costs no signal and needs no fallback timer (§6.4's no-manual-timing rule holds). | A future state wanting the temporal channel has to argue for it from scratch: the bottom-bar test forbidding `SLOW_BLINK`/`RAPID_BLINK` on every cell is the gate it must move. |
+| History row 1 is title-only; the episode count lives on the row-2 bar and is never duplicated into row 1 (ROD-509; §11.3) | The row pair gives each line one job: row 1 identifies (status glyph + title, and the title gets the full width before truncation), row 2 quantifies (bar + `N / M eps`). Duplicating the count into row 1 spends title width on a fact the line directly below already carries. The §5.4 comp's richer right-meta (resume indicator + season + status chips) was authored but never ratified and never built. | If finding the next episode to resume takes a scan rather than a glance (users asking where the resume number went, or reaching for the detail pane to answer it), spec a row-1 resume indicator on its own terms; reviving the §5.4 comp wholesale would drag the duplicated count back with it. |
 | Toast copy uses `·` as its clause separator | Port-time call: toast copy like `mpv not found · install mpv` uses the app's own metadata-separator idiom rather than a dash. Keeps every §4.10 string one visual grammar with the rest of the chrome (this doc also bans dash separators in prose). | If a toast ever needs a true sentence break, reword the copy; do not introduce a second separator style. |
 
 ### 10.1 Metadata Field Survey (ratified ship/skip verdicts)
@@ -3294,6 +3312,10 @@ nothing; no placeholder, no orphan separator~~, no bare rail row~~.
 Genuinely undecided items. The spec above does not resolve these; do not treat
 any of them as settled by implication.
 
+**Nothing is open as of 2026-07-31 (ROD-509).** All six entries are resolved and
+kept struck in place: the resolution and its date are the record. Anything whose
+resolution constrains future work also has a row in §10, with its trigger.
+
 1. ~~**Async runtime: tokio vs `std::thread` + mpsc.**~~ **Resolved 2026-07-17
    with the M1 cut (ROD-431/433): `std::thread` + mpsc.** The 04 worker model is
    thread-and-channel shaped, all six spikes ran on blocking reqwest + threads,
@@ -3309,23 +3331,52 @@ any of them as settled by implication.
    halfblocks. ghostty is visually ratified; kitty and wezterm remain
    spot-checks (same `ratatui-image` protocol branch). tmux survival is verified
    (halfblocks + fixed fallback heights, required for headless/self-driven use).
-3. **History row-1 right-meta.** The §5.4 mock draws a rich right-meta column on
-   the title row (`[▸12] 冬 2024 放映中`: resume indicator + season + status
-   chips). Not ratified; the ratified baseline is title-only row 1 with the count
-   on the bar row. Settle the column spec before building it.
-4. **Dim-glyph legibility.** Whether `◆`/`◈` (Drama/Mystery) and `◐`/`◎`
-   (Psychological/Sports) resolve distinctly at `text.dim` in real terminal fonts
-   is unresolved (§3.8a). If not, the genre glyph vocabulary needs substitutes
-   for one of each pair.
-5. **Discover as a landing-cycle option.** The `landing` cycle offers
-   `history · browse · last_watched` (§8.3). Adding `discover` was flagged as a
-   follow-up in the source design and never ratified.
-6. **Blink support variance.** The `▌` cursor relies on the terminal honouring
-   `SLOW_BLINK` (§9.4). Some terminals suppress blink, degrading it to a steady
-   magenta cursor. Decide during the TUI spike whether that degrade is acceptable
-   or the blink needs a manual timer (which §6.4 currently rules out).
+3. ~~**History row-1 right-meta.**~~ **Resolved 2026-07-31 (ROD-509): not built.
+   The ratified baseline is what shipped.** `draw_title_row` renders the status
+   glyph and the title, nothing else; the count rides the row-2 bar as
+   `N / M eps` (`src/tui/view/history.rs`). The §5.4 mock's
+   `[▸12] 冬 2024 放映中` column stays in the doc as a comp of an unbuilt target,
+   not as a spec. §10 carries the invariant it settles.
+4. ~~**Dim-glyph legibility.**~~ **Resolved 2026-07-31 (ROD-509): the pairs hold
+   at `text.dim`.** Rendered at `fg3` on `bg.base` under the README capture rig's
+   terminal conditions (kitty, font 16, stock font config), `◆`/`◈` and `◐`/`◎`
+   stay distinct: each pair separates by fill (solid vs outline, half vs ring),
+   which survives dimming, rather than by fine detail, which would not. `❖`
+   (Slice of Life), the third diamond-family entry, was checked against both and
+   separates by mass: it renders visibly smaller and pinched next to `◆`'s solid
+   body and `◈`'s nested outline. `⚜`/`✿` likewise. The glyphs collapse only when
+   set adjacent with no separator, which is the ROD-247 finding the shipped
+   renderer already obeys (`glyphs.join(" ")` at `palette.fg3`). §3.8a's
+   vocabulary stands; no substitutes.
+5. ~~**Discover as a landing-cycle option.**~~ **Resolved 2026-07-31 (ROD-509):
+   not adopted.** The shipped cycle is `history · browse · last_watched`
+   (`LANDING_PRESETS`, `src/tui/view/settings.rs`). A landing option earns its
+   config slot by being somewhere a user wants to *start* every session; Discover
+   is where they go when the watchlist has nothing for them, and the empty-history
+   state already routes there with a single `D` (§8.3).
+6. ~~**Blink support variance.**~~ **Resolved 2026-07-23 (ROD-481): blink retired
+   everywhere, the `▌` is steady `state.now`.** The degrade question is moot
+   because the blink is gone on terminals that honour `SLOW_BLINK` too: ghostty
+   never rendered it and kitty did, so one spec produced two different cursors,
+   and where it did render, a blinking block in the corner read as a stray
+   terminal cursor rather than a status marker. No manual timer, so §6.4 stands
+   unchanged.
 
 ## Changelog
+
+**2026-07-31 (ROD-509):** Retitled from `Status: spec` to a living spec: the app
+is shipped, the doc describes it, and code/doc disagreement is drift with a bug
+on one side. zigoku's retirement is recorded in the header, so parity is no
+longer a reason for anything here. §11's four remaining questions are struck in
+place with their verdicts (History row 1 stays title-only; the `◆`/`◈` and
+`◐`/`◎` pairs are legible at `fg3`; Discover is not a landing option; the blink
+went in ROD-481), leaving nothing open. §10 gained the runtime call, the cover
+support matrix, the steady `▌` and History's row-1 invariant, each with a
+trigger. Corrected across the doc: every reference to a blink the code has a
+test forbidding (§5.1, §5.2, §6.4, §6.5, §7.5, §5.5, §8.3, §9.4), the §8.3
+landing default (`last_watched` ships as default, History is the floor under all
+three, §7.1/§5.5/§9.6 with it), and §9.8, which no longer presents the runtime as
+two candidate shapes.
 
 **2026-07-31 (ROD-511):** Added §1.4a: the `transparent_background` config
 toggle maps the `bg` tier to `Color::Reset` (terminal default) so the
