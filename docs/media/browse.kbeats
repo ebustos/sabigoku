@@ -13,7 +13,7 @@ sleep 2
 key shift+b
 sleep 1500ms
 
-record browse.gif fps=15 width=960
+record browse.gif fps=15
 sleep 900ms
 
 # search the catalogue; typing animates, then results + covers stream in

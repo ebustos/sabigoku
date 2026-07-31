@@ -26,12 +26,15 @@ key shift+s
 sleep 1500ms
 key j j j j j j j j             # down to the palette row (Interface section)
 sleep 600ms
-resize 1280x800                 # narrow: good for the settings still AND the tour gif
-                                # (can't resize mid-record, so record the whole tour here)
+resize 1300x1150                # tall + narrow: the only frame that fits the whole
+                                # options list, Player through Updates
 grab settings.png               # settings, palette row focused
 sleep 500ms
 
-record stills.gif fps=15 width=960
+resize 1600x1000                # 16:10 for the tour gif (can't resize mid-record, so
+                                # the whole tour is recorded at this one size)
+sleep 400ms
+record stills.gif fps=15
 sleep 700ms
 key l                           # cycle palette forward: terminal_ghost → phosphor
 sleep 1300ms
@@ -39,6 +42,14 @@ key l                           # → nord
 sleep 1300ms
 key l                           # → tokyonight
 sleep 1300ms
+
+key j                           # onto transparent background, the row below palette
+sleep 900ms
+key space                       # ON: the palette's bg drops to the terminal's own
+sleep 1700ms
+key space                       # OFF again, so detail-themed.png keeps tokyonight's bg
+sleep 900ms
+
 key F2                          # back to the re-themed watchlist (SAVES → toast fires)
 # Hold past the toast's 2.5s auto-dismiss so the re-themed frames are clean:
 # the "settings saved" toast otherwise overlaps the footer.
@@ -47,6 +58,6 @@ key l                           # enter the detail pane (re-themed cover), toast
 sleep 1400ms
 endrecord                       # gif ends on the clean re-themed detail
 
-resize 1596x996                 # back to wide for the two-pane re-themed detail still
+resize 1996x1240                # back to wide for the two-pane re-themed detail still
 sleep 800ms
 grab detail-themed.png          # two-pane detail, re-themed to tokyonight, toast-free

@@ -18,7 +18,7 @@ grab browse-covers.png          # Discover cover-wall, WIDE: two full rows of co
 # The single-pane detail zoom leaves the right half empty at the wide default.
 # Shrink to a standard window so it reads balanced, grab, then restore the wide
 # size for the two-pane History view.
-resize 1280x800
+resize 1300x1150
 key Return
 sleep 4s                        # open #1's detail zoom: cover + kanji chips + synopsis
                                 # + episode grid (the grid loads a beat after the pane)
@@ -28,7 +28,7 @@ key Escape                      # back out of the zoom (NEVER Return here; it pl
 sleep 600ms
 key shift+h
 sleep 1400ms
-resize 1596x996                 # back to wide for the two-pane view
+resize 1996x1240                # back to wide for the two-pane view
 key j j j
 sleep 900ms
 grab history.png                # real watchlist master-detail (grouped status + covers)

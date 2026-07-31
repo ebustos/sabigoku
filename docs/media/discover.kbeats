@@ -13,7 +13,8 @@ sleep 2
 key shift+d
 sleep 7s                  # live feed load (AniList ranking + covers)
 
-record discover.gif fps=15 width=960
+record discover.gif fps=15 width=1200   # narrower than the default: a full-motion
+                                        # cover wall is the heaviest gif we encode
 sleep 800ms
 
 # sweep the selection across the grid; the highlight moves cover to cover

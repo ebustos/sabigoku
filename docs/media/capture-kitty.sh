@@ -42,12 +42,25 @@ set -uo pipefail
 
 # ── config (env-overridable) ──────────────────────────────────────────────────
 DISP="${SC_DISPLAY:-:99}"
-SCRW="${SC_SCRW:-1600}"; SCRH="${SC_SCRH:-1000}"   # Xvfb screen, ~150x51 grid; roomy
-                                                   # enough for 2 full Discover cover rows
+# Xvfb canvas. It is the hard ceiling on both WIN0W/WIN0H and any `resize` beat;
+# anything larger is silently clamped by Xvfb. Kept taller than the default
+# window because the settings still needs a ~1150px-tall frame for its whole
+# options list.
+SCRW="${SC_SCRW:-2000}"; SCRH="${SC_SCRH:-1300}"
+# Default window, ~191x41 cells. The height is pinned to the widest band that
+# still shows exactly two Discover cover rows WITH their caption blocks: ~40px
+# taller starts a third row that the footer then clips, ~90px shorter drops the
+# second row's captions.
+WIN0W="${SC_WINW:-1996}"; WIN0H="${SC_WINH:-1240}"
+# DO NOT raise the font to gain resolution. Cached cover art is 230px wide
+# (AniList "large") and the two render paths degrade differently as cells grow:
+# the Discover/Browse wall crops and never upscales, so covers strand as
+# thumbnails in oversized slots, while the detail pane scales past native, so
+# its cover fills the box but goes soft. Grow the window, not the glyphs.
 FONTSIZE="${SC_FONTSIZE:-16}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUTDIR="${SC_OUTDIR:-$ROOT/docs/media}"
-STILL_BUDGET="${SC_STILL_BUDGET:-$((500*1024))}"   # GitHub sizing budget for stills
+STILL_BUDGET="${SC_STILL_BUDGET:-$((800*1024))}"   # GitHub sizing budget for stills
 
 CHECK=""; ARGS=()
 for a in "$@"; do
@@ -162,7 +175,7 @@ xdpyinfo >/dev/null 2>&1 || { echo "Xvfb $DISP failed to come up" >&2; cat "$TMP
 
 kitty --class sabicap --config NONE \
       -o linux_display_server=x11 \
-      -o initial_window_width="$SCRW" -o initial_window_height="$SCRH" \
+      -o initial_window_width="$WIN0W" -o initial_window_height="$WIN0H" \
       -o font_size="$FONTSIZE" -o cursor_blink_interval=0 \
       bash "$ROOT/docs/media/capture-launch.sh" >"$TMP/kitty.log" 2>&1 &
 KITTY_PID=$!
@@ -177,10 +190,10 @@ done
 [ -n "$WID" ] || { echo "no kitty window appeared" >&2; exit 1; }
 xdotool windowmap "$WID" 2>/dev/null; xdotool windowraise "$WID" 2>/dev/null
 # kitty IGNORES initial_window_width under bare Xvfb (no WM) and opens at a small
-# default, so force the window to (nearly) fill the screen and let the app reflow
+# default, so force the window to the target size and let the app reflow
 # (SIGWINCH) before we read the final geometry. This is what gives Discover its
 # 2nd full cover row.
-xdotool windowsize "$WID" "$((SCRW-4))" "$((SCRH-4))"
+xdotool windowsize "$WID" "$WIN0W" "$WIN0H"
 sleep 1.5
 read -r WINW WINH < <(xdotool getwindowgeometry --shell "$WID" | awk -F= '/WIDTH/{w=$2} /HEIGHT/{h=$2} END{print w, h}')
 echo "booted: window ${WINW}x${WINH} on $DISP"
@@ -222,11 +235,11 @@ grab() {  # grab <file>: framebuffer cropped to the kitty window, kept under bud
   fi
   echo "  grab → $1 ($(magick identify -format '%wx%h' "$out"), $((bytes/1024)) KB)"
 }
-REC_OUT=""; REC_FPS=15; REC_W=960
+REC_OUT=""; REC_FPS=15; REC_W=1440
 rec_start() {  # record <file> [fps=N] [width=N]
   is_bad_name "$1" && { echo "  refusing record to unsafe path: '$1'" >&2; return 1; }
   [ -n "$FF_PID" ] && { echo "  record already in progress ($REC_OUT); endrecord first" >&2; return 1; }
-  REC_OUT="$1"; REC_FPS=15; REC_W=960; shift
+  REC_OUT="$1"; REC_FPS=15; REC_W=1440; shift
   for kv in "$@"; do case "$kv" in fps=*) REC_FPS="${kv#fps=}";; width=*) REC_W="${kv#width=}";; esac; done
   rm -rf "$TMP/frames"; mkdir -p "$TMP/frames"
   # -nostdin + </dev/null: keep ffmpeg off stdin. The read-loop is already on fd 3,

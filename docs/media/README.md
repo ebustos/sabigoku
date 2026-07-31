@@ -11,13 +11,24 @@ fallback and can never capture one. Driving a real kitty and grabbing its
 framebuffer is the only way, and it means every asset, including the hero gif
 and the Discover wall, shows **real covers**.
 
-Default capture is a roomy **1600×1000** Xvfb screen (font size 16 ≈ a 150×51
-grid), so the Discover feed shows **two full rows** of cover art. Views that
-don't reflow to fill that width (the single-pane detail zoom and the settings
-list) are shrunk per-grab with a `resize` beat so they read balanced instead of
-half-empty. kitty ignores `initial_window_width` under a bare (no-WM) Xvfb, so
-the runner sets the size with `xdotool windowsize` after launch and lets the
-app reflow.
+Default capture is a **1996×1240** window (font size 16 ≈ a 191×41 grid) on a
+slightly larger **2000×1300** Xvfb canvas, so the Discover feed shows **two full
+rows** of cover art with their caption blocks. Views that don't reflow to fill
+that width (the single-pane detail zoom and the settings list) are shrunk
+per-grab with a `resize` beat so they read balanced instead of half-empty. kitty
+ignores `initial_window_width` under a bare (no-WM) Xvfb, so the runner sets the
+size with `xdotool windowsize` after launch and lets the app reflow.
+
+The canvas is deliberately larger than the window: it is the hard ceiling on any
+`resize` beat, and the settings still needs a 1150px-tall frame to fit its whole
+options list.
+
+**Resolution comes from the window, never the font.** Cached cover art is 230px
+wide (AniList `large`), and the two cover render paths degrade differently once
+a cell outgrows it. The Discover/Browse wall crops and never upscales, so
+raising `SC_FONTSIZE` strands every cover as a thumbnail in an oversized slot.
+The detail pane scales past native instead, so its cover fills the box but goes
+soft. Grow `SC_WINW`/`SC_WINH` instead.
 
 ## Regenerate
 
@@ -54,7 +65,7 @@ live sabigoku. Comments start with `#`. Commands:
 | `sleep <dur>` | wait: `900ms`, `2.5s`, or bare seconds |
 | `resize <W>x<H>` | resize the window (app reflows); use before a `grab` that wants a narrower frame. Never mid-`record`. |
 | `grab <file.png>` | screenshot the framebuffer, crop to the window, write to `docs/media/` |
-| `record <file.gif> [fps=N] [width=N]` … `endrecord` | x11grab the window, encode with gifski |
+| `record <file.gif> [fps=N] [width=N]` … `endrecord` | x11grab the window, encode with gifski (defaults 15fps, 1440px wide) |
 
 It's an iterate loop: edit the beats, re-run, eyeball, adjust `sleep`/keys. See
 `demo.kbeats` for a worked example.
@@ -66,9 +77,9 @@ It's an iterate loop: edit the beats, re-run, eyeball, adjust `sleep`/keys. See
 | `demo.gif` | `demo.kbeats` | **Hero:** watchlist master-detail with **live cover art** (cover updates per selection) → typed filter down to the Frieren detail. |
 | `discover.gif` | `discover.kbeats` | **Discover tour:** the ranked cover wall; sweep the grid, switch the ranking axis (`Trending` → `Popular`), a fresh wall of covers loads. |
 | `browse.gif` | `browse.kbeats` | **Browse tour:** live catalogue search; type a query and real covers stream into the two-pane results. |
-| `stills.gif` | `stills.kbeats` | **Themes tour:** Settings palette cycle re-theming a two-pane detail. |
+| `stills.gif` | `stills.kbeats` | **Themes tour:** Settings palette cycle re-theming a two-pane detail, then the transparent-background toggle dropping the palette's bg to the terminal's own. |
 | `watchlist.png` | `stills.kbeats` | Populated watchlist (default **terminal_ghost**), grouped status + progress bars. |
-| `settings.png` | `stills.kbeats` | Settings tab, palette row focused. |
+| `settings.png` | `stills.kbeats` | Settings tab, palette row focused, whole options list visible (Player through Updates). |
 | `detail-themed.png` | `stills.kbeats` | Two-pane detail re-themed to **tokyonight**. |
 | `detail-cover.png` | `covers.kbeats` | **Discover** #1 detail zoom: real cover + kanji chips + score + synopsis + episode grid. |
 | `browse-covers.png` | `covers.kbeats` | **Discover feed:** a wall of real Kitty-graphics cover art. |
@@ -116,10 +127,11 @@ adds three guards on top:
 - **`unset TMUX`:** if TMUX leaks in, the graphics protocol goes out in
   tmux-passthrough form, which a non-tmux kitty rejects: no cover. (sabigoku
   under tmux falls back to the halfblock mosaic; see the drive-tui skill.)
-- **Sizing (GitHub budget):** hero gif **< 3 MB**, stills **< 500 KB**. `grab`
+- **Sizing (GitHub budget):** hero gif **< 3 MB**, stills **< 800 KB**. `grab`
   auto-quantizes a still to a 256-colour PNG only if it would bust the budget
   (the Discover cover-wall needs it; nothing else does): no visible banding, no
-  downscale.
+  downscale. The wall is ~1.8 MB truecolor and quantizes to ~526 KB, so it is
+  the one asset the budget check actually fires on.
 - **Software GL** (llvmpipe) is plenty at 15fps. On a compressed FS, `du`
   under-reports on-disk size; the runner reports logical bytes (`stat`) so the
   budget check stays accurate.

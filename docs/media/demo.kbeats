@@ -21,7 +21,7 @@ sleep 400ms
 key k k k
 sleep 900ms
 
-record demo.gif fps=15 width=960
+record demo.gif fps=15
 sleep 700ms
 
 # Browse the watchlist: the right-pane cover updates per selection (now warm).
