@@ -4257,6 +4257,22 @@ mod tests {
     }
 
     #[test]
+    fn transparent_bg_toggle_projects_live() {
+        use ratatui::style::Color;
+        let (mut app, tx, now) = sized("settings-transparent", 100, 32);
+        app.tick(ch('S'), now, &tx);
+        // Down to the transparent background row (index 9), flip it twice.
+        for _ in 0..9 {
+            app.tick(ch('j'), now, &tx);
+        }
+        app.tick(ch(' '), now, &tx);
+        assert!(app.config.transparent_background);
+        assert_eq!(app.palette.bg, Color::Reset, "repaints on the next frame");
+        app.tick(ch(' '), now, &tx);
+        assert_eq!(app.palette.bg, theme::by_name(&app.config.palette).bg);
+    }
+
+    #[test]
     fn translation_cycle_rekeys_an_engaged_grid() {
         let (mut app, tx, rx, now) = play_harness("settings-trans");
         let t1 = open_first_result(&mut app, &tx, &rx, now);

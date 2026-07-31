@@ -98,8 +98,8 @@ already applied app-wide.*
   `~/.config/sabigoku/config.toml`. Four palettes: `terminal_ghost`,
   `phosphor`, `nord`, `tokyonight`, each with an optional transparent
   background that lets your terminal's own opacity or blur show through
-  (panels and toasts stay opaque; pair with a cell-opacity option like
-  ghostty's `background-opacity-cells` if you want those blended too).
+  (highlights, popups and toasts stay opaque; pair with a cell-opacity option
+  like ghostty's `background-opacity-cells` if you want those blended too).
 - **Self-updating**: a boot check toasts when a newer release exists;
   `sabigoku update` upgrades in place.
 - **Scriptable CLI**: `sabigoku <query>` runs a search → pick → play flow,

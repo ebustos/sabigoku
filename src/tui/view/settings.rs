@@ -104,7 +104,7 @@ pub const ROWS: [Row; 15] = [
     row(RowId::Palette, "palette", RowKind::Cycle, "hjkl to cycle"),
     row(
         RowId::TransparentBg,
-        "transparent bg",
+        "transparent background",
         RowKind::Toggle,
         "space to toggle",
     ),
