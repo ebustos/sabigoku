@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::domain::{self, StreamLink};
+use crate::domain::{self, StreamLink, is_absolute_url};
 use crate::fetchguard::{GuardError, guard_fetch_url};
 use crate::proxy::{self, ProxyStartError};
 
@@ -246,7 +246,7 @@ fn build_argv(
         }
         argv.push(format!("--user-agent={ua}"));
     }
-    if play_url.starts_with("http://") || play_url.starts_with("https://") {
+    if is_absolute_url(play_url) {
         argv.push("--stream-lavf-o=multiple_requests=1,icy=0".into());
     }
     if let Some(sub) = &link.sub_url {

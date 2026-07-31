@@ -14,10 +14,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::http::{Accept, HttpClient, Method, Request};
-use crate::domain::{Enrichment, Quality, StreamLink, Translation, is_still_airing};
+use crate::domain::{
+    Enrichment, Quality, StreamLink, Translation, is_absolute_url, is_still_airing,
+};
 use crate::fetchguard::guard_fetch_url;
 use crate::providers::{
-    CoverRequest, ProviderError, SEARCH_PAGE_SIZE, SearchHit, SearchOptions, StreamProvider,
+    CoverRequest, MAX_COVER_REF_LEN, ProviderError, SEARCH_PAGE_SIZE, SearchHit, SearchOptions,
+    StreamProvider, clean_arg, guard_show_id,
 };
 
 const API: &str = "https://senshi.live";
@@ -25,8 +28,6 @@ const API: &str = "https://senshi.live";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 // Stream CDN (ninstream) 403s a refererless GET; gate on this origin.
 const STREAM_REFERER: &str = "https://senshi.live/";
-// Cap on a cover ref before splicing into a fetch URL (mirrors allanime).
-const MAX_COVER_REF_LEN: usize = 2048;
 
 // ── catalog DTOs ────────────────────────────────────────────────────────────
 // Both /anime/filter (`{data:[…]}`) and trending (bare array); `id` is the MAL
@@ -271,16 +272,6 @@ fn percent_decode(s: &str) -> String {
 
 // ── input guards ────────────────────────────────────────────────────────────
 
-/// Show id is digits only (stringified MAL id). Reject before URL path splice
-/// so `../…` or `1/x` cannot smuggle a second path segment.
-fn guard_show_id(show_id: &str) -> Result<(), super::ProviderError> {
-    if !show_id.is_empty() && show_id.bytes().all(|c| c.is_ascii_digit()) {
-        Ok(())
-    } else {
-        Err(super::ProviderError::Decode("invalid show id".into()))
-    }
-}
-
 /// Episode label is `ep_label` shape: digits, at most one `.`. Reject path
 /// tricks before URL splice.
 fn guard_ep_label(s: &str) -> Result<(), super::ProviderError> {
@@ -299,16 +290,6 @@ fn guard_ep_label(s: &str) -> Result<(), super::ProviderError> {
         }
     }
     Ok(())
-}
-
-/// Safe for a fetch URL / mpv argv: printable ASCII only (0x21-0x7e). Catches
-/// CR/LF and any control a `<0x20` denylist would miss.
-fn clean_arg(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|c| (0x21..=0x7e).contains(&c))
-}
-
-fn is_absolute_url(s: &str) -> bool {
-    s.starts_with("http://") || s.starts_with("https://")
 }
 
 /// Sidecar CDN empty/403 windows (ROD-309): bounded retries with escalating
@@ -837,15 +818,6 @@ mod tests {
     }
 
     #[test]
-    fn guard_show_id_is_digits_only() {
-        assert!(guard_show_id("59708").is_ok());
-        assert!(guard_show_id("").is_err());
-        assert!(guard_show_id("1/x").is_err());
-        assert!(guard_show_id("../7").is_err());
-        assert!(guard_show_id("12a").is_err());
-    }
-
-    #[test]
     fn guard_ep_label_allows_one_dot() {
         assert!(guard_ep_label("1").is_ok());
         assert!(guard_ep_label("13.5").is_ok());
@@ -853,15 +825,6 @@ mod tests {
         assert!(guard_ep_label("1.2.3").is_err());
         assert!(guard_ep_label("1/2").is_err());
         assert!(guard_ep_label("e1").is_err());
-    }
-
-    #[test]
-    fn clean_arg_rejects_controls_and_space() {
-        assert!(clean_arg("https://cdn/v.m3u8"));
-        assert!(!clean_arg("a b"));
-        assert!(!clean_arg("a\nb"));
-        assert!(!clean_arg("a\r\nb"));
-        assert!(!clean_arg(""));
     }
 
     // ── golden fixtures (live capture 2026-07-18, trimmed) ──────────────────
