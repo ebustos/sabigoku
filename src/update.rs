@@ -494,11 +494,11 @@ mod tests {
         // kill -0, and an orphan reparented to a PID 1 that never reaps (a CI
         // job container's `tail -f /dev/null`) stays one indefinitely. An empty
         // row means reaped, Z means dead and unburied; both are gone.
-        let state = Command::new("ps")
+        let probe = Command::new("ps")
             .args(["-o", "stat=", "-p", &pid])
             .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_default();
+            .expect("ps must run to probe the grandchild's state");
+        let state = String::from_utf8_lossy(&probe.stdout).trim().to_string();
         let _ = std::fs::remove_file(&marker);
         assert!(
             state.is_empty() || state.starts_with('Z'),
