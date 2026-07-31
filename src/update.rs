@@ -490,16 +490,19 @@ mod tests {
             .expect("leader recorded the grandchild pid")
             .trim()
             .to_string();
-        // kill -0 succeeds only for a live process: the backgrounded sleep
-        // must be gone, not orphaned to init.
-        let alive = Command::new("kill")
-            .args(["-0", &pid])
-            .status()
-            .is_ok_and(|s| s.success());
+        // Probe the state, not signal deliverability: a zombie still answers
+        // kill -0, and an orphan reparented to a PID 1 that never reaps (a CI
+        // job container's `tail -f /dev/null`) stays one indefinitely. An empty
+        // row means reaped, Z means dead and unburied; both are gone.
+        let probe = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .expect("ps must run to probe the grandchild's state");
+        let state = String::from_utf8_lossy(&probe.stdout).trim().to_string();
         let _ = std::fs::remove_file(&marker);
         assert!(
-            !alive,
-            "the backgrounded grandchild (pid {pid}) must be killed with the group"
+            state.is_empty() || state.starts_with('Z'),
+            "the backgrounded grandchild (pid {pid}) must be killed with the group (ps stat {state:?})"
         );
     }
 
