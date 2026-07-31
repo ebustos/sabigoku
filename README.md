@@ -42,7 +42,7 @@ on cover, kanji chips, and synopsis.*
 
 ![Discover: a ranked wall of real cover art, sweeping and reloading live](https://raw.githubusercontent.com/vantroy/sabigoku/master/docs/media/discover.gif)
 
-*Discover: a ranked wall of real cover art, ten shows a screen, across
+*Discover: a ranked wall of real cover art across
 `Trending` / `Popular` / `Top Rated` / `This Season`. Moving the selection
 sweeps cover to cover; switching the ranking axis reloads a fresh wall, live
 from the AniList rankings.*
