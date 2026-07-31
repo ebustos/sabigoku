@@ -364,8 +364,8 @@ fn draw_title_row(
     if selected && focused {
         frame.render_widget(Block::new().style(Style::new().bg(palette.surface)), row);
     }
-    // Row 1 is title-only at every width (DESIGN 5.4a; the richer right-meta
-    // is an open question).
+    // Row 1 is title-only at every width; the count belongs to the bar row and
+    // is never duplicated here (DESIGN 5.4a, 10).
     let title = preferred_title(
         &show.enrichment.title_romaji,
         show.enrichment.title_english.as_deref(),

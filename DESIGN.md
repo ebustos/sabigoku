@@ -724,10 +724,13 @@ returned order).
 | Supernatural | ☽ | U+263D | Crescent moon |
 | Thriller | ↯ | U+21AF | Lightning |
 
-The `◆`/`◈` and `◐`/`◎` pairs are legible at `text.dim` (ratified ROD-509,
-§11.4). They separate by fill, which dimming preserves; the single separator
-space is what stops two adjacent glyphs merging into one shape (ROD-247). A
-glyph added here inherits both requirements.
+The `◆`/`◈`/`❖` and `◐`/`◎` shapes are legible at `text.dim` (ratified ROD-509,
+§11.4). They separate at silhouette level (fill, mass, outline weight), which
+dimming preserves, never by internal fine detail, which it erases; the single
+separator space is what stops two adjacent glyphs merging into one shape
+(ROD-247). A glyph added here inherits both rules and the test that established
+them: render it at `fg3` on `bg.base` beside its nearest neighbour in this
+table (§11.4's conditions). A codepoint chart is not the test.
 
 ---
 
@@ -3276,7 +3279,7 @@ that history). Logged here so they can be revisited without archaeology.
 | Runtime is `std::thread` + mpsc, not tokio (ROD-431/433; §11.1) | The 04 worker model is thread-and-channel shaped, every M0 spike ran on blocking reqwest plus threads, and `ratatui-image`'s `ThreadProtocol` works on plain mpsc; reqwest's own runtime stays contained behind `blocking`. §9.8's bindings (event vocabulary, spinner clock, debounces, render purity) are runtime-agnostic and survive a swap. | If a feature needs concurrency the thread model can't express (cancellation trees, thousands of in-flight requests), reopen it as a fresh call rather than smuggling an executor in beside the threads. |
 | Kitty-graphics covers must render in ghostty, kitty and wezterm; every other terminal degrades to halfblocks (ROD-417; §11.2) | ghostty is the daily driver and is visually ratified; kitty and wezterm ride the same `ratatui-image` protocol branch, so they are spot-checks of one implementation, not three. tmux gets halfblocks plus fixed fallback heights, which is what makes headless and self-driven runs (the capture rig, the drive-tui skill) work at all. | If a fourth terminal becomes a daily driver, ratify it visually before adding it to the matrix: sharing the protocol branch is what makes a spot-check sufficient, and a terminal outside it is a new claim. |
 | The `▌` is steady, never SGR blink (ROD-481; §11.6) | ghostty never rendered SGR blink and kitty did, so one spec produced two different cursors; where it did render, a blinking block in the corner read as a stray terminal cursor rather than a status marker. Nothing else in the UI uses the temporal channel, so the retirement costs no signal and needs no fallback timer (§6.4's no-manual-timing rule holds). | A future state wanting the temporal channel has to argue for it from scratch: the bottom-bar test forbidding `SLOW_BLINK`/`RAPID_BLINK` on every cell is the gate it must move. |
-| History row 1 is title-only; the episode count lives on the row-2 bar and is never duplicated into row 1 (ROD-509; §11.3) | The row pair gives each line one job: row 1 identifies (status glyph + title, and the title gets the full width before truncation), row 2 quantifies (bar + `N / M eps`). Duplicating the count into row 1 spends title width on a fact the line directly below already carries. The §5.4 comp's richer right-meta (resume indicator + season + status chips) was authored but never ratified and never built. | If a resume indicator on row 1 is ever wanted, spec that column on its own terms; reviving the comp wholesale would drag the duplicated count back with it. |
+| History row 1 is title-only; the episode count lives on the row-2 bar and is never duplicated into row 1 (ROD-509; §11.3) | The row pair gives each line one job: row 1 identifies (status glyph + title, and the title gets the full width before truncation), row 2 quantifies (bar + `N / M eps`). Duplicating the count into row 1 spends title width on a fact the line directly below already carries. The §5.4 comp's richer right-meta (resume indicator + season + status chips) was authored but never ratified and never built. | If finding the next episode to resume takes a scan rather than a glance (users asking where the resume number went, or reaching for the detail pane to answer it), spec a row-1 resume indicator on its own terms; reviving the §5.4 comp wholesale would drag the duplicated count back with it. |
 | Toast copy uses `·` as its clause separator | Port-time call: toast copy like `mpv not found · install mpv` uses the app's own metadata-separator idiom rather than a dash. Keeps every §4.10 string one visual grammar with the rest of the chrome (this doc also bans dash separators in prose). | If a toast ever needs a true sentence break, reword the copy; do not introduce a second separator style. |
 
 ### 10.1 Metadata Field Survey (ratified ship/skip verdicts)
@@ -3338,10 +3341,13 @@ resolution constrains future work also has a row in §10, with its trigger.
    at `text.dim`.** Rendered at `fg3` on `bg.base` under the README capture rig's
    terminal conditions (kitty, font 16, stock font config), `◆`/`◈` and `◐`/`◎`
    stay distinct: each pair separates by fill (solid vs outline, half vs ring),
-   which survives dimming, rather than by fine detail, which would not. They
-   collapse only when set adjacent with no separator, which is the ROD-247
-   finding the shipped renderer already obeys (`glyphs.join(" ")` at
-   `palette.fg3`). §3.8a's vocabulary stands; no substitutes.
+   which survives dimming, rather than by fine detail, which would not. `❖`
+   (Slice of Life), the third diamond-family entry, was checked against both and
+   separates by mass: it renders visibly smaller and pinched next to `◆`'s solid
+   body and `◈`'s nested outline. `⚜`/`✿` likewise. The glyphs collapse only when
+   set adjacent with no separator, which is the ROD-247 finding the shipped
+   renderer already obeys (`glyphs.join(" ")` at `palette.fg3`). §3.8a's
+   vocabulary stands; no substitutes.
 5. ~~**Discover as a landing-cycle option.**~~ **Resolved 2026-07-31 (ROD-509):
    not adopted.** The shipped cycle is `history · browse · last_watched`
    (`LANDING_PRESETS`, `src/tui/view/settings.rs`). A landing option earns its
