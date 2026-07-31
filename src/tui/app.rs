@@ -3057,7 +3057,13 @@ mod tests {
         settle_feed(&mut app, &tx, &rx, t1);
         assert_eq!(app.browse.count(), 3);
         assert!(rendered(&mut app, 100, 30).contains("╌ more ╌"));
-        press(&mut app, &tx, t1, &[ch('j'), key(KeyCode::Down)]);
+        press(&mut app, &tx, t1, &[ch('j')]);
+        let mid = rendered(&mut app, 100, 30);
+        assert!(
+            mid.contains("╌ more ╌") && !mid.contains("loading…"),
+            "mid-list never fires"
+        );
+        press(&mut app, &tx, t1, &[key(KeyCode::Down)]);
         assert!(rendered(&mut app, 100, 30).contains("loading…"));
         settle_feed(&mut app, &tx, &rx, t1);
         assert_eq!(app.browse.count(), 6, "page 2 appended");
@@ -3070,6 +3076,47 @@ mod tests {
             !rendered(&mut app, 100, 30).contains("╌ more ╌"),
             "exhausted feed drops the footer"
         );
+    }
+
+    /// Upward motion never fires load-more. A single result keeps the
+    /// clamped cursor on the tail through the Up press, so only the dy gate
+    /// holds the fetch; the same fixture firing on Down proves it.
+    #[test]
+    fn browse_up_at_the_last_result_never_loads_more() {
+        let page = |id, has_next| {
+            Ok(CatalogPage {
+                entries: vec![feed_entry(id)],
+                has_next,
+            })
+        };
+        let (mut app, tx, rx, now) = harness_with(
+            "browse-up-hold",
+            StubCatalog::search_scripted(vec![page(1, true), page(2, false)]),
+        );
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(
+            &mut app,
+            &tx,
+            now,
+            &[ch('B'), ch('/'), ch('f'), key(KeyCode::Enter)],
+        );
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        assert_eq!(app.browse.count(), 1);
+        press(&mut app, &tx, t1, &[key(KeyCode::Up), ch('k')]);
+        let text = rendered(&mut app, 100, 30);
+        assert!(
+            text.contains("╌ more ╌") && !text.contains("loading…"),
+            "Up and k at the last result hold"
+        );
+        press(&mut app, &tx, t1, &[key(KeyCode::Down)]);
+        assert!(
+            rendered(&mut app, 100, 30).contains("loading…"),
+            "the fixture fires on Down"
+        );
+        settle_feed(&mut app, &tx, &rx, t1);
+        assert_eq!(app.browse.count(), 2);
     }
 
     #[test]
