@@ -17,6 +17,16 @@ release.yml refuses to build a tag whose section is missing or empty, and
 publishes that section verbatim as the release body.
 -->
 
+## [0.1.4] - 2026-08-01
+
+A fourth streaming source, widening the fallback pool from three to four.
+
+### Added
+
+- **Broader stream fallback**: a fourth source is tried automatically when
+  the existing three can't resolve a stream. Softsub tracks are carried
+  like the rest.
+
 ## [0.1.3] - 2026-07-31
 
 No functional change: nothing here behaves differently from 0.1.2. This
