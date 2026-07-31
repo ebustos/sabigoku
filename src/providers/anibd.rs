@@ -126,17 +126,21 @@ fn parse_players(raw: &[u8]) -> Result<Vec<PlayerEntry>, ProviderError> {
     serde_json::from_slice(raw).map_err(|e| ProviderError::Decode(format!("players: {e}")))
 }
 
-/// Extract `videoUrl: "..."` from an ArtPlayer config in player HTML.
-/// Relative paths are resolved against `origin`.
-fn extract_video_url(html: &str, origin: &str) -> Option<String> {
-    let needle = "videoUrl";
-    let at = html.find(needle)?;
-    let rest = &html[at + needle.len()..];
-    // Skip whitespace and colon.
+/// Extract the ArtPlayer stream URL from player HTML. Tries `videoUrl`
+/// first (legacy/Anilili convention), then bare `url` (live site as of
+/// 2026-08). Relative paths resolved against `page_url`.
+fn extract_video_url(html: &str, page_url: &str) -> Option<String> {
+    extract_config_value(html, "videoUrl", page_url)
+        .or_else(|| extract_config_value(html, "url", page_url))
+}
+
+/// Find `key: "value"` or `key: 'value'` in HTML and resolve relative paths.
+fn extract_config_value(html: &str, key: &str, page_url: &str) -> Option<String> {
+    let at = html.find(key)?;
+    let rest = &html[at + key.len()..];
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(':')?;
     let rest = rest.trim_start();
-    // Quoted value.
     let quote = rest.as_bytes().first()?;
     if *quote != b'"' && *quote != b'\'' {
         return None;
@@ -147,18 +151,7 @@ fn extract_video_url(html: &str, origin: &str) -> Option<String> {
     if raw.is_empty() {
         return None;
     }
-    Some(resolve_url(raw, origin))
-}
-
-/// Resolve a potentially relative URL against an origin.
-fn resolve_url(raw: &str, origin: &str) -> String {
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        raw.to_string()
-    } else if raw.starts_with('/') {
-        format!("{origin}{raw}")
-    } else {
-        format!("{origin}/{raw}")
-    }
+    Some(resolve_url(raw, page_url))
 }
 
 /// Extract the origin (scheme + authority) from a URL.
@@ -167,6 +160,17 @@ fn url_origin(url: &str) -> String {
         Ok(parsed) => parsed.origin().ascii_serialization(),
         Err(_) => url.to_string(),
     }
+}
+
+/// Resolve a potentially relative URL against a base page URL.
+fn resolve_url(raw: &str, base_url: &str) -> String {
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return raw.to_string();
+    }
+    url::Url::parse(base_url)
+        .and_then(|base| base.join(raw))
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// Parse jwplayer-style soft subtitles from player HTML (playsub.php).
@@ -280,7 +284,7 @@ impl AniBd {
         })
     }
 
-    fn get(&self, url: &str) -> Result<Vec<u8>, ProviderError> {
+    fn api_get(&self, url: &str) -> Result<Vec<u8>, ProviderError> {
         self.http.fetch(&Request {
             method: Method::Get,
             url,
@@ -295,9 +299,30 @@ impl AniBd {
         })
     }
 
+    /// Player pages live on a different origin that gates on its own
+    /// Referer + a browser-shaped Accept. Cloudflare 301s anything else.
+    fn player_get(&self, url: &str, referer: &str) -> Result<Vec<u8>, ProviderError> {
+        self.http.fetch(&Request {
+            method: Method::Get,
+            url,
+            payload: None,
+            user_agent: UA,
+            extra_headers: &[
+                ("Referer", referer),
+                (
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                ),
+                ("Accept-Language", "en-US,en;q=0.9"),
+            ],
+            accept: Accept::Any2xx,
+            deadline: None,
+        })
+    }
+
     fn fetch_catalog(&self, anilist_id: &str) -> Result<Vec<CatalogGroup>, ProviderError> {
         let url = format!("{}/api2.php?epid={anilist_id}", self.api);
-        let raw = self.get(&url)?;
+        let raw = self.api_get(&url)?;
         parse_catalog(&raw)
     }
 
@@ -369,7 +394,7 @@ impl StreamProvider for AniBd {
 
         let encoded_link: String = url::form_urlencoded::byte_serialize(link.as_bytes()).collect();
         let players_url = format!("{}/apilink.php?data={encoded_link}", self.api);
-        let raw = self.get(&players_url)?;
+        let raw = self.api_get(&players_url)?;
         let players = parse_players(&raw)?;
 
         let usable: Vec<_> = players
@@ -389,11 +414,11 @@ impl StreamProvider for AniBd {
             }
             let origin = url_origin(player_url);
             let referer = format!("{origin}/");
-            let html = match self.get(player_url) {
+            let html = match self.player_get(player_url, &referer) {
                 Ok(body) => String::from_utf8_lossy(&body).into_owned(),
                 Err(_) => continue,
             };
-            let Some(hls) = extract_video_url(&html, &origin) else {
+            let Some(hls) = extract_video_url(&html, player_url) else {
                 continue;
             };
             if !is_absolute_url(&hls) || !clean_arg(&hls) {
@@ -411,7 +436,7 @@ impl StreamProvider for AniBd {
                 resolution: None,
                 referer: Some(referer),
                 user_agent: Some(UA.to_string()),
-                cloaked_segments: false,
+                cloaked_segments: true,
                 decloak_segments: false,
                 sub_url,
             });
@@ -536,7 +561,7 @@ mod tests {
     fn extract_video_url_absolute() {
         let html = r#"var player = { videoUrl: "https://cdn.example/master.m3u8", other: 1 }"#;
         assert_eq!(
-            extract_video_url(html, "https://player.example"),
+            extract_video_url(html, "https://player.example/play.php"),
             Some("https://cdn.example/master.m3u8".to_string())
         );
     }
@@ -545,17 +570,35 @@ mod tests {
     fn extract_video_url_relative_slash() {
         let html = r#"videoUrl: "/r2/cache/abc/index.m3u8""#;
         assert_eq!(
-            extract_video_url(html, "https://player.example"),
+            extract_video_url(html, "https://player.example/play.php"),
             Some("https://player.example/r2/cache/abc/index.m3u8".to_string())
         );
     }
 
     #[test]
-    fn extract_video_url_relative_bare() {
-        let html = r#"videoUrl:"stream/master.m3u8""#;
+    fn extract_video_url_relative_bare_resolves_against_page_dir() {
+        let html = r#"url: 'cache/ani2-154587ebd1.m3u8'"#;
         assert_eq!(
-            extract_video_url(html, "https://player.example"),
-            Some("https://player.example/stream/master.m3u8".to_string())
+            extract_video_url(html, "https://playeng.example/r2/play.php?x=1"),
+            Some("https://playeng.example/r2/cache/ani2-154587ebd1.m3u8".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_video_url_falls_back_to_bare_url_key() {
+        let html = "url: 'https://cdn.test/v.m3u8'";
+        assert_eq!(
+            extract_video_url(html, "https://x/play.php"),
+            Some("https://cdn.test/v.m3u8".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_video_url_prefers_video_url_over_bare() {
+        let html = r#"url: 'https://wrong.test/x.m3u8', videoUrl: "https://right.test/y.m3u8""#;
+        assert_eq!(
+            extract_video_url(html, "https://x/play.php"),
+            Some("https://right.test/y.m3u8".to_string())
         );
     }
 
@@ -563,7 +606,7 @@ mod tests {
     fn extract_video_url_single_quotes() {
         let html = "videoUrl : 'https://cdn.test/v.m3u8'";
         assert_eq!(
-            extract_video_url(html, "https://x"),
+            extract_video_url(html, "https://x/play.php"),
             Some("https://cdn.test/v.m3u8".to_string())
         );
     }
@@ -571,10 +614,13 @@ mod tests {
     #[test]
     fn extract_video_url_none_when_absent() {
         assert_eq!(
-            extract_video_url("<html>no player</html>", "https://x"),
+            extract_video_url("<html>no player</html>", "https://x/play.php"),
             None
         );
-        assert_eq!(extract_video_url(r#"videoUrl: """#, "https://x"), None);
+        assert_eq!(
+            extract_video_url(r#"videoUrl: """#, "https://x/play.php"),
+            None
+        );
     }
 
     #[test]
