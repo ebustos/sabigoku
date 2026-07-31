@@ -17,6 +17,23 @@ release.yml refuses to build a tag whose section is missing or empty, and
 publishes that section verbatim as the release body.
 -->
 
+## [0.1.3] - 2026-07-31
+
+No functional change: nothing here behaves differently from 0.1.2. This
+release exists to unblock the AUR package, which failed 0.1.2's build and is
+still stuck on 0.1.1; every other channel already has everything here.
+
+### Fixed
+
+- **AUR package build**: the AUR job runs the test suite as part of `check()`,
+  and one test asserted a killed background process was gone by probing with
+  `kill -0`, which also succeeds for a zombie. The build container's PID 1
+  never reaps orphans, so the dead process answered the probe forever and the
+  test failed every time. It now checks process state directly, treating a
+  zombie as dead. AUR users get 0.1.2's self-updating, one-time zigoku import,
+  and transparent background option in this release; everyone else already
+  has them.
+
 ## [0.1.2] - 2026-07-31
 
 Self-updating, a one-time zigoku import, and a transparent background option.
@@ -130,6 +147,7 @@ Licensed GPL-3.0-or-later.
 - **`sabigoku update` is not implemented**: it prints a message saying so. There
   is no self-update yet.
 
+[0.1.3]: https://github.com/vantroy/sabigoku/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/vantroy/sabigoku/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vantroy/sabigoku/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vantroy/sabigoku/releases/tag/v0.1.0
