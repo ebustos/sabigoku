@@ -16,6 +16,11 @@ pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 #[serde(default)]
 pub struct Config {
     pub mpv_path: String,
+    pub ffmpeg_path: String,
+    /// Episode download destination; empty resolves to `$HOME/Videos/sabigoku`
+    /// at use-site (06 §2.2 degrade-safe: never validated as an existing
+    /// path here, only when a download actually fires).
+    pub download_dir: String,
     pub default_quality: String,
     pub translation: String,
     pub resume_offset_sec: u32,
@@ -38,6 +43,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             mpv_path: "mpv".into(),
+            ffmpeg_path: "ffmpeg".into(),
+            download_dir: String::new(),
             default_quality: "best".into(),
             translation: "sub".into(),
             resume_offset_sec: 5,
@@ -106,6 +113,8 @@ mod tests {
         let path = tmp("round_trip.toml");
         let cfg = Config {
             mpv_path: "/opt/mpv/bin/mpv".into(),
+            ffmpeg_path: "/opt/ffmpeg/bin/ffmpeg".into(),
+            download_dir: "/home/rod/Videos".into(),
             translation: "dub".into(),
             resume_offset_sec: 12,
             cover_art: false,

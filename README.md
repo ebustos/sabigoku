@@ -68,6 +68,7 @@ Themes: `terminal_ghost` → `phosphor` → `nord` → `tokyonight`.
 - **Discover**: AniList rankings with cover art and scores
 - **Cover art**: real pixels on kitty / ghostty / WezTerm / iTerm2; halfblocks elsewhere
 - **Play**: AniList metadata → streaming source → `mpv`
+- **Download**: `d` remuxes the current episode to disk via `ffmpeg -c copy` (no re-encode)
 - **Sources**: multiple streaming sources, automatic fallback, preferred order, per-show pins
 - **History**: SQLite watch history and exact resume
 - **AniList sync**: Settings or `sabigoku login`; two-way background sync, or local-only
@@ -78,6 +79,7 @@ Themes: `terminal_ghost` → `phosphor` → `nord` → `tokyonight`.
 ## Install
 
 Runtime dependency: `mpv` on your `PATH`. Without it, you get a browser.
+Optional: `ffmpeg` on your `PATH` enables the `d` download shortcut.
 
 ### Quick install (Linux & macOS)
 

@@ -2,6 +2,7 @@
 //! and the UI thread is the sole consumer, so `tick(event)` sees a total order.
 //! Worker-result variants arrive with their subsystems (ROD-434+).
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -51,6 +52,19 @@ pub enum PlayFailure {
     MpvNotFound,
     MpvFailed,
     OpenFailed,
+    Resolve(FetchClass),
+    Internal,
+}
+
+/// Download failure classes as event payload; copy mapping lives in
+/// `download_failure_copy` (app.rs, mirrors `play_failure_copy`).
+/// `FfmpegNotFound` is normally pre-empted by the proactive `ffmpeg_ok`
+/// check (app.rs), but stays here for the rare TOCTOU (binary removed
+/// mid-session) and for the CLI/worker path, which has no such gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadFailure {
+    FfmpegNotFound,
+    FfmpegFailed,
     Resolve(FetchClass),
     Internal,
 }
@@ -177,6 +191,15 @@ pub enum Event {
         anilist_id: i64,
         position: Option<Position>,
         failure: Option<PlayFailure>,
+        token: u64,
+    },
+    /// Terminal download outcome (mirrors `PlayFinished`). `path` is the
+    /// landed file on success; `failure` on abort. Never both.
+    DownloadFinished {
+        anilist_id: i64,
+        episode_ix: u32,
+        path: Option<PathBuf>,
+        failure: Option<DownloadFailure>,
         token: u64,
     },
     /// Refresh-on-view answer (04 §10); keep-check by `for_id` in tick.

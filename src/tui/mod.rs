@@ -8,6 +8,7 @@ pub mod app;
 pub mod chrome;
 pub mod clock;
 pub mod covers;
+pub mod download;
 pub mod episodes;
 pub mod event;
 pub mod layout;

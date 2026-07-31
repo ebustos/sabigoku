@@ -18,6 +18,8 @@ use crate::tui::theme::Palette;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowId {
     MpvPath,
+    FfmpegPath,
+    DownloadDir,
     Quality,
     Translation,
     ResumeOffset,
@@ -62,7 +64,7 @@ const fn row(id: RowId, label: &'static str, kind: RowKind, hint: &'static str) 
 
 /// Interactive rows only; the read-only rows (two Catalog, one AniList Sync,
 /// one Updates) render separately and are skipped by navigation (DESIGN 5.5).
-pub const ROWS: [Row; 15] = [
+pub const ROWS: [Row; 17] = [
     row(RowId::MpvPath, "mpv path", RowKind::Text, "enter to edit"),
     row(
         RowId::Quality,
@@ -133,14 +135,26 @@ pub const ROWS: [Row; 15] = [
         RowKind::Toggle,
         "space to toggle",
     ),
+    row(
+        RowId::FfmpegPath,
+        "ffmpeg path",
+        RowKind::Text,
+        "enter to edit",
+    ),
+    row(
+        RowId::DownloadDir,
+        "download dir",
+        RowKind::Text,
+        "enter to edit",
+    ),
 ];
 
 // Section boundaries (DESIGN 5.5): Player 0..5, Catalog 5..6, Interface
-// 6..12, AniList Sync 12..14, Updates 14..15. A row insertion that shifts a
-// boundary must break the build, never silently misattribute a row to the
-// wrong header.
+// 6..12, AniList Sync 12..14, Updates 14..15, Download 15..17. A row
+// insertion that shifts a boundary must break the build, never silently
+// misattribute a row to the wrong header.
 const _: () = {
-    assert!(ROWS.len() == 15);
+    assert!(ROWS.len() == 17);
     assert!(matches!(ROWS[4].id, RowId::SkipMode)); // last Player
     assert!(matches!(ROWS[5].id, RowId::Provider)); // the lone Catalog row
     assert!(matches!(ROWS[6].id, RowId::CoverArt)); // first Interface
@@ -148,6 +162,8 @@ const _: () = {
     assert!(matches!(ROWS[12].id, RowId::Connect)); // first AniList Sync
     assert!(matches!(ROWS[13].id, RowId::Sync)); // last AniList Sync
     assert!(matches!(ROWS[14].id, RowId::CheckUpdates)); // the lone Updates row
+    assert!(matches!(ROWS[15].id, RowId::FfmpegPath)); // first Download
+    assert!(matches!(ROWS[16].id, RowId::DownloadDir)); // last Download
 };
 
 const QUALITY_PRESETS: [&str; 5] = ["worst", "480", "720", "1080", "best"];
@@ -225,7 +241,7 @@ impl SettingsState {
                 KeyOutcome::ConfigChanged
             }
             KeyCode::Enter if row.kind == RowKind::Text => {
-                self.edit = config.mpv_path.clone();
+                self.edit = edit_seed(config, row.id);
                 self.editing = true;
                 KeyOutcome::Consumed
             }
@@ -252,7 +268,7 @@ impl SettingsState {
                 self.editing = false;
                 let value = std::mem::take(&mut self.edit);
                 if !value.is_empty() {
-                    config.mpv_path = value;
+                    commit_edit(config, ROWS[self.cursor].id, value);
                     self.dirty = true;
                 }
             }
@@ -333,6 +349,29 @@ fn cycle(config: &mut Config, id: RowId, dir: i8, providers: &[&str]) {
     }
 }
 
+/// Seed the edit buffer from the field a Text row backs (DESIGN 5.5).
+fn edit_seed(config: &Config, id: RowId) -> String {
+    match id {
+        RowId::MpvPath => config.mpv_path.clone(),
+        RowId::FfmpegPath => config.ffmpeg_path.clone(),
+        RowId::DownloadDir => config.download_dir.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Write a committed edit back to the field a Text row backs. An empty
+/// commit never reaches here (`on_edit_key` guards it): a blank `mpv_path`/
+/// `ffmpeg_path` argv0 must never land, and a blank `download_dir` already
+/// means "use the default" without a round-trip through the editor.
+fn commit_edit(config: &mut Config, id: RowId, value: String) {
+    match id {
+        RowId::MpvPath => config.mpv_path = value,
+        RowId::FfmpegPath => config.ffmpeg_path = value,
+        RowId::DownloadDir => config.download_dir = value,
+        _ => {}
+    }
+}
+
 fn toggle(config: &mut Config, id: RowId) {
     match id {
         RowId::CoverArt => config.cover_art = !config.cover_art,
@@ -348,6 +387,14 @@ fn toggle(config: &mut Config, id: RowId) {
 fn value(config: &Config, id: RowId, providers: &[&str]) -> String {
     match id {
         RowId::MpvPath => config.mpv_path.clone(),
+        RowId::FfmpegPath => config.ffmpeg_path.clone(),
+        RowId::DownloadDir => {
+            if config.download_dir.is_empty() {
+                "~/Videos/sabigoku (default)".to_string()
+            } else {
+                config.download_dir.clone()
+            }
+        }
         RowId::Quality => config.default_quality.clone(),
         RowId::Translation => config.translation.clone(),
         RowId::ResumeOffset => format!("{}s", config.resume_offset_sec),
@@ -435,6 +482,9 @@ fn layout(env: &SettingsEnv) -> Vec<Li> {
     section(&mut lines, "Updates");
     lines.push(Li::Inert("version", env.version.to_string()));
     lines.push(Li::Row(14));
+    lines.push(Li::Blank);
+    section(&mut lines, "Download");
+    (15..17).for_each(|i| lines.push(Li::Row(i)));
     lines
 }
 
@@ -806,6 +856,56 @@ mod tests {
         };
         assert_eq!(value(&pinned, RowId::Provider, &PROVIDERS), "senshi");
         assert_eq!(value(&c, RowId::Connect, &PROVIDERS), "");
+        assert_eq!(value(&c, RowId::FfmpegPath, &PROVIDERS), "ffmpeg");
+        assert_eq!(
+            value(&c, RowId::DownloadDir, &PROVIDERS),
+            "~/Videos/sabigoku (default)",
+            "empty download_dir shows the resolved default"
+        );
+        let dir_set = Config {
+            download_dir: "/srv/media".into(),
+            ..Config::default()
+        };
+        assert_eq!(
+            value(&dir_set, RowId::DownloadDir, &PROVIDERS),
+            "/srv/media"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_path_and_download_dir_edit_like_mpv_path() {
+        let (mut s, mut c) = state();
+        // ffmpeg path: the first row of the trailing Download section.
+        for _ in 0..15 {
+            press(&mut s, &mut c, &[KeyCode::Char('j')]);
+        }
+        assert_eq!(ROWS[s.cursor].id, RowId::FfmpegPath);
+        press(&mut s, &mut c, &[KeyCode::Enter]);
+        assert!(s.editing());
+        press(
+            &mut s,
+            &mut c,
+            &[KeyCode::Char('-'), KeyCode::Char('x'), KeyCode::Enter],
+        );
+        assert_eq!(c.ffmpeg_path, "ffmpeg-x");
+        assert!(s.dirty);
+
+        // download dir: one row below that.
+        press(&mut s, &mut c, &[KeyCode::Char('j'), KeyCode::Enter]);
+        assert!(s.editing());
+        for c_ in ['/', 'd', 'l'] {
+            press(&mut s, &mut c, &[KeyCode::Char(c_)]);
+        }
+        press(&mut s, &mut c, &[KeyCode::Enter]);
+        assert_eq!(c.download_dir, "/dl");
+
+        // Empty commit is a no-op here too (consistent with mpv_path).
+        press(&mut s, &mut c, &[KeyCode::Enter]);
+        for _ in 0..5 {
+            press(&mut s, &mut c, &[KeyCode::Backspace]);
+        }
+        press(&mut s, &mut c, &[KeyCode::Enter]);
+        assert_eq!(c.download_dir, "/dl", "empty commit is a no-op");
     }
 
     #[test]

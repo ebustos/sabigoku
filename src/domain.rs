@@ -338,6 +338,25 @@ pub fn strip_controls(s: String) -> String {
     }
 }
 
+/// Filesystem-safe title for a download filename (unlike `strip_controls`,
+/// which only guards mpv's OSD): replaces path separators and the reserved
+/// Windows/NTFS punctuation with `_` so titles carrying `/`, `:`, etc. never
+/// escape the download dir or produce a bogus path. Controls fold in too,
+/// via `strip_controls`, since a title reaching a filename is a stricter
+/// context than the OSD it was first vetted for.
+pub fn sanitize_filename(s: &str) -> String {
+    fn banned(c: char) -> bool {
+        matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }
+    let cleaned = strip_controls(s.to_string());
+    cleaned
+        .chars()
+        .map(|c| if banned(c) { '_' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 pub fn preferred_title<'a>(
     romaji: &'a str,
     english: Option<&'a str>,
@@ -587,6 +606,25 @@ mod tests {
         assert_eq!(map_episode_index(&eps, "7", 9), None);
         assert_eq!(map_episode_index(&eps, "7", 0), None);
         assert_eq!(map_episode_index::<&str>(&[], "1", 1), None);
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_reserved_chars_and_trims() {
+        assert_eq!(
+            sanitize_filename("Attack on Titan: Final Season"),
+            "Attack on Titan_ Final Season"
+        );
+        assert_eq!(
+            sanitize_filename("a/b\\c:d*e?f\"g<h>i|j"),
+            "a_b_c_d_e_f_g_h_i_j"
+        );
+        assert_eq!(sanitize_filename("  padded  "), "padded");
+        assert_eq!(sanitize_filename("plain title"), "plain title");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_controls_too() {
+        assert_eq!(sanitize_filename("A\r\nB\u{200B}"), "AB");
     }
 
     #[test]

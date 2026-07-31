@@ -13,6 +13,7 @@ use crate::anilist::AniList;
 use crate::aniskip::{self, SkipMode};
 use crate::auth::Auth;
 use crate::domain::{Enrichment, Quality, Translation, expected_episode_count};
+use crate::downloader::{self, DownloadError};
 use crate::error::Error;
 use crate::login::ConnectResult;
 use crate::loopback::Loopback;
@@ -25,7 +26,7 @@ use crate::resolver;
 use crate::store::Store;
 use crate::sync::{self, SyncOutcome, SyncSummary, ThreadSleeper};
 use crate::tui::covers::{self, CoverCaches};
-use crate::tui::event::{Event, EventTx, FetchClass, PlayFailure, PrewarmVerdict};
+use crate::tui::event::{DownloadFailure, Event, EventTx, FetchClass, PlayFailure, PrewarmVerdict};
 
 /// The 02 §4b post-play gate, the one owner of the finish writes (01 §3 glue).
 /// No meaningful position, no writes of any kind; the player already collapsed
@@ -610,6 +611,105 @@ pub fn play_failure(e: &PlayError) -> PlayFailure {
         PlayError::OpenFailed { .. } => PlayFailure::OpenFailed,
         PlayError::Exit { .. } => PlayFailure::MpvFailed,
         _ => PlayFailure::Internal,
+    }
+}
+
+/// One download, described as data (mirrors `PlaySpec`): the resolve runs
+/// once inside the worker, no retry loop — a download that fails is a
+/// download the user re-fires with `d`, not something the transport itself
+/// walks providers for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownloadSpec {
+    pub anilist_id: i64,
+    pub provider: String,
+    pub provider_id: String,
+    pub episode_label: String,
+    /// 1-based, for the toast copy and the terminal event.
+    pub episode_ix: u32,
+    pub translation: Translation,
+    pub quality: Quality,
+    /// Filesystem-safe (`domain::sanitize_filename` already applied).
+    pub base_name: String,
+    pub ffmpeg_path: String,
+    pub output_dir: PathBuf,
+    pub token: u64,
+}
+
+/// The download worker (mirrors `spawn_play`): resolve once, hand the link
+/// to `downloader::download`, post the one terminal outcome.
+#[must_use]
+pub fn spawn_download(
+    drain: &Drain,
+    tx: EventTx,
+    registry: Arc<ProviderRegistry>,
+    spec: DownloadSpec,
+) -> bool {
+    drain.spawn("download", move || {
+        let DownloadSpec {
+            anilist_id,
+            provider,
+            provider_id,
+            episode_label,
+            episode_ix,
+            translation,
+            quality,
+            base_name,
+            ffmpeg_path,
+            output_dir,
+            token,
+        } = spec;
+        // A retired name can only arrive through a stale binding row.
+        let Some(p) = registry.by_name(&provider) else {
+            tx.post(Event::DownloadFinished {
+                anilist_id,
+                episode_ix,
+                path: None,
+                failure: Some(DownloadFailure::Resolve(FetchClass::Data)),
+                token,
+            });
+            return;
+        };
+        let link = match p.resolve(&provider_id, &episode_label, translation, quality) {
+            Ok(link) => link,
+            Err(e) => {
+                tx.post(Event::DownloadFinished {
+                    anilist_id,
+                    episode_ix,
+                    path: None,
+                    failure: Some(DownloadFailure::Resolve(FetchClass::from(&e))),
+                    token,
+                });
+                return;
+            }
+        };
+        let opts = downloader::DownloadOpts {
+            ffmpeg_path: &ffmpeg_path,
+            output_dir: &output_dir,
+            base_name: &base_name,
+        };
+        let (path, failure) = match downloader::download(&opts, &link) {
+            Ok(path) => (Some(path), None),
+            Err(e) => (None, Some(download_failure(&e))),
+        };
+        tx.post(Event::DownloadFinished {
+            anilist_id,
+            episode_ix,
+            path,
+            failure,
+            token,
+        });
+    })
+}
+
+/// `DownloadError` → the POD classes the toast matrix keys on (mirrors
+/// `play_failure`).
+pub fn download_failure(e: &DownloadError) -> DownloadFailure {
+    match e {
+        DownloadError::Spawn { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+            DownloadFailure::FfmpegNotFound
+        }
+        DownloadError::Failed { .. } => DownloadFailure::FfmpegFailed,
+        _ => DownloadFailure::Internal,
     }
 }
 

@@ -283,13 +283,13 @@ fn build_argv(
 /// Provider bytes an argv element may carry: printable ASCII, no space. Catches
 /// CR/LF (header injection, ROD-92) and >= 0x80 in one range check. Empty is
 /// allowed: a blank optional field (referer/sub) yields an inert flag value.
-fn arg_clean(s: &str) -> bool {
+pub(crate) fn arg_clean(s: &str) -> bool {
     s.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
 /// UAs are the one field with legitimate spaces, and must be non-empty: an
 /// empty `--user-agent=` blanks mpv's UA and defeats the CF bot-score workaround.
-fn ua_clean(s: &str) -> bool {
+pub(crate) fn ua_clean(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
 

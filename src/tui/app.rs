@@ -23,6 +23,7 @@ use ratatui_image::picker::Picker;
 use crate::aniskip::SkipMode;
 use crate::config::Config;
 use crate::domain::{self, TitleLanguage, Translation};
+use crate::downloader;
 use crate::paths::Paths;
 use crate::player::{self, Position};
 use crate::providers::{CatalogProvider, DiscoverAxis, ProviderRegistry};
@@ -32,8 +33,9 @@ use super::chrome::{self, BottomBar, HelpLine, Tab, TopBar};
 use super::clock::Debounce;
 use super::covers::CoverCaches;
 use super::covers::render::ProtocolPool;
+use super::download::{DownloadDeps, DownloadFeedback, DownloadRequest, DownloadSession};
 use super::episodes::{EpisodeDeps, Feedback};
-use super::event::{Event, EventTx, FetchClass, PlayFailure, PrewarmVerdict};
+use super::event::{DownloadFailure, Event, EventTx, FetchClass, PlayFailure, PrewarmVerdict};
 use super::layout;
 use super::playback::{HopAsk, PlayFeedback, PlayRequest, PlaybackDeps, PlaybackSession};
 use super::prewarm::{self, PrewarmState};
@@ -89,6 +91,12 @@ pub struct App {
     settings: SettingsState,
     pub(super) detail: DetailState,
     playback: PlaybackSession,
+    downloads: DownloadSession,
+    /// Proactive `ffmpeg -version` probe (no mpv equivalent exists: mpv only
+    /// fails reactively on spawn `NotFound`). Computed once at startup and
+    /// recomputed whenever the ffmpeg path row commits in Settings, never
+    /// re-spawned on every `d` press.
+    ffmpeg_ok: bool,
     pub(super) prewarm: PrewarmState,
     store: Store,
     catalog: Arc<dyn CatalogProvider>,
@@ -169,6 +177,8 @@ impl App {
             settings: SettingsState::default(),
             detail: DetailState::default(),
             playback: PlaybackSession::default(),
+            downloads: DownloadSession::default(),
+            ffmpeg_ok: downloader::ffmpeg_available(&config.ffmpeg_path),
             prewarm: PrewarmState::default(),
             store,
             catalog,
@@ -259,6 +269,13 @@ impl App {
                 failure,
                 token,
             } => self.on_play_finished(anilist_id, position, failure, token, now, tx),
+            Event::DownloadFinished {
+                anilist_id,
+                episode_ix,
+                path,
+                failure,
+                token,
+            } => self.on_download_finished(anilist_id, episode_ix, path, failure, token, now),
             Event::PrewarmResult {
                 anilist_id,
                 provider,
@@ -337,6 +354,7 @@ impl App {
             KeyCode::Char('p') => self.on_status_key(domain::ListStatus::Paused, now),
             KeyCode::Char('x') => self.on_status_key(domain::ListStatus::Dropped, now),
             KeyCode::Char('c') => self.on_status_key(domain::ListStatus::Completed, now),
+            KeyCode::Char('d') => self.on_download(now, tx),
             KeyCode::Char('w') => self.on_status_key(domain::ListStatus::Watching, now),
             KeyCode::Char('u') => self.on_undo(now),
             KeyCode::Char('r') => self.on_recompute(now),
@@ -1289,13 +1307,14 @@ impl App {
     /// leave/quit path. Returns whether the key was consumed.
     fn on_settings_key(&mut self, key: KeyEvent, now: Instant, tx: &EventTx) -> bool {
         let translation_before = self.config.translation.clone();
+        let ffmpeg_path_before = self.config.ffmpeg_path.clone();
         let names: Vec<&str> = self.registry.iter().map(|p| p.name()).collect();
         let outcome = self.settings.on_key(key.code, &mut self.config, &names);
         match outcome {
             settings::KeyOutcome::Ignored => false,
             settings::KeyOutcome::Consumed => true,
             settings::KeyOutcome::ConfigChanged => {
-                self.on_settings_config_changed(&translation_before, now, tx);
+                self.on_settings_config_changed(&translation_before, &ffmpeg_path_before, now, tx);
                 true
             }
             settings::KeyOutcome::ConnectRequested => {
@@ -1532,7 +1551,13 @@ impl App {
     /// Live projections after a Settings mutation: the palette repaints on
     /// the next frame; a translation change re-keys an engaged grid exactly
     /// like the `:dub` command (same reset, no walk storm).
-    fn on_settings_config_changed(&mut self, translation_before: &str, now: Instant, tx: &EventTx) {
+    fn on_settings_config_changed(
+        &mut self,
+        translation_before: &str,
+        ffmpeg_path_before: &str,
+        now: Instant,
+        tx: &EventTx,
+    ) {
         self.palette = theme::resolve(&self.config.palette, self.config.transparent_background);
         if self.config.translation != translation_before {
             let engaged = self
@@ -1543,6 +1568,11 @@ impl App {
                 self.detail.episodes.reset();
                 self.engage_detail(now, tx);
             }
+        }
+        // Re-probe only on an actual change: ffmpeg -version is cheap but
+        // still a spawn, never worth repeating on every unrelated keypress.
+        if self.config.ffmpeg_path != ffmpeg_path_before {
+            self.ffmpeg_ok = downloader::ffmpeg_available(&self.config.ffmpeg_path);
         }
     }
 
@@ -1663,6 +1693,72 @@ impl App {
         self.apply_play_feedback(fb, now);
     }
 
+    /// `d` downloads the cursor episode via `ffmpeg -c copy` — the same
+    /// episode Enter would play (03 §6.3); inert without a landed grid.
+    /// `ffmpeg_ok` is checked first so a missing binary is a toast, never a
+    /// wasted resolve round trip.
+    fn on_download(&mut self, now: Instant, tx: &EventTx) {
+        if !self.ffmpeg_ok {
+            self.toasts.push(
+                Kind::Error,
+                "ffmpeg not found · install it to enable downloads",
+                now,
+            );
+            return;
+        }
+        let Some(entry) = self.detail.shown() else {
+            return;
+        };
+        let aid = entry.anilist_id;
+        let session = &self.detail.episodes;
+        if !session.is_for(aid) || !session.has_grid() {
+            return;
+        }
+        let cursor = session.cursor();
+        let Some(serving) = session.serving() else {
+            return;
+        };
+        let Some(episode_label) = session.grid().get(cursor).cloned() else {
+            return;
+        };
+        // Same binding lookup fire_play_at uses: the serving grid minted its
+        // binding before caching (ROD-327), so a miss here is a torn store.
+        let Some(provider_id) = self
+            .store
+            .bindings_for(aid)
+            .ok()
+            .and_then(|bs| bs.into_iter().find(|b| b.provider == serving))
+            .map(|b| b.provider_id)
+        else {
+            return;
+        };
+        let provider = serving.to_string();
+        let episode_ix = cursor as u32 + 1;
+        let show_title = domain::preferred_title(
+            &entry.title_romaji,
+            entry.title_english.as_deref(),
+            entry.title_native.as_deref(),
+            TitleLanguage::parse(&self.config.title_language),
+        );
+        let base_name = format!(
+            "{} - {episode_label}",
+            domain::sanitize_filename(show_title)
+        );
+        let request = DownloadRequest {
+            anilist_id: aid,
+            provider,
+            provider_id,
+            episode_label,
+            episode_ix,
+            base_name,
+        };
+        let fb = {
+            let deps = download_deps(&self.registry, &self.config, tx);
+            self.downloads.fire(request, &deps)
+        };
+        self.apply_download_feedback(fb, now);
+    }
+
     fn on_play_position(
         &mut self,
         anilist_id: i64,
@@ -1734,6 +1830,23 @@ impl App {
     /// Terminal play outcome: session settles the writes, then a recorded
     /// finish fans out (grid progress refresh, history reload), and a
     /// hop-eligible failure walks to a sibling (03 §6.4).
+    /// Terminal download outcome: unlike `on_play_finished`, there is no
+    /// store write and no continuation to arm — just the toast.
+    fn on_download_finished(
+        &mut self,
+        anilist_id: i64,
+        episode_ix: u32,
+        path: Option<std::path::PathBuf>,
+        failure: Option<DownloadFailure>,
+        token: u64,
+        now: Instant,
+    ) {
+        let fb = self
+            .downloads
+            .on_finished(anilist_id, episode_ix, path, failure, token);
+        self.apply_download_feedback(fb, now);
+    }
+
     fn on_play_finished(
         &mut self,
         anilist_id: i64,
@@ -1871,6 +1984,40 @@ impl App {
                 }
                 PlayFeedback::SaveFailed => {
                     self.toasts.push(Kind::Error, "couldn't save progress", now)
+                }
+            }
+        }
+    }
+
+    /// Download outcomes. Unlike Play, there is no mpv window to make a
+    /// download's progress visible, so `Started`/`Busy` both earn a toast
+    /// (Play's double-fire guard stays silent; this one cannot).
+    fn apply_download_feedback(&mut self, feedback: Vec<DownloadFeedback>, now: Instant) {
+        for f in feedback {
+            match f {
+                DownloadFeedback::Started { episode_ix } => {
+                    let copy = format!("downloading episode {episode_ix}…");
+                    self.toasts.push(Kind::Info, &copy, now);
+                }
+                DownloadFeedback::Busy => {
+                    self.toasts
+                        .push(Kind::Warn, "download already in progress", now);
+                }
+                DownloadFeedback::Done { episode_ix, path } => {
+                    let copy = format!(
+                        "downloaded episode {episode_ix} → {}",
+                        settings::tilde_path(&path)
+                    );
+                    self.toasts.push(Kind::Success, &copy, now);
+                }
+                DownloadFeedback::Failed {
+                    episode_ix,
+                    provider,
+                    failure,
+                } => {
+                    let copy = download_failure_copy(failure, &self.display_name(&provider));
+                    self.toasts
+                        .push(Kind::Error, &format!("episode {episode_ix}: {copy}"), now);
                 }
             }
         }
@@ -2232,6 +2379,49 @@ fn play_failure_copy(failure: PlayFailure, provider: &str) -> Option<String> {
             _ => failure_class_copy(class, provider),
         },
         PlayFailure::Internal => Some("playback failed".to_string()),
+    }
+}
+
+/// The download-side rows, mirroring `play_failure_copy`. Never `None`: a
+/// download failure is always worth a word, there is no silent-absence case
+/// like the walk's `Unsupported`.
+fn download_failure_copy(failure: DownloadFailure, provider: &str) -> String {
+    match failure {
+        DownloadFailure::FfmpegNotFound => "ffmpeg not found · install ffmpeg".to_string(),
+        DownloadFailure::FfmpegFailed => "ffmpeg couldn't remux the stream".to_string(),
+        DownloadFailure::Resolve(class) => {
+            failure_class_copy(class, provider).unwrap_or_else(|| "download failed".into())
+        }
+        DownloadFailure::Internal => "download failed".to_string(),
+    }
+}
+
+/// Resolve the configured download dir; empty means "use the default"
+/// (`$HOME/Videos/sabigoku`). Never validated as existing here —
+/// `downloader::download` creates it on demand.
+fn resolve_download_dir(config: &Config) -> PathBuf {
+    if !config.download_dir.is_empty() {
+        return PathBuf::from(&config.download_dir);
+    }
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => PathBuf::from(home).join("Videos").join("sabigoku"),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Free function for the same disjoint-borrow reason as `episode_deps`.
+fn download_deps<'a>(
+    registry: &'a Arc<ProviderRegistry>,
+    config: &'a Config,
+    tx: &'a EventTx,
+) -> DownloadDeps<'a> {
+    DownloadDeps {
+        registry,
+        tx,
+        ffmpeg_path: &config.ffmpeg_path,
+        output_dir: resolve_download_dir(config),
+        translation: Translation::parse(&config.translation).unwrap_or(Translation::Sub),
+        quality: domain::Quality::parse(&config.default_quality),
     }
 }
 
@@ -4273,6 +4463,46 @@ mod tests {
         );
         press(&mut app, &tx, t1, &[ch('X'), ch('y')]);
         assert!(app.store.list_history().unwrap().is_empty());
+    }
+
+    // ── download ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn d_key_fires_a_download_and_worker_posts_the_resolve_failure() {
+        let (mut app, tx, rx, now) = play_harness("download-fire");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.ffmpeg_ok = true;
+        assert!(!app.downloads.is_active());
+        app.tick(ch('d'), t1, &tx);
+        assert!(app.downloads.is_active());
+        assert!(app.downloads.drain(Duration::from_secs(5)));
+        let finished = rx.try_recv().unwrap();
+        assert_eq!(
+            finished,
+            Event::DownloadFinished {
+                anilist_id: 1,
+                episode_ix: 1,
+                path: None,
+                failure: Some(DownloadFailure::Resolve(FetchClass::Unsupported)),
+                token: app.downloads.active_token().unwrap(),
+            }
+        );
+        app.tick(finished, t1, &tx);
+        assert!(!app.downloads.is_active());
+        let text = rendered(&mut app, 100, 32);
+        assert!(text.contains("episode 1: download failed"), "{text}");
+    }
+
+    #[test]
+    fn d_key_is_a_no_op_toast_when_ffmpeg_is_missing() {
+        let (mut app, tx, rx, now) = play_harness("download-no-ffmpeg");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.ffmpeg_ok = false;
+        app.tick(ch('d'), t1, &tx);
+        assert!(!app.downloads.is_active(), "never touches the session");
+        assert!(rx.try_recv().is_err(), "no worker ever spawned");
+        let text = rendered(&mut app, 100, 32);
+        assert!(text.contains("ffmpeg not found"), "{text}");
     }
 
     // ── Settings (chunk 7) ──────────────────────────────────────────────

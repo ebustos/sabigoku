@@ -76,6 +76,7 @@ fn print_paths() -> ExitCode {
     println!("  cache    {}", show(&paths.cache));
     println!("  runtime  {}", show(&paths.runtime));
     println!("  mpv      {}", config.mpv_path);
+    println!("  ffmpeg   {}", config.ffmpeg_path);
     println!("  palette  {}", config.palette);
     ExitCode::SUCCESS
 }
