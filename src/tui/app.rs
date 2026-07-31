@@ -81,7 +81,7 @@ pub struct App {
     /// (ROD-229); user-driven opens never arm this.
     resume_demote: Option<i64>,
     toasts: Toasts,
-    palette: &'static Palette,
+    palette: Palette,
     config: Config,
     pub(super) browse: BrowseState,
     history: HistoryState,
@@ -161,7 +161,7 @@ impl App {
             resume_pending: false,
             resume_demote: None,
             toasts: Toasts::default(),
-            palette: theme::by_name(&config.palette),
+            palette: theme::resolve(&config.palette, config.transparent_background),
             config: config.clone(),
             browse: BrowseState::default(),
             history: HistoryState::default(),
@@ -1284,7 +1284,7 @@ impl App {
             account: &account,
             version: &version,
         };
-        settings::draw(frame, area, self.palette, &self.settings, &env);
+        settings::draw(frame, area, &self.palette, &self.settings, &env);
     }
 
     /// One Settings keypress (DESIGN 5.5): the state mutates config and
@@ -1536,7 +1536,7 @@ impl App {
     /// the next frame; a translation change re-keys an engaged grid exactly
     /// like the `:dub` command (same reset, no walk storm).
     fn on_settings_config_changed(&mut self, translation_before: &str, now: Instant, tx: &EventTx) {
-        self.palette = theme::by_name(&self.config.palette);
+        self.palette = theme::resolve(&self.config.palette, self.config.transparent_background);
         if self.config.translation != translation_before {
             let engaged = self
                 .detail
@@ -1897,7 +1897,7 @@ impl App {
             return;
         }
         let rows = layout::frame_rows(area);
-        chrome::draw_top_bar(frame, rows.top, self.palette, &self.top_bar());
+        chrome::draw_top_bar(frame, rows.top, &self.palette, &self.top_bar());
         match self.view {
             View::Browse => self.draw_browse(frame, rows.content, now),
             View::History => self.draw_history(frame, rows.content, now),
@@ -1905,16 +1905,16 @@ impl App {
             View::Discover => self.draw_discover(frame, rows.content, now),
             View::Settings => self.draw_settings(frame, rows.content),
         }
-        chrome::draw_bottom_bar(frame, rows.bottom, self.palette, &self.bottom_bar(now));
+        chrome::draw_bottom_bar(frame, rows.bottom, &self.palette, &self.bottom_bar(now));
         if let Some(session) = &self.connect {
             let view = ConnectView {
                 url: &session.url,
                 elapsed: now.saturating_duration_since(session.started),
                 copied: session.copied,
             };
-            connect::draw(frame, rows.content, self.palette, &view);
+            connect::draw(frame, rows.content, &self.palette, &view);
         }
-        self.toasts.draw(frame, area, self.palette);
+        self.toasts.draw(frame, area, &self.palette);
     }
 
     fn view_env(&self, now: Instant) -> ViewEnv {
@@ -1943,7 +1943,7 @@ impl App {
             browse::draw_list(
                 frame,
                 list,
-                self.palette,
+                &self.palette,
                 &self.browse,
                 &env,
                 self.pane == Pane::List,
@@ -1959,7 +1959,7 @@ impl App {
             detail::draw_pane(
                 frame,
                 pane,
-                self.palette,
+                &self.palette,
                 &self.detail,
                 &env,
                 &mut self.pool,
@@ -1973,7 +1973,7 @@ impl App {
                 area.width.saturating_sub(3),
                 area.height,
             );
-            browse::draw_list(frame, list, self.palette, &self.browse, &env, true);
+            browse::draw_list(frame, list, &self.palette, &self.browse, &env, true);
         }
     }
 
@@ -1992,7 +1992,7 @@ impl App {
             history::draw_list(
                 frame,
                 list,
-                self.palette,
+                &self.palette,
                 &self.history,
                 &env,
                 self.pane == Pane::List,
@@ -2008,7 +2008,7 @@ impl App {
             detail::draw_pane(
                 frame,
                 pane,
-                self.palette,
+                &self.palette,
                 &self.detail,
                 &env,
                 &mut self.pool,
@@ -2024,7 +2024,7 @@ impl App {
                 area.width.saturating_sub(3),
                 area.height,
             );
-            history::draw_list(frame, list, self.palette, &self.history, &env, true);
+            history::draw_list(frame, list, &self.palette, &self.history, &env, true);
         }
     }
 
@@ -2033,7 +2033,7 @@ impl App {
         detail::draw_zoom(
             frame,
             area,
-            self.palette,
+            &self.palette,
             &self.detail,
             &env,
             &mut self.pool,
@@ -2045,7 +2045,7 @@ impl App {
         discover::draw(
             frame,
             area,
-            self.palette,
+            &self.palette,
             &self.discover,
             &mut self.pool,
             &env,
@@ -4254,6 +4254,22 @@ mod tests {
         app.tick(ch('l'), now, &tx);
         assert_eq!(app.config.palette, "phosphor");
         assert_eq!(app.palette.name, "phosphor", "repaints on the next frame");
+    }
+
+    #[test]
+    fn transparent_bg_toggle_projects_live() {
+        use ratatui::style::Color;
+        let (mut app, tx, now) = sized("settings-transparent", 100, 32);
+        app.tick(ch('S'), now, &tx);
+        // Down to the transparent background row (index 9), flip it twice.
+        for _ in 0..9 {
+            app.tick(ch('j'), now, &tx);
+        }
+        app.tick(ch(' '), now, &tx);
+        assert!(app.config.transparent_background);
+        assert_eq!(app.palette.bg, Color::Reset, "repaints on the next frame");
+        app.tick(ch(' '), now, &tx);
+        assert_eq!(app.palette.bg, theme::by_name(&app.config.palette).bg);
     }
 
     #[test]

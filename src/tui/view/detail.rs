@@ -316,8 +316,9 @@ impl DetailState {
     }
 }
 
-/// The persistent right-hand pane: surface-tier background marks the pane
-/// boundary without a border (DESIGN 3.1). `focused` lights the grid cursor;
+/// The persistent right-hand pane: base-tier fill like the list column
+/// (zigoku parity, ROD-458 F4); the 2-cell gap alone marks the boundary
+/// (DESIGN 3.1). `focused` lights the grid cursor;
 /// `split_ok` gates the two-column cover|content split (Browse keeps the
 /// single stack, History splits past the width gate).
 #[allow(clippy::too_many_arguments)]

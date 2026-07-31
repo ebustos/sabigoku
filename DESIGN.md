@@ -133,9 +133,10 @@ per §1.2 semantic alias) and ships four concrete instances:
 | TokyoNight | `tokyonight` | TokyoNight "night" base with a storm-bg surface tier (`bg_surface` is TN storm `#24283b`). `hot` is TN red `#f7768e`, `warn` TN yellow `#e0af68`. **Focus is a deliberate luminance lift off canonical TN:** TN's own cyan (`#7dcfff`, L≈0.56) reads *dimmer* than `fg` (`#c0caf5`, L≈0.60). Fine for an editor cursor on one glyph, wrong for a full focused row that must out-read its neighbours, and unlike Nord there is no hue rescue (both sit in the blue-lavender family). So `focus` is lifted to a brighter same-hue cyan (`#b0e8ff`, L≈0.75) to honour the §1.1 focus-clears-`fg` rule. `fg2` (`#9aa5ce`) is tuned between TN `fg_dark` and `dark5` for even `fg→fg2→fg3` spacing (`fg2`-vs-`fg3` = 2.55:1). |
 
 The active palette is chosen by the `palette` config key (default
-`"terminal_ghost"`). The app holds a reference to the active `Palette`; render
-functions reference its fields instead of module-level constants, so a theme switch
-takes effect without touching component code.
+`"terminal_ghost"`). The app holds the active resolved `Palette` (the named theme
+plus the §1.4a transparency remap); render functions reference its fields instead of
+module-level constants, so a theme switch takes effect without touching component
+code.
 
 **Dark-only still holds.** All four themes are dark. "No light theme, ever" (§0) is a
 constraint on every palette, not just the default: a theme is a re-hue of the same
@@ -146,6 +147,43 @@ honour it (TokyoNight via a deliberate lift off canonical TN cyan; see its row),
 trades it for a hue-shift focus per the note above, a ratified call (§10). A new
 theme must keep the two invariants; how it makes `focus` legible against `fg`
 (luminance lift or hue shift) is its own call.
+
+### 1.4a Transparent Background
+
+`transparent_background` (config key, default `false`) is an axis orthogonal to
+theme selection: any palette can run transparent. When set, the `bg` tier resolves
+to the terminal's default background (`Color::Reset`) instead of the theme's
+painted base, so cells that would carry the base color instead show whatever the
+terminal composites there (its own opacity, blur, wallpaper). sabigoku never
+handles alpha itself: the backdrop behind the window is unreadable to any terminal
+app, and no standard query for the terminal's opacity exists, so there is nothing
+to composite against. Leaving the cell unpainted is the entire mechanism, and it
+is also why the option exists: terminals apply window opacity only to
+default-background cells, so a fully painted app renders opaque even in a
+transparent terminal.
+
+Scope of the remap (first cut, ratified ROD-511):
+
+- `bg` → `Color::Reset`. Nothing else.
+- `surface` and `elevated` stay painted: focused rows, cards, and toasts remain
+  opaque islands with intact §1.1 contrast over the transparent base.
+- `chrome`, all fg tiers, and accents are untouched.
+
+The base tier is the whole canvas, list and persistent detail pane alike (the
+pane fills `bg.base` since ROD-458 F4, §3.1), so the app's primary surfaces go
+transparent together; the opaque islands are exactly the surface/elevated
+fills, not "panels" in general.
+
+Opt-in, never default. With `bg` reset the theme's base color is ignored, and an
+opaque terminal with a light default background will wreck fg contrast. That is
+accepted as the user's call (they opted in); transparent mode does not force a
+minimum fg tier. Dark-only (§0) is unchanged: transparency drops the paint, it
+does not admit a light theme.
+
+Users who want the painted tiers blended as well pair the toggle with their
+terminal's cell-opacity control (e.g. ghostty ≥ 1.2 `background-opacity-cells`).
+How explicitly painted cells behave under window opacity differs per terminal;
+that is documented, not coded around.
 
 ---
 
@@ -238,8 +276,11 @@ rule: the status glyph reads `text.muted` when unselected and only becomes
 
 Panes are separated by:
 1. **Whitespace:** a 2-cell gap between the list column and the detail column.
-2. **Color differentiation:** the detail pane background is `bg.surface` where the
-   list column is `bg.base`. The boundary is visible without a line.
+2. **Color differentiation:** ~~the detail pane background is `bg.surface` where the
+   list column is `bg.base`. The boundary is visible without a line.~~ Retired by
+   the zigoku parity pass (ROD-458 F4): the pane fills `bg.base` like the list, and
+   the gap plus alignment alone carry the boundary. In §1.4a transparent mode both
+   regions accordingly ride the terminal backdrop together.
 3. **Content alignment:** list content is left-aligned; detail content uses the
    leftmost cell of its column as the margin anchor.
 
@@ -1756,6 +1797,7 @@ Live-editable. Full width. No cover art.
     cover art                     [████ on ████]                     space to toggle
     kanji chips                   [████ on ████]                     space to toggle
     palette                       terminal_ghost                       hjkl to cycle
+    transparent background        [████ off ████]                    space to toggle
     landing view                  history                              hjkl to cycle
     title language                romaji                               hjkl to cycle
 
@@ -1773,12 +1815,12 @@ Live-editable. Full width. No cover art.
   ▌  hjkl navigate · space toggle · enter edit · q save+quit
 ```
 
-Five sections (Player · Catalog · Interface · AniList Sync · Updates): fourteen
+Five sections (Player · Catalog · Interface · AniList Sync · Updates): fifteen
 interactive rows plus four read-only rows (two Catalog, one AniList Sync, one
 Updates). The interactive-row split is Player `0..5`, Catalog `5..6` (the lone
-`provider` row, below the two inert status rows), Interface `6..11`, AniList
-Sync `11..13`, Updates `13..14`, pinned by a compile-time assertion in
-`src/tui/settings_state.rs` so a future row insertion that shifts a boundary
+`provider` row, below the two inert status rows), Interface `6..12`, AniList
+Sync `12..14`, Updates `14..15`, pinned by a compile-time assertion in
+`src/tui/view/settings.rs` so a future row insertion that shifts a boundary
 breaks the build instead of silently misattributing a row to the wrong section
 header.
 
@@ -1817,6 +1859,9 @@ Notes:
 - **skip mode** cycles `none·intro·outro·both`, default `both`.
 - **palette** cycles `terminal_ghost·phosphor·nord·tokyonight`, default
   `terminal_ghost` (§1.4). Live-preview: cycling repaints on the next frame.
+- **transparent background** toggles `config.transparent_background`, default **off**:
+  the §1.4a remap of the `bg` tier to the terminal default. Live-preview like
+  `palette`: flipping it re-resolves the active palette on the next frame.
 - **default quality** cycles `worst · 480 · 720 · 1080 · best`, default `best`. It
   is honoured at stream-resolution time via a *cap* policy over the variants a
   provider exposes (`select_variant`): `best`/`worst` pick the resolution
@@ -2960,7 +3005,7 @@ strings elsewhere.
 | `src/tui/view/detail.rs` | `DETAIL_TWO_COL_MIN`, `cover_height_cap` / `synopsis_cap` (§3.3), `meta_line` / `provider_line` / `alt_rows` (§5.3a, §4.4) |
 | `src/tui/view/discover.rs` | `GENRE_GLYPHS` (must match §3.8a exactly), card-grid geometry (§3.8) |
 | `src/tui/view/browse.rs` / `src/tui/view/history.rs` | List-row rendering (§4.1), History preview stack (§5.4a) |
-| `src/tui/view/settings.rs` + `src/tui/settings_state.rs` | Settings rows; the compile-time section-boundary assertion (§5.5) |
+| `src/tui/view/settings.rs` | Settings rows; the compile-time section-boundary assertion (§5.5) |
 | `src/tui/view/connect.rs` + `src/anilist/login_loopback.rs` | AniList connect modal + OAuth loopback and callback pages (§5.5a) |
 | `src/tui/chrome.rs` | Top bar (§3.4) and bottom bar / help strings (§3.5, §7.5) |
 | `src/tui/render.rs` | `bar_fill_color` / `bar_frac_color` (§4.5, unit-tested) and shared styling helpers |
@@ -3172,6 +3217,7 @@ that history). Logged here so they can be revisited without archaeology.
 | Cover image footprint fill only: no `bg_surface` matte around the rendered image (ROD-164) | The slot geometry (fixed cell dimensions vs the poster's pixel aspect) produces unavoidable non-zero fit-matte at arbitrary terminal sizes; the cover math is rebuilt each frame from reported pixel/cell metrics that don't divide cleanly. Filling the full slot with `bg_surface` exposes this as a contrasting matte whose size varies with terminal geometry, and `bg_surface` means "elevated layer" (§1.1); mounting hero content in it is a semantic collision. Instead only the image footprint is painted; the leftover slot inherits `bg_base`, so the mismatch has nothing to contrast against (§0 "panes float in the void", §3.3 "no border"). `bg_surface` is preserved for placeholder states (loading spinner, "no art yet") where the panel itself is the content. PNG alpha composites onto `bg_base`. | If covers with heavy alpha transparency look wrong on `bg_base`, add a `bg_surface` fill scoped to the fit rect only (not the full slot). |
 | Single magenta cursor, not per-pane focus indicators | Two simultaneous magenta elements dilute the "pointer" semantic. The `·` dot in the top bar handles pane focus in `state.focus` (cyan) only. | If pane focus proves unclear, move the active pane label to a more prominent position. |
 | No animation on state transitions | Terminal Ghost's identity is restraint. The blink cursor already claims the one temporal channel. | If feedback identifies a specific transition that needs clarification, add a single-frame flash (not a slide). |
+| Transparent mode resets only the `bg` tier; `surface`/`elevated` stay painted (ROD-511) | The base tier is the whole canvas (list and detail pane alike, ROD-458 F4), which is exactly what the user opted to see through; focused rows, cards, and toasts keep §1.1 contrast as opaque islands. No app-side alpha: the backdrop is unreadable and no opacity query exists, so `Color::Reset` is the only hook (§1.4a). | If painted islands over a blurred backdrop read as floating patches rather than layers, consider resetting `surface` too and carrying depth on borders and fg tiers alone. |
 | Kanji season/status chips without box borders | Box around kanji chips adds visual noise against an already dense detail pane. Color alone is sufficient on dark. | If user testing shows the chips are missed, add a dim `[` `]` wrap in `border.hair` color. |
 | Help line updates contextually per view | The bottom bar doubles as a contextual hint line. Fewer permanent labels means less to ignore. | If users report confusion about available keys, add a `?` keybind that shows a full key reference in `bg.elevated` overlay. |
 | Score ≥ 91 earns `state.now` | The 91 threshold maps to AniList's "Favorites" tier. Below 91, scores are metadata. Above, they are a claim. | Adjust threshold if the distribution feels wrong in practice. |
@@ -3280,6 +3326,15 @@ any of them as settled by implication.
    or the blink needs a manual timer (which §6.4 currently rules out).
 
 ## Changelog
+
+**2026-07-31 (ROD-511):** Added §1.4a: the `transparent_background` config
+toggle maps the `bg` tier to `Color::Reset` (terminal default) so the
+terminal's own opacity/blur shows through; `surface`/`elevated` stay painted
+as opaque islands. New `transparent background` toggle row after `palette`
+(Interface, §5.5; fifteen interactive rows). Also struck the §3.1
+color-differentiation clause that ROD-458 F4 had already retired in code: the
+detail pane fills `bg.base`, not `bg.surface`, so it rides the transparent
+base with the list.
 
 **2026-07-28 (ROD-484):** The §5.3a provider row encodes serving and pin on the
 fg ladder instead of naming the pin in text: the `· pin {pinned}` segment is gone,

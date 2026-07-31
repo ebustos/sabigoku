@@ -6,7 +6,7 @@
 use ratatui::style::Color;
 
 /// One field per DESIGN 1.2 semantic alias, plus `elevated` (toast layer).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     pub name: &'static str,
     pub bg: Color,
@@ -97,6 +97,17 @@ pub fn by_name(name: &str) -> &'static Palette {
     }
 }
 
+/// The active palette: `by_name`, with transparent mode mapping `bg` (and only
+/// `bg`) to the terminal default so the emulator's own opacity/blur applies.
+/// `surface`/`elevated` stay painted (DESIGN 1.4a).
+pub fn resolve(name: &str, transparent: bool) -> Palette {
+    let mut palette = *by_name(name);
+    if transparent {
+        palette.bg = Color::Reset;
+    }
+    palette
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +124,24 @@ mod tests {
     #[test]
     fn phosphor_focus_matches_fg_by_design() {
         assert_eq!(PHOSPHOR.focus, PHOSPHOR.fg);
+    }
+
+    #[test]
+    fn resolve_transparent_resets_bg_and_nothing_else() {
+        for name in ["terminal_ghost", "phosphor", "nord", "tokyonight"] {
+            let transparent = resolve(name, true);
+            assert_eq!(transparent.bg, Color::Reset);
+            let opaque = Palette {
+                bg: by_name(name).bg,
+                ..transparent
+            };
+            assert_eq!(&opaque, by_name(name));
+        }
+    }
+
+    #[test]
+    fn resolve_opaque_is_the_named_palette_verbatim() {
+        assert_eq!(resolve("nord", false), NORD);
+        assert_eq!(resolve("unknown", false), TERMINAL_GHOST);
     }
 }
