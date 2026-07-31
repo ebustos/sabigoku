@@ -171,6 +171,7 @@ fn url_origin(url: &str) -> String {
 
 /// Parse jwplayer-style soft subtitles from player HTML (playsub.php).
 /// `tracks: [{...}, ...]` where each object has file, label, kind fields.
+/// Naive brace scanner: breaks if a string value contains `}` or `]`.
 fn parse_subtitles(html: &str) -> Vec<SubTrack> {
     // Find the tracks array.
     let Some(at) = html.find("tracks") else {
@@ -297,11 +298,7 @@ impl AniBd {
     fn fetch_catalog(&self, anilist_id: &str) -> Result<Vec<CatalogGroup>, ProviderError> {
         let url = format!("{}/api2.php?epid={anilist_id}", self.api);
         let raw = self.get(&url)?;
-        let groups = parse_catalog(&raw)?;
-        if groups.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(groups)
+        parse_catalog(&raw)
     }
 
     /// Fetch subtitle from a player page and validate it for mpv.
@@ -370,7 +367,8 @@ impl StreamProvider for AniBd {
         let link = find_link(&groups, ep_num, tt)
             .ok_or_else(|| ProviderError::Decode("no stream for track".into()))?;
 
-        let players_url = format!("{}/apilink.php?data={link}", self.api);
+        let encoded_link: String = url::form_urlencoded::byte_serialize(link.as_bytes()).collect();
+        let players_url = format!("{}/apilink.php?data={encoded_link}", self.api);
         let raw = self.get(&players_url)?;
         let players = parse_players(&raw)?;
 
@@ -383,6 +381,12 @@ impl StreamProvider for AniBd {
         }
 
         for player_url in usable.iter().take(MAX_PLAYER_TRIES) {
+            if !is_absolute_url(player_url)
+                || !clean_arg(player_url)
+                || guard_fetch_url(player_url).is_err()
+            {
+                continue;
+            }
             let origin = url_origin(player_url);
             let referer = format!("{origin}/");
             let html = match self.get(player_url) {
@@ -730,6 +734,68 @@ mod tests {
         let p = against(response_with_body("403 Forbidden", b""));
         let got = p.episodes("154587", Translation::Sub, None);
         assert!(matches!(got, Err(ProviderError::Forbidden { status: 403 })));
+    }
+
+    #[test]
+    fn resolve_skips_private_player_url() {
+        // apilink.php returns a loopback player link: the SSRF guard must
+        // skip it, not fetch it. With no other candidates, resolve fails.
+        let catalog = r#"[{"server_name":"Sub","server_data":[{"name":"1","link":"x"}]}]"#;
+        let players = r#"[{"link":"http://169.254.169.254/latest/meta-data/"}]"#;
+        // First request: catalog. Second: apilink. The player URL itself
+        // must never be fetched, so only two hops need a response.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cat = response_with_body("200 OK", catalog.as_bytes());
+        let pl = response_with_body("200 OK", players.as_bytes());
+        std::thread::spawn(move || {
+            for resp in [cat, pl] {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut sock, &mut buf);
+                let _ = std::io::Write::write_all(&mut sock, &resp);
+            }
+        });
+        let p = AniBd::with_endpoint(format!("http://{addr}")).unwrap();
+        let got = p.resolve("154587", "1", Translation::Sub, Quality::Best);
+        assert!(matches!(got, Err(ProviderError::Decode(_))));
+    }
+
+    #[test]
+    fn resolve_encodes_catalog_link_in_url() {
+        // A catalog link with query metacharacters must be percent-encoded
+        // so it stays inside the `data` param, not injected as siblings.
+        let catalog = r#"[{"server_name":"Sub","server_data":[
+            {"name":"1","link":"evil&inject=1"}
+        ]}]"#;
+        // apilink.php response: empty players -> resolve fails, but the
+        // point is the link reached the wire encoded, not raw.
+        let players = b"[]";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cat = response_with_body("200 OK", catalog.as_bytes());
+        let pl = response_with_body("200 OK", players);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // First hop: catalog.
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let _ = std::io::Write::write_all(&mut sock, &cat);
+            // Second hop: apilink. Capture the request.
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let _ = std::io::Write::write_all(&mut sock, &pl);
+        });
+        let p = AniBd::with_endpoint(format!("http://{addr}")).unwrap();
+        let _ = p.resolve("154587", "1", Translation::Sub, Quality::Best);
+        let req = rx.recv().unwrap();
+        assert!(
+            req.contains("data=evil%26inject%3D1"),
+            "link must be percent-encoded in the URL, got: {req}"
+        );
     }
 
     #[test]
