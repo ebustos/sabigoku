@@ -16,6 +16,26 @@ use crate::domain::{Enrichment, Quality, StreamLink, Translation};
 pub const SEARCH_PAGE_SIZE: u32 = 26;
 /// Discover feed page (06 §8b).
 pub const DISCOVER_PAGE_SIZE: u32 = 20;
+/// Cover ref ceiling for `cover_request` guards (senshi, allanime).
+pub const MAX_COVER_REF_LEN: usize = 2048;
+
+/// Digit-only id guard shared by MAL-keyed providers (senshi, megaplay).
+/// Rejects empty, path-smuggle (`../7`), and mixed (`12a`) before the id
+/// reaches a URL splice.
+pub fn guard_show_id(show_id: &str) -> Result<(), ProviderError> {
+    if !show_id.is_empty() && show_id.bytes().all(|c| c.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(ProviderError::Decode("invalid show id".into()))
+    }
+}
+
+/// Printable-ASCII-only argv guard (0x21..=0x7e). Rejects controls, spaces,
+/// and empty strings before a value reaches mpv's command line or an HTTP
+/// header splice.
+pub fn clean_arg(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| (0x21..=0x7e).contains(&c))
+}
 
 /// Provider failure classes; the TUI maps these to toast copy and hop policy
 /// (03 §7). `Ok(vec![])` from `episodes` is NOT an error: it is authoritative
@@ -476,6 +496,29 @@ mod tests {
             reg.iter().map(|p| p.name()).collect::<Vec<_>>(),
             vec!["megaplay", "senshi", "allanime"]
         );
+    }
+
+    #[test]
+    fn guard_show_id_accepts_digits_rejects_traversal() {
+        assert!(guard_show_id("52991").is_ok());
+        assert!(guard_show_id("59708").is_ok());
+        assert!(guard_show_id("").is_err());
+        assert!(guard_show_id("../etc").is_err());
+        assert!(guard_show_id("52991/x").is_err());
+        assert!(guard_show_id("13458abc").is_err());
+        assert!(guard_show_id("1/x").is_err());
+        assert!(guard_show_id("../7").is_err());
+        assert!(guard_show_id("12a").is_err());
+    }
+
+    #[test]
+    fn clean_arg_rejects_controls_and_space() {
+        assert!(clean_arg("https://cdn/v.m3u8"));
+        assert!(clean_arg("simple"));
+        assert!(!clean_arg("a b"));
+        assert!(!clean_arg("a\nb"));
+        assert!(!clean_arg("a\r\nb"));
+        assert!(!clean_arg(""));
     }
 
     #[test]

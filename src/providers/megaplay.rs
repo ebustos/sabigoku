@@ -27,7 +27,9 @@ use crate::domain::{
     Enrichment, MAX_EPISODE_HINT, Quality, StreamLink, Translation, is_absolute_url,
 };
 use crate::fetchguard::guard_fetch_url;
-use crate::providers::{CoverRequest, ProviderError, SearchHit, SearchOptions, StreamProvider};
+use crate::providers::{
+    CoverRequest, ProviderError, SearchHit, SearchOptions, StreamProvider, clean_arg, guard_show_id,
+};
 
 const HOST: &str = "https://megaplay.buzz";
 // Every downstream CDN host gates on this exact origin.
@@ -191,24 +193,6 @@ fn english_captions(tracks: &[Track]) -> Vec<&str> {
         out.push(t.file.as_str());
     }
     out
-}
-
-// ── input guards ──────────────────────────────────────────────────────────────
-
-/// Show id is digits only (stringified MAL id). Reject before URL path splice so
-/// `../…` or `1/x` cannot smuggle a second path segment.
-fn guard_show_id(show_id: &str) -> Result<(), ProviderError> {
-    if !show_id.is_empty() && show_id.bytes().all(|c| c.is_ascii_digit()) {
-        Ok(())
-    } else {
-        Err(ProviderError::Decode("invalid show id".into()))
-    }
-}
-
-/// Safe for a fetch URL / mpv argv: printable ASCII only (0x21-0x7e). Catches
-/// CR/LF and any control a `<0x20` denylist would miss.
-fn clean_arg(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|c| (0x21..=0x7e).contains(&c))
 }
 
 /// MAL-keyed embed URL. `{sub|dub}` is Translation's wire tag.
@@ -499,15 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn guard_show_id_accepts_mal_rejects_traversal() {
-        assert!(guard_show_id("52991").is_ok());
-        assert!(guard_show_id("").is_err());
-        assert!(guard_show_id("../etc").is_err());
-        assert!(guard_show_id("52991/x").is_err());
-        assert!(guard_show_id("13458abc").is_err());
-    }
-
-    #[test]
     fn embed_url_splices_mal_episode_and_track() {
         assert_eq!(
             embed_url(HOST, "52991", "28", Translation::Sub),
@@ -528,15 +503,6 @@ mod tests {
         // Zero -> one (empty means not-stocked). Hostile count clamps.
         assert_eq!(labels(0).len(), 1);
         assert_eq!(labels(u32::MAX).len(), MAX_EPISODE_HINT as usize);
-    }
-
-    #[test]
-    fn clean_arg_rejects_controls_and_space() {
-        assert!(clean_arg("https://cdn/v.m3u8"));
-        assert!(!clean_arg("a b"));
-        assert!(!clean_arg("a\nb"));
-        assert!(!clean_arg("a\r\nb"));
-        assert!(!clean_arg(""));
     }
 
     #[test]

@@ -19,9 +19,12 @@ use std::time::Duration;
 
 use super::hls;
 use super::http::{Accept, HttpClient, Method, Request};
-use crate::domain::{Enrichment, Quality, StreamLink, Translation};
+use crate::domain::{Enrichment, Quality, StreamLink, Translation, is_absolute_url};
 use crate::fetchguard::guard_fetch_url;
-use crate::providers::{CoverRequest, ProviderError, SEARCH_PAGE_SIZE, SearchHit, StreamProvider};
+use crate::providers::{
+    CoverRequest, MAX_COVER_REF_LEN, ProviderError, SEARCH_PAGE_SIZE, SearchHit, StreamProvider,
+    clean_arg,
+};
 
 const API: &str = "https://api.allanime.day/api";
 // Old Chrome UA: accepted and unremarkable.
@@ -42,9 +45,6 @@ const SITE: &str = "https://allanime.day";
 // Cover CDN for bare relative `mcovers/…` paths (absolute AniList/MAL urls
 // pass through). Cloudflare-fronted; 403s without referer (ROD-267).
 const COVER_CDN_BASE: &str = "https://wp.youtube-anime.com/aln.youtube-anime.com/";
-
-// Cap before splicing a cover ref into a fetch URL (ROD-267).
-const MAX_COVER_REF_LEN: usize = 2048;
 
 // Referers the API / CDN gate on.
 const REFERER_API: &str = "https://allmanga.to/"; // search + episodes + clock GET
@@ -349,14 +349,7 @@ fn wixmp_variants(link: &str) -> Result<Option<Vec<hls::Variant>>, ProviderError
     Ok(Some(out))
 }
 
-/// Safe for mpv argv: printable ASCII 0x21-0x7e only (allowlist, not
-/// denylist). Catches CR/LF and ≥0x80 line-break-equivalents a `<0x20`
-/// denylist would miss.
-fn clean_arg(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|c| (0x21..=0x7e).contains(&c))
-}
-
-/// Untrusted clock.json Referer → SITE if dirty/absent (header-injection
+/// Untrusted clock.json Referer, falls back to SITE if dirty/absent (header-injection
 /// hazard).
 fn safe_referer(r: Option<&str>) -> &str {
     match r {
@@ -369,7 +362,7 @@ fn safe_referer(r: Option<&str>) -> &str {
 /// `--` mpv would treat as an option) and clean. Quality pick is
 /// `select_variant`'s job.
 fn consider(url: &str, resolution: Option<u32>, referer: &str) -> Option<StreamLink> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    if !is_absolute_url(url) {
         return None;
     }
     if !clean_arg(url) {
@@ -664,7 +657,7 @@ impl StreamProvider for AllAnime {
         if cover_ref.is_empty() || cover_ref.len() > MAX_COVER_REF_LEN || !clean_arg(cover_ref) {
             return Err(ProviderError::Decode("invalid cover ref".into()));
         }
-        if cover_ref.starts_with("http://") || cover_ref.starts_with("https://") {
+        if is_absolute_url(cover_ref) {
             return Ok(CoverRequest {
                 url: cover_ref.to_string(),
                 referer: None,

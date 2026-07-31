@@ -2,7 +2,7 @@
 //! Providers fetch the master themselves (CDN headers differ per source) and
 //! feed the bytes here; cap policy and variant math live in one place.
 
-use crate::domain::{Quality, StreamLink};
+use crate::domain::{Quality, StreamLink, is_absolute_url};
 
 /// Master playlist entry: variant URI (verbatim, possibly relative) + vertical
 /// resolution when STREAM-INF advertised one.
@@ -53,7 +53,7 @@ pub fn parse_master_playlist(text: &str) -> Vec<Variant> {
 /// http(s) passes through; `/rooted` keeps scheme+host; else relative to the
 /// playlist dir. `./`/`../` stay literal: mpv normalizes; we don't resolve.
 pub fn join_url(base: &str, reference: &str) -> Option<String> {
-    if reference.starts_with("http://") || reference.starts_with("https://") {
+    if is_absolute_url(reference) {
         return Some(reference.to_string());
     }
     let scheme_end = base.find("://")? + 3;
