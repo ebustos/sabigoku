@@ -24,6 +24,7 @@ pub struct Config {
     pub cover_art: bool,
     pub kanji_chips: bool,
     pub palette: String,
+    pub transparent_background: bool,
     pub landing: String,
     pub title_language: String,
     /// Unclamped as stored; read through `effective_cover_concurrency()`.
@@ -45,6 +46,7 @@ impl Default for Config {
             cover_art: true,
             kanji_chips: true,
             palette: "terminal_ghost".into(),
+            transparent_background: false,
             landing: "last_watched".into(),
             title_language: "romaji".into(),
             discover_cover_concurrency: 4,
@@ -107,6 +109,7 @@ mod tests {
             translation: "dub".into(),
             resume_offset_sec: 12,
             cover_art: false,
+            transparent_background: true,
             preferred_provider: "allanime".into(),
             ..Config::default()
         };

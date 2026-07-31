@@ -56,6 +56,7 @@ Rules:
 | `cover_art` | `true` | |
 | `kanji_chips` | `true` | |
 | `palette` | `"terminal_ghost"` | DESIGN themes |
+| `transparent_background` | `false` | DESIGN 1.4a: `bg` tier → terminal default; surface/elevated stay painted |
 | `landing` | `"history"` | history\|browse\|last_watched |
 | `title_language` | `"romaji"` | romaji\|english\|native |
 | `discover_cover_concurrency` | `4` | clamp **[1, 16]** at read |

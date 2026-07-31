@@ -133,9 +133,10 @@ per §1.2 semantic alias) and ships four concrete instances:
 | TokyoNight | `tokyonight` | TokyoNight "night" base with a storm-bg surface tier (`bg_surface` is TN storm `#24283b`). `hot` is TN red `#f7768e`, `warn` TN yellow `#e0af68`. **Focus is a deliberate luminance lift off canonical TN:** TN's own cyan (`#7dcfff`, L≈0.56) reads *dimmer* than `fg` (`#c0caf5`, L≈0.60). Fine for an editor cursor on one glyph, wrong for a full focused row that must out-read its neighbours, and unlike Nord there is no hue rescue (both sit in the blue-lavender family). So `focus` is lifted to a brighter same-hue cyan (`#b0e8ff`, L≈0.75) to honour the §1.1 focus-clears-`fg` rule. `fg2` (`#9aa5ce`) is tuned between TN `fg_dark` and `dark5` for even `fg→fg2→fg3` spacing (`fg2`-vs-`fg3` = 2.55:1). |
 
 The active palette is chosen by the `palette` config key (default
-`"terminal_ghost"`). The app holds a reference to the active `Palette`; render
-functions reference its fields instead of module-level constants, so a theme switch
-takes effect without touching component code.
+`"terminal_ghost"`). The app holds the active resolved `Palette` (the named theme
+plus the §1.4a transparency remap); render functions reference its fields instead of
+module-level constants, so a theme switch takes effect without touching component
+code.
 
 **Dark-only still holds.** All four themes are dark. "No light theme, ever" (§0) is a
 constraint on every palette, not just the default: a theme is a re-hue of the same
@@ -146,6 +147,37 @@ honour it (TokyoNight via a deliberate lift off canonical TN cyan; see its row),
 trades it for a hue-shift focus per the note above, a ratified call (§10). A new
 theme must keep the two invariants; how it makes `focus` legible against `fg`
 (luminance lift or hue shift) is its own call.
+
+### 1.4a Transparent Background
+
+`transparent_background` (config key, default `false`) is an axis orthogonal to
+theme selection: any palette can run transparent. When set, the `bg` tier resolves
+to the terminal's default background (`Color::Reset`) instead of the theme's
+painted base, so cells that would carry the base color instead show whatever the
+terminal composites there (its own opacity, blur, wallpaper). sabigoku never
+handles alpha itself; there is no way to (the backdrop behind the window is
+unreadable, and no standard query for the terminal's opacity exists). Leaving the
+cell unpainted is the entire mechanism, and it is also why the option exists:
+terminals apply window opacity only to default-background cells, so a fully
+painted app renders opaque even in a transparent terminal.
+
+Scope of the remap (first cut, ratified ROD-511):
+
+- `bg` → `Color::Reset`. Nothing else.
+- `surface` and `elevated` stay painted: focused rows, cards, and toasts remain
+  opaque islands with intact §1.1 contrast over the transparent base.
+- `chrome`, all fg tiers, and accents are untouched.
+
+Opt-in, never default. With `bg` reset the theme's base color is ignored, and an
+opaque terminal with a light default background will wreck fg contrast. That is
+accepted as the user's call (they opted in); transparent mode does not force a
+minimum fg tier. Dark-only (§0) is unchanged: transparency drops the paint, it
+does not admit a light theme.
+
+Users who want the painted tiers blended as well pair the toggle with their
+terminal's cell-opacity control (e.g. ghostty ≥ 1.2 `background-opacity-cells`).
+How explicitly painted cells behave under window opacity differs per terminal;
+that is documented, not coded around.
 
 ---
 
@@ -1756,6 +1788,7 @@ Live-editable. Full width. No cover art.
     cover art                     [████ on ████]                     space to toggle
     kanji chips                   [████ on ████]                     space to toggle
     palette                       terminal_ghost                       hjkl to cycle
+    transparent bg                [████ off ████]                    space to toggle
     landing view                  history                              hjkl to cycle
     title language                romaji                               hjkl to cycle
 
@@ -1773,11 +1806,11 @@ Live-editable. Full width. No cover art.
   ▌  hjkl navigate · space toggle · enter edit · q save+quit
 ```
 
-Five sections (Player · Catalog · Interface · AniList Sync · Updates): fourteen
+Five sections (Player · Catalog · Interface · AniList Sync · Updates): fifteen
 interactive rows plus four read-only rows (two Catalog, one AniList Sync, one
 Updates). The interactive-row split is Player `0..5`, Catalog `5..6` (the lone
-`provider` row, below the two inert status rows), Interface `6..11`, AniList
-Sync `11..13`, Updates `13..14`, pinned by a compile-time assertion in
+`provider` row, below the two inert status rows), Interface `6..12`, AniList
+Sync `12..14`, Updates `14..15`, pinned by a compile-time assertion in
 `src/tui/settings_state.rs` so a future row insertion that shifts a boundary
 breaks the build instead of silently misattributing a row to the wrong section
 header.
@@ -1817,6 +1850,9 @@ Notes:
 - **skip mode** cycles `none·intro·outro·both`, default `both`.
 - **palette** cycles `terminal_ghost·phosphor·nord·tokyonight`, default
   `terminal_ghost` (§1.4). Live-preview: cycling repaints on the next frame.
+- **transparent bg** toggles `config.transparent_background`, default **off**:
+  the §1.4a remap of the `bg` tier to the terminal default. Live-preview like
+  `palette`: flipping it re-resolves the active palette on the next frame.
 - **default quality** cycles `worst · 480 · 720 · 1080 · best`, default `best`. It
   is honoured at stream-resolution time via a *cap* policy over the variants a
   provider exposes (`select_variant`): `best`/`worst` pick the resolution

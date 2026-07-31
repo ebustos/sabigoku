@@ -26,6 +26,7 @@ pub enum RowId {
     CoverArt,
     KanjiChips,
     Palette,
+    TransparentBg,
     Landing,
     TitleLanguage,
     Connect,
@@ -61,7 +62,7 @@ const fn row(id: RowId, label: &'static str, kind: RowKind, hint: &'static str) 
 
 /// Interactive rows only; the read-only rows (two Catalog, one AniList Sync,
 /// one Updates) render separately and are skipped by navigation (DESIGN 5.5).
-pub const ROWS: [Row; 14] = [
+pub const ROWS: [Row; 15] = [
     row(RowId::MpvPath, "mpv path", RowKind::Text, "enter to edit"),
     row(
         RowId::Quality,
@@ -102,6 +103,12 @@ pub const ROWS: [Row; 14] = [
     ),
     row(RowId::Palette, "palette", RowKind::Cycle, "hjkl to cycle"),
     row(
+        RowId::TransparentBg,
+        "transparent bg",
+        RowKind::Toggle,
+        "space to toggle",
+    ),
+    row(
         RowId::Landing,
         "landing view",
         RowKind::Cycle,
@@ -129,18 +136,18 @@ pub const ROWS: [Row; 14] = [
 ];
 
 // Section boundaries (DESIGN 5.5): Player 0..5, Catalog 5..6, Interface
-// 6..11, AniList Sync 11..13, Updates 13..14. A row insertion that shifts a
+// 6..12, AniList Sync 12..14, Updates 14..15. A row insertion that shifts a
 // boundary must break the build, never silently misattribute a row to the
 // wrong header.
 const _: () = {
-    assert!(ROWS.len() == 14);
+    assert!(ROWS.len() == 15);
     assert!(matches!(ROWS[4].id, RowId::SkipMode)); // last Player
     assert!(matches!(ROWS[5].id, RowId::Provider)); // the lone Catalog row
     assert!(matches!(ROWS[6].id, RowId::CoverArt)); // first Interface
-    assert!(matches!(ROWS[10].id, RowId::TitleLanguage)); // last Interface
-    assert!(matches!(ROWS[11].id, RowId::Connect)); // first AniList Sync
-    assert!(matches!(ROWS[12].id, RowId::Sync)); // last AniList Sync
-    assert!(matches!(ROWS[13].id, RowId::CheckUpdates)); // the lone Updates row
+    assert!(matches!(ROWS[11].id, RowId::TitleLanguage)); // last Interface
+    assert!(matches!(ROWS[12].id, RowId::Connect)); // first AniList Sync
+    assert!(matches!(ROWS[13].id, RowId::Sync)); // last AniList Sync
+    assert!(matches!(ROWS[14].id, RowId::CheckUpdates)); // the lone Updates row
 };
 
 const QUALITY_PRESETS: [&str; 5] = ["worst", "480", "720", "1080", "best"];
@@ -330,6 +337,7 @@ fn toggle(config: &mut Config, id: RowId) {
     match id {
         RowId::CoverArt => config.cover_art = !config.cover_art,
         RowId::KanjiChips => config.kanji_chips = !config.kanji_chips,
+        RowId::TransparentBg => config.transparent_background = !config.transparent_background,
         RowId::Sync => config.anilist_sync_enabled = !config.anilist_sync_enabled,
         RowId::CheckUpdates => config.check_for_updates = !config.check_for_updates,
         _ => {}
@@ -358,6 +366,7 @@ fn value(config: &Config, id: RowId, providers: &[&str]) -> String {
         RowId::CoverArt => onoff(config.cover_art),
         RowId::KanjiChips => onoff(config.kanji_chips),
         RowId::Palette => config.palette.clone(),
+        RowId::TransparentBg => onoff(config.transparent_background),
         RowId::Landing => config.landing.clone(),
         RowId::TitleLanguage => config.title_language.clone(),
         RowId::Sync => onoff(config.anilist_sync_enabled),
@@ -417,15 +426,15 @@ fn layout(env: &SettingsEnv) -> Vec<Li> {
     lines.push(Li::Row(5));
     lines.push(Li::Blank);
     section(&mut lines, "Interface");
-    (6..11).for_each(|i| lines.push(Li::Row(i)));
+    (6..12).for_each(|i| lines.push(Li::Row(i)));
     lines.push(Li::Blank);
     section(&mut lines, "AniList Sync");
     lines.push(Li::Inert("account", env.account.to_string()));
-    (11..13).for_each(|i| lines.push(Li::Row(i)));
+    (12..14).for_each(|i| lines.push(Li::Row(i)));
     lines.push(Li::Blank);
     section(&mut lines, "Updates");
     lines.push(Li::Inert("version", env.version.to_string()));
-    lines.push(Li::Row(13));
+    lines.push(Li::Row(14));
     lines
 }
 
@@ -671,6 +680,21 @@ mod tests {
     }
 
     #[test]
+    fn transparent_bg_row_flips_the_config_key() {
+        let (mut s, mut c) = state();
+        for _ in 0..9 {
+            press(&mut s, &mut c, &[KeyCode::Char('j')]);
+        }
+        assert_eq!(ROWS[s.cursor].id, RowId::TransparentBg);
+        assert_eq!(
+            press(&mut s, &mut c, &[KeyCode::Char(' ')]),
+            KeyOutcome::ConfigChanged
+        );
+        assert!(c.transparent_background);
+        assert!(s.dirty, "the toggle must persist on leave");
+    }
+
+    #[test]
     fn edit_mode_prefills_appends_commits_and_cancels() {
         let (mut s, mut c) = state();
         press(&mut s, &mut c, &[KeyCode::Enter]);
@@ -741,7 +765,7 @@ mod tests {
     #[test]
     fn connect_row_reports_the_action() {
         let (mut s, mut c) = state();
-        for _ in 0..11 {
+        for _ in 0..12 {
             press(&mut s, &mut c, &[KeyCode::Char('j')]);
         }
         assert_eq!(ROWS[s.cursor].id, RowId::Connect);
@@ -755,7 +779,7 @@ mod tests {
     #[test]
     fn check_updates_row_toggles_the_boot_gate() {
         let (mut s, mut c) = state();
-        for _ in 0..13 {
+        for _ in 0..14 {
             press(&mut s, &mut c, &[KeyCode::Char('j')]);
         }
         assert_eq!(ROWS[s.cursor].id, RowId::CheckUpdates);

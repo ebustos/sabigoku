@@ -162,7 +162,7 @@ fn draw_startup_frame(frame: &mut ratatui::Frame<'_>, config: &Config) {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Block;
-    let palette = theme::by_name(&config.palette);
+    let palette = theme::resolve(&config.palette, config.transparent_background);
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::new().bg(palette.bg)), area);
     render::draw_centered(
