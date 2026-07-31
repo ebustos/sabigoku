@@ -5,6 +5,7 @@
 //! tui or store (01 §5, keeps backends testable offline).
 
 pub mod allanime;
+pub mod anibd;
 pub mod hls;
 pub mod http;
 pub mod megaplay;
@@ -239,6 +240,7 @@ pub fn default_registry() -> Result<ProviderRegistry, ProviderError> {
         Box::new(megaplay::MegaPlay::new()?) as Box<dyn StreamProvider>,
         Box::new(senshi::Senshi::new()?),
         Box::new(allanime::AllAnime::new()?),
+        Box::new(anibd::AniBd::new()?),
     ]))
 }
 
@@ -351,6 +353,7 @@ mod tests {
             Box::new(Fake("megaplay", false)),
             Box::new(Fake("senshi", true)),
             Box::new(Fake("allanime", true)),
+            Box::new(Fake("anibd", false)),
         ])
     }
 
@@ -364,7 +367,7 @@ mod tests {
         let reg = default_registry().expect("offline construction");
         assert_eq!(
             names(&reg.iter().collect::<Vec<_>>()),
-            ["megaplay", "senshi", "allanime"]
+            ["megaplay", "senshi", "allanime", "anibd"]
         );
         assert!(
             !reg.primary().supports_search(),
@@ -415,7 +418,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             names(&reg.ordered(None)),
-            vec!["megaplay", "senshi", "allanime"]
+            vec!["megaplay", "senshi", "allanime", "anibd"]
         );
     }
 
@@ -424,7 +427,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             names(&reg.ordered(Some("senshi"))),
-            vec!["senshi", "megaplay", "allanime"]
+            vec!["senshi", "megaplay", "allanime", "anibd"]
         );
     }
 
@@ -433,7 +436,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             names(&reg.ordered(Some("gogo"))),
-            vec!["megaplay", "senshi", "allanime"]
+            vec!["megaplay", "senshi", "allanime", "anibd"]
         );
     }
 
@@ -442,7 +445,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             names(&reg.ordered(Some("megaplay"))),
-            vec!["megaplay", "senshi", "allanime"]
+            vec!["megaplay", "senshi", "allanime", "anibd"]
         );
     }
 
@@ -494,7 +497,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             reg.iter().map(|p| p.name()).collect::<Vec<_>>(),
-            vec!["megaplay", "senshi", "allanime"]
+            vec!["megaplay", "senshi", "allanime", "anibd"]
         );
     }
 
