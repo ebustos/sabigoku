@@ -67,4 +67,8 @@ pub struct ViewEnv {
     pub now: std::time::Instant,
     /// Some while a play is resolving/launching: the §4.6 launching cell.
     pub play: Option<crate::tui::playback::PlayGlance>,
+    /// Some for the whole duration of an active download: no second-phase
+    /// surface like mpv's window exists to hand the "still going" signal
+    /// off to.
+    pub download: Option<crate::tui::download::DownloadGlance>,
 }

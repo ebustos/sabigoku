@@ -8,9 +8,11 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::domain::{Quality, Translation};
 use crate::providers::ProviderRegistry;
+use crate::tui::clock::AsyncStart;
 use crate::tui::event::{DownloadFailure, EventTx};
 use crate::tui::workers::{self, DownloadSpec, Drain, Generation};
 
@@ -26,6 +28,7 @@ pub struct DownloadDeps<'a> {
     pub output_dir: PathBuf,
     pub translation: Translation,
     pub quality: Quality,
+    pub now: Instant,
 }
 
 /// One download ask, assembled by App from the engaged episode session.
@@ -61,9 +64,23 @@ pub enum DownloadFeedback {
     },
 }
 
+/// The launching cell for a download, mirrors `PlayGlance` — except it
+/// never clears until the job actually finishes: a download has no
+/// second-phase surface (like mpv's own window) to hand the "still going"
+/// signal off to.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadGlance {
+    pub anilist_id: i64,
+    /// 0-based cell index.
+    pub cell: usize,
+    pub started: AsyncStart,
+}
+
 struct Active {
     anilist_id: i64,
     provider: String,
+    episode_ix: u32,
+    started: AsyncStart,
     token: u64,
 }
 
@@ -111,6 +128,8 @@ impl DownloadSession {
         self.active = Some(Active {
             anilist_id: req.anilist_id,
             provider: req.provider,
+            episode_ix,
+            started: AsyncStart::new(deps.now),
             token,
         });
         vec![DownloadFeedback::Started { episode_ix }]
@@ -148,6 +167,19 @@ impl DownloadSession {
 
     pub fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Some for the whole run, unlike `PlaybackSession::glance` (which
+    /// clears once mpv's window opens): ffmpeg never hands off to a
+    /// second visible surface, so the grid spinner is the only signal
+    /// there is until the job finishes.
+    pub fn glance(&self) -> Option<DownloadGlance> {
+        let active = self.active.as_ref()?;
+        Some(DownloadGlance {
+            anilist_id: active.anilist_id,
+            cell: active.episode_ix.saturating_sub(1) as usize,
+            started: active.started,
+        })
     }
 
     /// Tests only: quit deliberately never drains this family (module doc).
@@ -189,6 +221,7 @@ mod tests {
                 output_dir: PathBuf::from("/tmp"),
                 translation: Translation::Sub,
                 quality: Quality::Best,
+                now: Instant::now(),
             }
         }
     }
@@ -288,6 +321,21 @@ mod tests {
         let fb = rig.session.fire(request(7, 4), &rig.world.deps());
         assert_eq!(fb, vec![DownloadFeedback::Started { episode_ix: 4 }]);
         assert!(rig.session.active_token().unwrap() > token);
+    }
+
+    #[test]
+    fn glance_tracks_the_whole_download() {
+        let mut rig = Rig::new();
+        rig.session.fire(request(7, 3), &rig.world.deps());
+        let glance = rig.session.glance().unwrap();
+        assert_eq!((glance.anilist_id, glance.cell), (7, 2));
+        let token = rig.settle();
+        // Unlike a play launch, resolving/spawning being done does not
+        // clear it — only `on_finished` does.
+        assert!(rig.session.glance().is_some());
+        rig.session
+            .on_finished(7, 3, None, Some(DownloadFailure::FfmpegNotFound), token);
+        assert!(rig.session.glance().is_none());
     }
 
     #[test]

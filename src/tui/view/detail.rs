@@ -675,9 +675,9 @@ fn draw_grid(
 }
 
 /// One cell's text + style, by the DESIGN 4.6 precedence: launching >
-/// resume > cursor > watched > unaired > unwatched. The launching cell
-/// outranks everything: it sits at the user's attention locus and tracks the
-/// playing episode, not the cursor.
+/// downloading > resume > cursor > watched > unaired > unwatched. The
+/// launching cell outranks everything: it sits at the user's attention
+/// locus and tracks the playing (or downloading) episode, not the cursor.
 #[allow(clippy::too_many_arguments)]
 fn grid_cell(
     palette: &Palette,
@@ -703,6 +703,19 @@ fn grid_cell(
             Style::new()
                 .bg(palette.surface)
                 .fg(color)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let downloading = env
+        .download
+        .filter(|g| session.is_for(g.anilist_id) && g.cell == ix);
+    if let Some(glance) = downloading {
+        let spin = SPINNER[glance.started.frame(env.now, SPINNER.len())];
+        return (
+            format!("[{spin}]"),
+            Style::new()
+                .bg(palette.surface)
+                .fg(palette.warn)
                 .add_modifier(Modifier::BOLD),
         );
     }

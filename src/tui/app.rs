@@ -1753,7 +1753,7 @@ impl App {
             base_name,
         };
         let fb = {
-            let deps = download_deps(&self.registry, &self.config, tx);
+            let deps = download_deps(&self.registry, &self.config, tx, now);
             self.downloads.fire(request, &deps)
         };
         self.apply_download_feedback(fb, now);
@@ -2070,6 +2070,7 @@ impl App {
             unix_now: unix_now(),
             now,
             play: self.playback.glance(),
+            download: self.downloads.glance(),
         }
     }
 
@@ -2414,6 +2415,7 @@ fn download_deps<'a>(
     registry: &'a Arc<ProviderRegistry>,
     config: &'a Config,
     tx: &'a EventTx,
+    now: Instant,
 ) -> DownloadDeps<'a> {
     DownloadDeps {
         registry,
@@ -2422,6 +2424,7 @@ fn download_deps<'a>(
         output_dir: resolve_download_dir(config),
         translation: Translation::parse(&config.translation).unwrap_or(Translation::Sub),
         quality: domain::Quality::parse(&config.default_quality),
+        now,
     }
 }
 

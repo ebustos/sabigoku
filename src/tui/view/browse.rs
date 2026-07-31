@@ -449,6 +449,7 @@ mod tests {
             unix_now: 0,
             now: Instant::now(),
             play: None,
+            download: None,
         };
         let pal = &crate::tui::theme::TERMINAL_GHOST;
         for w in 30u16..=80 {
