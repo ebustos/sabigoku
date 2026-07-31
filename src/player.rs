@@ -177,21 +177,37 @@ where
     let decloak = proxy::engage(link)?;
     let socket = socket_path(opts.socket_dir);
     let argv = build_argv(link, decloak.url(), opts, &socket)?;
+    run_mpv(&argv, opts.mpv_path, &socket, on_event)
+    // decloak drops here: proxy lifetime == mpv lifetime (ROD-445 seam).
+}
 
+/// Spawn mpv on a finished argv, watch its IPC socket for position events,
+/// wait for exit. Shared by the remote and local-file attempts — everything
+/// upstream of this (guard/proxy/argv-build) is what actually differs
+/// between them.
+fn run_mpv<F>(
+    argv: &[String],
+    mpv_path: &str,
+    socket: &Path,
+    on_event: F,
+) -> Result<AttemptResult, PlayError>
+where
+    F: Fn(PlayerEvent) + Send,
+{
     // Clear a stale or pre-planted file so mpv binds its own socket rather than
     // failing on an existing path. Squatter forgery is caught separately by the
     // peer-cred check in connect_ipc, not by this unlink.
-    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(socket);
 
     // Null stdio or mpv fights the TUI for the terminal it inherited.
-    let mut child = Command::new(opts.mpv_path)
-        .args(&argv)
+    let mut child = Command::new(mpv_path)
+        .args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|source| PlayError::Spawn {
-            mpv: opts.mpv_path.to_string(),
+            mpv: mpv_path.to_string(),
             source,
         })?;
 
@@ -200,7 +216,7 @@ where
     let gone = AtomicBool::new(false);
     let exit = thread::scope(|s| {
         s.spawn(|| {
-            if let Some(stream) = connect_ipc(&socket, &gone, child_pid) {
+            if let Some(stream) = connect_ipc(socket, &gone, child_pid) {
                 watch_ipc(stream, &observed, on_event);
             }
         });
@@ -209,14 +225,40 @@ where
         exit
     });
     // Best-effort: the socket is dead once mpv exits; a leftover file is inert.
-    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(socket);
     let exit = exit.map_err(PlayError::Wait)?;
     let observed = observed.into_inner().unwrap();
     Ok(AttemptResult {
         position: observed.final_position(),
         exit,
     })
-    // decloak drops here: proxy lifetime == mpv lifetime (ROD-445 seam).
+}
+
+/// Local-file playback (no resolve, no guard, no proxy): the path is ours,
+/// written by the download feature at a known name. Mirrors `play`, minus
+/// the resolve closure — nothing changes per retry attempt.
+pub fn play_local<F>(opts: &PlayOpts, path: &Path, on_event: F) -> Result<PlayOutcome, PlayError>
+where
+    F: Fn(PlayerEvent) + Send + Clone,
+{
+    run_attempts(
+        |_| attempt_play_local(path, opts, on_event.clone()),
+        |attempt| on_event(PlayerEvent::Retry { attempt }),
+        thread::sleep,
+    )
+}
+
+fn attempt_play_local<F>(
+    path: &Path,
+    opts: &PlayOpts,
+    on_event: F,
+) -> Result<AttemptResult, PlayError>
+where
+    F: Fn(PlayerEvent) + Send,
+{
+    let socket = socket_path(opts.socket_dir);
+    let argv = build_argv_local(path, opts, &socket)?;
+    run_mpv(&argv, opts.mpv_path, &socket, on_event)
 }
 
 // ── argv (03 §6.3.1, the table is law) ──────────────────────────────────────
@@ -260,7 +302,15 @@ fn build_argv(
     if link.cloaked_segments {
         argv.push("--demuxer-lavf-o=allowed_extensions=ALL".into());
     }
-    // mpv renders this in its own window title/OSD with no framework
+    push_common_flags(&mut argv, opts, socket);
+    argv.push(play_url.to_string());
+    Ok(argv)
+}
+
+/// Title, IPC socket, resume start, AniSkip script: identical for a remote
+/// or local play. Shared by `build_argv` and `build_argv_local`.
+fn push_common_flags(argv: &mut Vec<String>, opts: &PlayOpts, socket: &Path) {
+    // mpv renders the title in its own window title/OSD with no framework
     // backstop, so the full ROD-435 strip applies (bidi/zero-width included).
     let title = domain::strip_controls(opts.title.to_string());
     if !title.is_empty() {
@@ -276,7 +326,29 @@ fn build_argv(
         argv.push(format!("--script={}", skip.path.display()));
         argv.push(format!("--script-opts={}", skip.opts));
     }
-    argv.push(play_url.to_string());
+}
+
+/// argv for a downloaded file already on disk: no url guard (no upstream
+/// fetch), no referer/UA/proxy (baked into the remux at download time). A
+/// sidecar `.vtt` next to the file (downloader.rs's best-effort subtitle
+/// download) is picked up automatically if present.
+fn build_argv_local(path: &Path, opts: &PlayOpts, socket: &Path) -> Result<Vec<String>, PlayError> {
+    let play_path = path.to_string_lossy();
+    if !path_clean(&play_path) {
+        return Err(PlayError::UnsafeArg("path"));
+    }
+    let mut argv = Vec::new();
+    push_common_flags(&mut argv, opts, socket);
+    let sub = path.with_extension("vtt");
+    if sub.is_file() {
+        let sub_str = sub.to_string_lossy();
+        if path_clean(&sub_str) {
+            argv.push(format!("--sub-file={sub_str}"));
+            argv.push("--sub-pos=92".into());
+            argv.push("--sub-bold=yes".into());
+        }
+    }
+    argv.push(play_path.into_owned());
     Ok(argv)
 }
 
@@ -291,6 +363,15 @@ pub(crate) fn arg_clean(s: &str) -> bool {
 /// empty `--user-agent=` blanks mpv's UA and defeats the CF bot-score workaround.
 pub(crate) fn ua_clean(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// Local-file paths: ours, not provider bytes — built by
+/// `domain::sanitize_filename`, under a Settings-configured directory. Still
+/// refuses a leading '-' (flag injection, same as `arg_clean`) and any
+/// control byte or DEL (CR-LF injection into mpv's argv/IPC); unlike
+/// `arg_clean`, space and non-ASCII UTF-8 bytes are fine.
+fn path_clean(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('-') && s.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
 fn socket_path(dir: &Path) -> PathBuf {
@@ -581,6 +662,123 @@ mod tests {
         // Table order (03 §6.3.1): aniskip after --start, before the url.
         assert!(at("--script=/cache/skip.lua") > at("--start=42.5"));
         assert_eq!(argv.last().unwrap(), &link.url);
+    }
+
+    // ── local playback ──────────────────────────────────────────────────
+
+    #[test]
+    fn path_clean_rejects_flags_and_control_bytes_allows_space_and_utf8() {
+        assert!(!path_clean(""));
+        assert!(!path_clean("-rf"));
+        assert!(!path_clean("/tmp/a\rb.mkv"));
+        assert!(!path_clean("/tmp/a\nb.mkv"));
+        assert!(!path_clean("/tmp/a\0b.mkv"));
+        assert!(!path_clean("/tmp/a\x7fb.mkv"));
+        assert!(path_clean("/tmp/Show 7 - 3.mkv"));
+        assert!(path_clean("/tmp/フリーレン - 3.mkv"));
+    }
+
+    #[test]
+    fn argv_local_full_house_matches_the_table() {
+        let dir = std::env::temp_dir().join(format!("sabigoku-argv-local-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Show 7 - 3.mkv");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::write(dir.join("Show 7 - 3.vtt"), b"").unwrap();
+        let socket = Path::new("/run/user/1000/sabigoku/s.sock");
+        let skip = SkipScript {
+            path: PathBuf::from("/cache/skip.lua"),
+            opts: "aniskip-op_start=12.5,aniskip-mode=both".into(),
+        };
+        let mut o = opts("Frieren 冒険", 42.5);
+        o.skip = Some(&skip);
+        let argv = build_argv_local(&path, &o, socket).unwrap();
+        let sub = dir.join("Show 7 - 3.vtt");
+        assert_eq!(
+            argv,
+            vec![
+                "--force-media-title=Frieren 冒険".to_string(),
+                "--title=sabigoku - ${media-title}".into(),
+                "--input-ipc-server=/run/user/1000/sabigoku/s.sock".into(),
+                "--start=42.5".into(),
+                "--script=/cache/skip.lua".into(),
+                "--script-opts=aniskip-op_start=12.5,aniskip-mode=both".into(),
+                format!("--sub-file={}", sub.to_string_lossy()),
+                "--sub-pos=92".into(),
+                "--sub-bold=yes".into(),
+                path.to_string_lossy().into_owned(),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn argv_local_minimal_skips_sidecar_when_absent() {
+        let dir =
+            std::env::temp_dir().join(format!("sabigoku-argv-local-min-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Show 7 - 3.mkv");
+        std::fs::write(&path, b"").unwrap();
+        let socket = Path::new("/tmp/s.sock");
+        let argv = build_argv_local(&path, &opts("", 0.0), socket).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "--input-ipc-server=/tmp/s.sock".to_string(),
+                path.to_string_lossy().into_owned(),
+            ]
+        );
+        assert!(!argv.iter().any(|a| a.contains("sub-file")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The e2e proof: a downloaded path with a space reaches mpv's argv
+    /// verbatim, with no guard/proxy involvement (no network, no headers).
+    #[test]
+    fn play_local_reaches_the_spawned_argv_with_a_space_in_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sabigoku-e2e-local-{}-{}",
+            std::process::id(),
+            socket_path(Path::new("/"))
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("Show 7 - 3.mkv");
+        std::fs::write(&video, b"").unwrap();
+        let argv_dump = dir.join("argv");
+        let fake_mpv = dir.join("mpv.sh");
+        std::fs::write(
+            &fake_mpv,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nexit 0\n",
+                argv_dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_mpv, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let o = PlayOpts {
+            mpv_path: fake_mpv.to_str().unwrap(),
+            socket_dir: &dir,
+            title: "t",
+            start_secs: 0.0,
+            skip: None,
+        };
+        let outcome = play_local(&o, &video, |_| {}).unwrap();
+        assert_eq!(outcome.attempts, 1);
+
+        let dumped = std::fs::read_to_string(&argv_dump).unwrap();
+        let positional = dumped.lines().last().unwrap();
+        assert_eq!(positional, video.to_string_lossy());
+        assert!(
+            !dumped.contains("http-header") && !dumped.contains("user-agent"),
+            "a local play must carry no provider headers"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

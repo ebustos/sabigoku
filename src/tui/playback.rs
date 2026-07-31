@@ -8,7 +8,7 @@
 //! is the user's, not the app's, so teardown leaves the worker parked in
 //! `child.wait()` and its posts vanish with the dropped receiver (04 §11).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,13 @@ use crate::providers::ProviderRegistry;
 use crate::store::Store;
 use crate::tui::clock::AsyncStart;
 use crate::tui::event::{EventTx, PlayFailure};
-use crate::tui::workers::{self, Drain, Generation, PlaySpec};
+use crate::tui::workers::{self, Drain, Generation, LocalPlaySpec, PlaySpec};
+
+/// `Active.provider` when a play is served from a local download, never a
+/// real provider name (`EpisodeSession::serving()` returns) — the hop-retry
+/// path (`app.rs::on_play_hop`) relies on that gap to never loop on a
+/// corrupt local file (see `fire_inner`).
+const LOCAL_PROVIDER: &str = "local";
 
 /// Persist a resume checkpoint every 30s of observed playback (04 §7.7), so
 /// a crash mid-episode costs at most this much progress.
@@ -56,6 +62,9 @@ pub struct PlayRequest {
     /// `all caught up` instead of `episode N done` (DESIGN 4.10).
     pub finale: bool,
     pub title: String,
+    /// Set when `fire_play_at` found the file `d` would have written
+    /// already on disk: play it directly, skip resolve/stream entirely.
+    pub local_path: Option<PathBuf>,
 }
 
 /// User-visible outcomes of a session step; App maps these to the DESIGN
@@ -181,37 +190,63 @@ impl PlaybackSession {
             .ok()
             .flatten()
             .map_or(0.0, |r| r.start_secs(deps.resume_offset_sec));
-        let spawned = workers::spawn_play(
-            &self.drain,
-            deps.tx.clone(),
-            Arc::clone(deps.registry),
-            PlaySpec {
-                anilist_id: req.anilist_id,
-                provider: req.provider.clone(),
-                provider_id: req.provider_id,
-                episode_label: req.episode_label.clone(),
-                episode_ix: req.episode_ix,
-                translation: deps.translation,
-                quality: deps.quality,
-                title: req.title,
-                start_secs,
-                mpv_path: deps.mpv_path.to_string(),
-                socket_dir: deps.socket_dir.to_path_buf(),
-                mal_id: req.mal_id,
-                skip_mode: deps.skip_mode,
-                cache_dir: deps.cache_dir.to_path_buf(),
-                token,
-            },
-        );
+        let (spawned, provider) = match req.local_path {
+            Some(path) => {
+                let spawned = workers::spawn_play_local(
+                    &self.drain,
+                    deps.tx.clone(),
+                    LocalPlaySpec {
+                        anilist_id: req.anilist_id,
+                        path,
+                        episode_label: req.episode_label.clone(),
+                        episode_ix: req.episode_ix,
+                        title: req.title,
+                        start_secs,
+                        mpv_path: deps.mpv_path.to_string(),
+                        socket_dir: deps.socket_dir.to_path_buf(),
+                        mal_id: req.mal_id,
+                        skip_mode: deps.skip_mode,
+                        cache_dir: deps.cache_dir.to_path_buf(),
+                        token,
+                    },
+                );
+                (spawned, LOCAL_PROVIDER.to_string())
+            }
+            None => {
+                let spawned = workers::spawn_play(
+                    &self.drain,
+                    deps.tx.clone(),
+                    Arc::clone(deps.registry),
+                    PlaySpec {
+                        anilist_id: req.anilist_id,
+                        provider: req.provider.clone(),
+                        provider_id: req.provider_id,
+                        episode_label: req.episode_label.clone(),
+                        episode_ix: req.episode_ix,
+                        translation: deps.translation,
+                        quality: deps.quality,
+                        title: req.title,
+                        start_secs,
+                        mpv_path: deps.mpv_path.to_string(),
+                        socket_dir: deps.socket_dir.to_path_buf(),
+                        mal_id: req.mal_id,
+                        skip_mode: deps.skip_mode,
+                        cache_dir: deps.cache_dir.to_path_buf(),
+                        token,
+                    },
+                );
+                (spawned, req.provider)
+            }
+        };
         if !spawned {
             return vec![PlayFeedback::Failed {
-                provider: req.provider,
+                provider,
                 failure: PlayFailure::Internal,
             }];
         }
         self.active = Some(Active {
             anilist_id: req.anilist_id,
-            provider: req.provider,
+            provider,
             episode_label: req.episode_label,
             episode_ix: req.episode_ix,
             finale: req.finale,
@@ -533,6 +568,7 @@ mod tests {
             episode_ix: ix,
             finale,
             title: "t".into(),
+            local_path: None,
         }
     }
 
@@ -570,6 +606,35 @@ mod tests {
         assert!(fb.is_empty(), "second fire is a silent no-op");
         assert_eq!(rig.session.active.as_ref().unwrap().token, token);
         assert_eq!(rig.session.active.as_ref().unwrap().episode_ix, 3);
+    }
+
+    /// A `local_path` on the request must never touch the (inert) registry:
+    /// the failure classification (`MpvNotFound`, not `Resolve`) proves the
+    /// local worker ran instead of a resolve attempt.
+    #[test]
+    fn local_path_skips_resolve_and_uses_the_local_worker() {
+        let mut rig = Rig::new();
+        rig.world.seed_bound(7);
+        let mut req = request(7, 3, false);
+        req.local_path = Some(PathBuf::from("/tmp/Show 7 - 3.mkv"));
+        let fb = rig.session.fire(req, &rig.world.deps());
+        assert!(fb.is_empty());
+        assert_eq!(
+            rig.session.active.as_ref().unwrap().provider,
+            LOCAL_PROVIDER
+        );
+        assert!(rig.session.drain.drain(Duration::from_secs(5)));
+        let finished = rig.world.rx.try_recv().unwrap();
+        let token = rig.session.active.as_ref().unwrap().token;
+        assert_eq!(
+            finished,
+            Event::PlayFinished {
+                anilist_id: 7,
+                position: None,
+                failure: Some(PlayFailure::MpvNotFound),
+                token,
+            }
+        );
     }
 
     #[test]

@@ -1656,15 +1656,20 @@ impl App {
             a.min(session.grid().len() as u32)
         });
         let finale = playable > 0 && episode_ix >= playable;
-        let title = format!(
-            "{} · {episode_label}",
-            domain::preferred_title(
-                &entry.title_romaji,
-                entry.title_english.as_deref(),
-                entry.title_native.as_deref(),
-                TitleLanguage::parse(&self.config.title_language),
-            )
+        let show_title = domain::preferred_title(
+            &entry.title_romaji,
+            entry.title_english.as_deref(),
+            entry.title_native.as_deref(),
+            TitleLanguage::parse(&self.config.title_language),
         );
+        let title = format!("{show_title} · {episode_label}");
+        // `d` writes to this exact name (`download_base_name`); if it's
+        // there, play it directly instead of resolving/streaming again.
+        let local_path = {
+            let base_name = download_base_name(show_title, &episode_label);
+            let path = resolve_download_dir(&self.config).join(format!("{base_name}.mkv"));
+            path.is_file().then_some(path)
+        };
         let request = PlayRequest {
             anilist_id: aid,
             provider,
@@ -1674,6 +1679,7 @@ impl App {
             episode_ix,
             finale,
             title,
+            local_path,
         };
         let fb = {
             let deps = playback_deps(
@@ -1740,10 +1746,7 @@ impl App {
             entry.title_native.as_deref(),
             TitleLanguage::parse(&self.config.title_language),
         );
-        let base_name = format!(
-            "{} - {episode_label}",
-            domain::sanitize_filename(show_title)
-        );
+        let base_name = download_base_name(show_title, &episode_label);
         let request = DownloadRequest {
             anilist_id: aid,
             provider,
@@ -2395,6 +2398,17 @@ fn download_failure_copy(failure: DownloadFailure, provider: &str) -> String {
         }
         DownloadFailure::Internal => "download failed".to_string(),
     }
+}
+
+/// The stem `downloader.rs`'s `unique_path` started from (before any
+/// " (N)" collision suffix) — `on_download` and `fire_play_at`'s
+/// local-file lookup must always agree on this, or a downloaded episode
+/// becomes invisible to play.
+fn download_base_name(show_title: &str, episode_label: &str) -> String {
+    format!(
+        "{} - {episode_label}",
+        domain::sanitize_filename(show_title)
+    )
 }
 
 /// Resolve the configured download dir; empty means "use the default"
@@ -4041,6 +4055,38 @@ mod tests {
         let text = rendered(&mut app, 100, 30);
         assert!(!text.contains("[⠋]"), "{text}");
         assert!(text.contains("[1]"), "{text}");
+    }
+
+    /// A file already sitting where `d` would have written it (same name,
+    /// same dir) must short-circuit resolve entirely: `MpvNotFound` (from
+    /// the local-play attempt) rather than `Resolve` (from the inert-registry
+    /// stub) proves the provider was never touched.
+    #[test]
+    fn enter_plays_an_existing_download_instead_of_resolving() {
+        let (mut app, tx, rx, now) = play_harness("play-local-file");
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        let dir = std::env::temp_dir().join(format!("sabigoku-app-local-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.config.download_dir = dir.to_string_lossy().into_owned();
+        app.config.mpv_path = "/definitely/not/mpv".into();
+        let expected = dir.join(format!("{}.mkv", download_base_name("Show 1", "1")));
+        std::fs::write(&expected, b"").unwrap();
+
+        app.tick(key(KeyCode::Enter), t1, &tx);
+        assert!(app.playback.is_playing());
+        let token = app.playback.active_token().unwrap();
+        assert!(app.playback.drain(Duration::from_secs(5)));
+        let finished = rx.try_recv().unwrap();
+        assert_eq!(
+            finished,
+            Event::PlayFinished {
+                anilist_id: 1,
+                position: None,
+                failure: Some(PlayFailure::MpvNotFound),
+                token,
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

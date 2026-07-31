@@ -596,6 +596,79 @@ pub fn spawn_play(
     })
 }
 
+/// One local-file play, described as data (mirrors `PlaySpec` minus every
+/// provider/resolve field): the file already exists on disk, found by name
+/// at fire time (`app.rs::fire_play_at`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalPlaySpec {
+    pub anilist_id: i64,
+    pub path: PathBuf,
+    pub episode_label: String,
+    /// 1-based; the AniSkip ordinal fallback (03 §9).
+    pub episode_ix: u32,
+    pub title: String,
+    pub start_secs: f64,
+    pub mpv_path: String,
+    pub socket_dir: PathBuf,
+    pub mal_id: Option<i64>,
+    pub skip_mode: SkipMode,
+    pub cache_dir: PathBuf,
+    pub token: u64,
+}
+
+/// The local-play worker (mirrors `spawn_play` minus the registry/resolve
+/// step): `player::play_local` skips `guard_fetch_url`/`proxy::engage`
+/// entirely, since there is no upstream fetch to guard.
+#[must_use]
+pub fn spawn_play_local(drain: &Drain, tx: EventTx, spec: LocalPlaySpec) -> bool {
+    drain.spawn("play-local", move || {
+        let LocalPlaySpec {
+            anilist_id,
+            path,
+            episode_label,
+            episode_ix,
+            title,
+            start_secs,
+            mpv_path,
+            socket_dir,
+            mal_id,
+            skip_mode,
+            cache_dir,
+            token,
+        } = spec;
+        let skip = aniskip::prepare(
+            mal_id,
+            aniskip::episode_number(&episode_label, episode_ix),
+            skip_mode,
+            &cache_dir,
+        );
+        let opts = PlayOpts {
+            mpv_path: &mpv_path,
+            socket_dir: &socket_dir,
+            title: &title,
+            start_secs,
+            skip: skip.as_ref(),
+        };
+        let bridge = PositionBridge {
+            tx: tx.clone(),
+            anilist_id,
+            token,
+            last: Arc::new(Mutex::new(None)),
+        };
+        let result = player::play_local(&opts, &path, move |event| bridge.forward(event));
+        let (position, failure) = match result {
+            Ok(outcome) => (outcome.position, None),
+            Err(e) => (None, Some(play_failure(&e))),
+        };
+        tx.post(Event::PlayFinished {
+            anilist_id,
+            position,
+            failure,
+            token,
+        });
+    })
+}
+
 /// `PlayError` → the POD classes the toast matrix keys on (DESIGN 4.10).
 /// Guard/proxy/wait failures land in `Internal`: residual, `playback failed`.
 /// Public so the CLI play path (main) reuses the same classification, including
