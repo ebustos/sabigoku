@@ -229,9 +229,10 @@ impl App {
             Event::DiscoverFeedError { axis, cause } => self.on_discover_feed_error(axis, cause),
             Event::SearchDone {
                 query,
-                page: _,
+                page,
                 results,
-            } => self.on_search_done(&query, results, now),
+                has_next,
+            } => self.on_search_done(&query, page, results, has_next, now),
             Event::SearchFailed { query, cause: _ } => self.on_search_failed(&query, now),
             Event::EnrichmentRefreshed { for_id, enrichment } => {
                 self.on_enrichment_refreshed(for_id, &enrichment)
@@ -327,8 +328,8 @@ impl App {
             KeyCode::Enter => self.on_enter(now, tx),
             KeyCode::Char('h') | KeyCode::Left => self.on_h(),
             KeyCode::Char('l') | KeyCode::Right => self.on_l(now, tx),
-            KeyCode::Char('j') | KeyCode::Down => self.on_j(now),
-            KeyCode::Char('k') | KeyCode::Up => self.on_k(now),
+            KeyCode::Char('j') | KeyCode::Down => self.on_j(now, tx),
+            KeyCode::Char('k') | KeyCode::Up => self.on_k(now, tx),
             KeyCode::Char('g') => self.on_jump(true, now),
             KeyCode::Char('G') => self.on_jump(false, now),
             KeyCode::Char('v') => self.on_pin_cycle(now, tx),
@@ -480,10 +481,10 @@ impl App {
         }
     }
 
-    fn on_j(&mut self, now: Instant) {
+    fn on_j(&mut self, now: Instant, tx: &EventTx) {
         match self.view {
             View::Discover => self.nav_discover(0, 1),
-            View::Browse if self.pane == Pane::List => self.on_browse_nav(1, now),
+            View::Browse if self.pane == Pane::List => self.on_browse_nav(1, now, tx),
             View::History if self.pane == Pane::List => self.on_history_nav(1, now),
             View::Browse | View::History if self.pane == Pane::Detail => self.detail.on_vertical(1),
             View::Detail => self.detail.on_vertical(1),
@@ -491,10 +492,10 @@ impl App {
         }
     }
 
-    fn on_k(&mut self, now: Instant) {
+    fn on_k(&mut self, now: Instant, tx: &EventTx) {
         match self.view {
             View::Discover => self.nav_discover(0, -1),
-            View::Browse if self.pane == Pane::List => self.on_browse_nav(-1, now),
+            View::Browse if self.pane == Pane::List => self.on_browse_nav(-1, now, tx),
             View::History if self.pane == Pane::List => self.on_history_nav(-1, now),
             View::Browse | View::History if self.pane == Pane::Detail => {
                 self.detail.on_vertical(-1)
@@ -558,9 +559,13 @@ impl App {
     }
 
     /// Cursor motion is continuous scroll: the metadata updates instantly,
-    /// the cover trails by the settle window (DESIGN 6.4).
-    fn on_browse_nav(&mut self, dy: i64, now: Instant) {
+    /// the cover trails by the settle window (DESIGN 6.4). Downward motion
+    /// onto the last result fires the next page (05 §16).
+    fn on_browse_nav(&mut self, dy: i64, now: Instant, tx: &EventTx) {
         self.browse.nav(dy, self.list_visible());
+        if dy > 0 {
+            self.browse.maybe_load_more(now, tx, &self.catalog);
+        }
         self.push_browse_selection(false, now);
     }
 
@@ -1046,11 +1051,24 @@ impl App {
     }
 
     /// Applied results are the AniList recovery signal: the persistent
-    /// unreachable toast clears on the first success (DESIGN 8.5).
-    fn on_search_done(&mut self, query: &str, results: Vec<domain::Enrichment>, now: Instant) {
-        if self.browse.on_done(query, results, &self.store, unix_now()) {
+    /// unreachable toast clears on the first success (DESIGN 8.5). An
+    /// appended page keeps the cursor, so only page 1 re-pushes the detail.
+    fn on_search_done(
+        &mut self,
+        query: &str,
+        page: u32,
+        results: Vec<domain::Enrichment>,
+        has_next: bool,
+        now: Instant,
+    ) {
+        if self
+            .browse
+            .on_done(query, page, results, has_next, &self.store, unix_now())
+        {
             self.toasts.clear_topic(ANILIST_TOPIC);
-            self.push_browse_selection(true, now);
+            if page == 1 {
+                self.push_browse_selection(true, now);
+            }
         }
         self.dirty = true;
     }
@@ -3011,6 +3029,47 @@ mod tests {
         let text = rendered(&mut app, 100, 30);
         assert!(text.contains("Show 1"));
         assert!(text.contains("[catalogue · 3]"));
+    }
+
+    /// Down at the last result loads the next page (05 §16, ROD-156 parity:
+    /// the arrow fires it, not just j); the answer appends past the cursor.
+    #[test]
+    fn browse_down_at_the_last_result_loads_the_next_page() {
+        let page = |from: i64, has_next| {
+            Ok(CatalogPage {
+                entries: (from..from + 3).map(feed_entry).collect(),
+                has_next,
+            })
+        };
+        let (mut app, tx, rx, now) = harness_with(
+            "browse-more",
+            StubCatalog::search_scripted(vec![page(1, true), page(4, false)]),
+        );
+        app.tick(Event::Resize(100, 30), now, &tx);
+        press(
+            &mut app,
+            &tx,
+            now,
+            &[ch('B'), ch('/'), ch('f'), key(KeyCode::Enter)],
+        );
+        let t1 = now + browse::SEARCH_DEBOUNCE;
+        app.tick(Event::Tick, t1, &tx);
+        settle_feed(&mut app, &tx, &rx, t1);
+        assert_eq!(app.browse.count(), 3);
+        assert!(rendered(&mut app, 100, 30).contains("╌ more ╌"));
+        press(&mut app, &tx, t1, &[ch('j'), key(KeyCode::Down)]);
+        assert!(rendered(&mut app, 100, 30).contains("loading…"));
+        settle_feed(&mut app, &tx, &rx, t1);
+        assert_eq!(app.browse.count(), 6, "page 2 appended");
+        assert_eq!(
+            app.browse.selected().map(|e| e.anilist_id),
+            Some(3),
+            "append keeps the cursor"
+        );
+        assert!(
+            !rendered(&mut app, 100, 30).contains("╌ more ╌"),
+            "exhausted feed drops the footer"
+        );
     }
 
     #[test]

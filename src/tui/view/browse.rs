@@ -40,6 +40,11 @@ pub struct BrowseState {
     results: Vec<Enrichment>,
     cursor: usize,
     scroll: usize,
+    /// Pages applied for `answered`; 0 until the first answer lands.
+    page: u32,
+    /// AniList's explicit hasNextPage for the applied results (port
+    /// adaptation: replaces zigoku's short-page heuristic, see anilist.rs).
+    has_next: bool,
     /// Spinner + slow escalation while a fetch is in flight; cleared when the
     /// answer for the live buffer lands (a stale answer keeps it spinning).
     started: Option<AsyncStart>,
@@ -82,13 +87,49 @@ impl BrowseState {
         }
     }
 
-    /// Apply a search answer; stale if the buffer moved on (04 §6). Applied
-    /// rows upsert catalog_cache best-effort (04 §10). True when applied
-    /// (the recovery signal that clears the persistent AniList toast).
+    /// `j`/Down at the last result fires the next page (05 §16, ROD-156
+    /// parity). Gated on hasNextPage, the in-flight guard, and the results
+    /// actually answering the live buffer.
+    pub fn maybe_load_more(
+        &mut self,
+        now: Instant,
+        tx: &EventTx,
+        catalog: &Arc<dyn CatalogProvider>,
+    ) {
+        let at_end = self.cursor + 1 == self.results.len();
+        let answers_buffer = self.answered.as_deref() == Some(self.query.as_str());
+        if self.results.is_empty()
+            || !at_end
+            || !self.has_next
+            || self.started.is_some()
+            || !answers_buffer
+        {
+            return;
+        }
+        self.started = Some(AsyncStart::new(now));
+        let spawned = workers::spawn_search(
+            &self.drain,
+            tx.clone(),
+            Arc::clone(catalog),
+            self.query.clone(),
+            self.page + 1,
+        );
+        if !spawned {
+            self.started = None;
+        }
+    }
+
+    /// Apply a search answer; stale if the buffer moved on (04 §6). Page 1
+    /// replaces and resets the cursor; a later page appends and keeps it
+    /// (05 §16), with out-of-order pages dropped. Applied rows upsert
+    /// catalog_cache best-effort (04 §10). True when applied (the recovery
+    /// signal that clears the persistent AniList toast).
     pub fn on_done(
         &mut self,
         query: &str,
+        page: u32,
         results: Vec<Enrichment>,
+        has_next: bool,
         store: &Store,
         now_unix: i64,
     ) -> bool {
@@ -96,14 +137,23 @@ impl BrowseState {
             return false;
         }
         self.started = None;
+        if page > 1 && (self.answered.as_deref() != Some(query) || page != self.page + 1) {
+            return false;
+        }
         for e in &results {
             let ttl = enrichment_ttl_secs(e.status.as_deref());
             let _ = store.upsert_catalog_cache(e, now_unix, Some(now_unix + ttl));
         }
-        self.results = results;
-        self.cursor = 0;
-        self.scroll = 0;
-        self.answered = Some(query.to_string());
+        if page == 1 {
+            self.results = results;
+            self.cursor = 0;
+            self.scroll = 0;
+            self.answered = Some(query.to_string());
+        } else {
+            self.results.extend(results);
+        }
+        self.page = page;
+        self.has_next = has_next;
         true
     }
 
@@ -182,6 +232,41 @@ pub fn draw_list(
             list_focused,
         );
     }
+    draw_footer(frame, area, palette, state, env.now);
+}
+
+/// Load-more footer on the row under the tail; a scrolled-full pane has no
+/// spare row and draws none (freeze parity).
+fn draw_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    palette: &Palette,
+    state: &BrowseState,
+    now: Instant,
+) {
+    if !state.has_next {
+        return;
+    }
+    let drawn = state.results.len() - state.scroll;
+    if drawn >= area.height as usize {
+        return;
+    }
+    let (text, style) = match &state.started {
+        Some(s) => (
+            format!(
+                "{} loading…",
+                render::SPINNER[s.frame(now, render::SPINNER.len())]
+            ),
+            Style::new().fg(palette.focus),
+        ),
+        None => ("╌ more ╌".to_string(), Style::new().fg(palette.fg3)),
+    };
+    render::draw_centered(
+        frame,
+        area,
+        drawn as u16,
+        Line::from(Span::styled(text, style)),
+    );
 }
 
 /// One list row: `[glyph] [title…] [eps] [score]`, selection per the
@@ -416,10 +501,13 @@ mod tests {
         let s = store();
         b.query = "frieren".into();
         b.started = Some(AsyncStart::new(Instant::now()));
-        assert!(!b.on_done("frier", vec![entry(1)], &s, 1000), "stale query");
+        assert!(
+            !b.on_done("frier", 1, vec![entry(1)], false, &s, 1000),
+            "stale query"
+        );
         assert!(b.results.is_empty());
         assert!(b.started.is_some(), "a newer fetch is still owed");
-        assert!(b.on_done("frieren", vec![entry(2)], &s, 1000));
+        assert!(b.on_done("frieren", 1, vec![entry(2)], false, &s, 1000));
         assert_eq!(b.count(), 1);
         assert!(b.started.is_none());
     }
@@ -429,7 +517,7 @@ mod tests {
         let mut b = BrowseState::default();
         let s = store();
         b.query = "x".into();
-        assert!(b.on_done("x", vec![entry(7)], &s, 1000));
+        assert!(b.on_done("x", 1, vec![entry(7)], false, &s, 1000));
         assert!(s.get_catalog(7).unwrap().is_some());
     }
 
@@ -438,11 +526,102 @@ mod tests {
         let mut b = BrowseState::default();
         let s = store();
         b.query = "a".into();
-        b.on_done("a", vec![entry(1), entry(2)], &s, 1000);
+        b.on_done("a", 1, vec![entry(1), entry(2)], false, &s, 1000);
         b.query = "ab".into();
         assert!(b.on_failed("ab"));
         assert_eq!(b.count(), 2, "outage keeps cached results (DESIGN 8.5)");
         assert!(!b.on_failed("zzz"), "stale failure is not an answer");
+    }
+
+    /// Search calls recorded by page, answering Network so nothing applies.
+    #[derive(Default)]
+    struct PageProbe {
+        pages: std::sync::Mutex<Vec<u32>>,
+    }
+    impl CatalogProvider for PageProbe {
+        fn search(&self, _q: &str, p: u32) -> Result<CatalogPage, CatalogError> {
+            self.pages.lock().unwrap().push(p);
+            Err(CatalogError::Network)
+        }
+        fn discover(
+            &self,
+            _a: crate::providers::DiscoverAxis,
+            _p: u32,
+        ) -> Result<CatalogPage, CatalogError> {
+            Err(CatalogError::Network)
+        }
+        fn enrich(&self, _id: i64) -> Result<Option<Enrichment>, CatalogError> {
+            Ok(None)
+        }
+    }
+
+    fn answered_page_one(b: &mut BrowseState, s: &Store, has_next: bool) {
+        b.query = "a".into();
+        b.on_done("a", 1, (1..=3).map(entry).collect(), has_next, s, 1000);
+    }
+
+    /// Down at the last result fires page 2 (05 §16, ROD-156 parity); the
+    /// exhausted twin is the mutation check on the hasNextPage gate.
+    #[test]
+    fn load_more_fires_page_two_at_the_last_result() {
+        let mut b = BrowseState::default();
+        let s = store();
+        let (tx, _rx) = event::channel();
+        let probe = Arc::new(PageProbe::default());
+        let catalog: Arc<dyn CatalogProvider> = Arc::clone(&probe) as _;
+        answered_page_one(&mut b, &s, true);
+        b.nav(1, 5);
+        b.maybe_load_more(Instant::now(), &tx, &catalog);
+        assert!(b.started.is_none(), "mid-list never fires");
+        b.jump(false, 5);
+        b.maybe_load_more(Instant::now(), &tx, &catalog);
+        assert!(b.started.is_some(), "last result fires");
+        b.maybe_load_more(Instant::now(), &tx, &catalog);
+        assert!(b.drain(Duration::from_secs(5)));
+        assert_eq!(
+            *probe.pages.lock().unwrap(),
+            vec![2],
+            "in-flight never dups"
+        );
+    }
+
+    #[test]
+    fn load_more_holds_when_exhausted_or_buffer_moved_on() {
+        let mut b = BrowseState::default();
+        let s = store();
+        let (tx, _rx) = event::channel();
+        let probe = Arc::new(PageProbe::default());
+        let catalog: Arc<dyn CatalogProvider> = Arc::clone(&probe) as _;
+        answered_page_one(&mut b, &s, false);
+        b.jump(false, 5);
+        b.maybe_load_more(Instant::now(), &tx, &catalog);
+        assert!(b.started.is_none(), "exhausted holds");
+        b.has_next = true;
+        b.query = "ab".into();
+        b.maybe_load_more(Instant::now(), &tx, &catalog);
+        assert!(b.started.is_none(), "an edited buffer holds");
+        assert!(probe.pages.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn page_two_appends_and_keeps_the_cursor() {
+        let mut b = BrowseState::default();
+        let s = store();
+        answered_page_one(&mut b, &s, true);
+        b.jump(false, 5);
+        assert!(b.on_done("a", 2, vec![entry(4), entry(5)], false, &s, 1000));
+        assert_eq!(b.count(), 5, "page 2 appends");
+        assert_eq!(b.cursor, 2, "append keeps the cursor");
+        assert!(!b.has_next, "exhaustion adopts the page's hasNextPage");
+        assert!(
+            !b.on_done("a", 2, vec![entry(6)], true, &s, 1000),
+            "duplicate page dropped"
+        );
+        assert!(
+            !b.on_done("a", 4, vec![entry(7)], true, &s, 1000),
+            "out-of-order page dropped"
+        );
+        assert_eq!(b.count(), 5);
     }
 
     #[test]
@@ -450,7 +629,7 @@ mod tests {
         let mut b = BrowseState::default();
         let s = store();
         b.query = "a".into();
-        b.on_done("a", (1..=10).map(entry).collect(), &s, 1000);
+        b.on_done("a", 1, (1..=10).map(entry).collect(), false, &s, 1000);
         b.nav(-1, 5);
         assert_eq!(b.cursor, 0);
         b.nav(3, 5);
