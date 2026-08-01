@@ -14,7 +14,7 @@
 **AniList id is the source of truth for show identity.**
 
 A show in sabigoku *is* an AniList media id. Catalog, metadata, watchlist membership,
-list status, progress counters, pins, absences, and routes hang off that id.
+list status, progress counters, last-used provider, and absences hang off that id.
 
 When a streaming provider has an offering for that show, we store a **binding**:
 `(anilist_id, provider, provider_id)`. The binding points **at** the AniList show.
@@ -129,14 +129,15 @@ for that gap (V17 anipub retirement is the clearest bloodstain: re-key orphans t
 2. **Bindings are edges, not the node.** Play, episode lists, and provider-opaque
    ids live on binding (and binding-scoped caches).
 3. **User state never lives on a provider id.** Switching preferred source or
-   pinning must not fork or drop watch state (the V12/V17 class of bug).
+   manually walking providers must not fork or drop watch state (the V12/V17
+   class of bug).
 4. **No play provider ⇒ no binding row**, not a fake `unbound` source. Playability
    is "has at least one binding" or "resolve can find one." History membership is
    its own explicit marker, not an accident of row existence: see §3.7.
 5. **Catalog cache is separate from the library.** Browse/Discover AniList hits
    land in `catalog_cache` (durable, no user state). They never share a table with
    watchlist rows and never need `history_visible` laundering. See §3.5.
-6. **Pins, absences, routes stay off the enrichment upsert path** (keep zigoku's
+6. **Last-used and absences stay off the enrichment upsert path** (keep zigoku's
    table-split invariant; it was right).
 7. **Independent store.** sabigoku does not open, migrate, or import zigoku DBs.
    No shared path, no compatibility ladder, no dual-read. A zigoku importer is a
@@ -151,13 +152,23 @@ for that gap (V17 anipub retirement is the clearest bloodstain: re-key orphans t
 | **ProviderBinding** | `(anilist_id, provider)` unique; `provider_id` opaque | How to talk to a stream source for this show |
 | **EpisodeProgress** | see §3.4 | Resume + fully_watched per episode label per translation |
 | **EpisodeCache** | `(anilist_id, provider, translation)` | Provider episode label lists + TTL |
-| **ProviderPin** | `anilist_id` | Forced provider for resolve |
+| **ProviderLastUsed** | `anilist_id` | Sticky provider a show last **landed** on; write-only-at-landing, feeds the open-order head (03 §5.1, ROD-525) |
 | **ProviderAbsence** | `(anilist_id, provider)` | Negative cache "not stocked" + checked_at |
-| **ProviderRoute** | `anilist_id` | Last settled preferred_provider (stale ⇒ re-route once; ROD-398 intent) |
 | **AppMeta** | `key` | One-shot flags |
 
 `mal_id` is a **secondary** index on Show (AniSkip, legacy bridges), never the PK.
 Non-unique in the wild; do not pretend otherwise.
+
+**ProviderPin and ProviderRoute retired (ROD-525).** The two-tier preference
+(global `preferred_provider` + per-show pin) is gone; `ProviderLastUsed` replaces
+both for resolve ordering (03 §5.1). Migration seeds `provider_last_used` from
+`provider_pin` rows, **only** where a matching `provider_binding` exists for that
+`(anilist_id, provider)` pair: an unbound pin names a provider with nothing to
+resume playing from, so it seeds nothing. `provider_route` seeds nothing at all:
+its `resolved_pref` was a config-generation marker (the global preference a show
+last **settled** under), not the provider that actually served it, so its rows
+are unfit as last-used seeds. `provider_pin` and `provider_route` are then
+dropped in the same migration.
 
 ### 3.3 Draft table sketch
 
@@ -245,7 +256,7 @@ CREATE TABLE episode_cache (
     PRIMARY KEY (anilist_id, provider, translation)
 );
 
-CREATE TABLE provider_pin (
+CREATE TABLE provider_last_used (
     anilist_id INTEGER PRIMARY KEY REFERENCES show(anilist_id) ON DELETE CASCADE,
     provider   TEXT NOT NULL
 );
@@ -255,11 +266,6 @@ CREATE TABLE provider_absence (
     provider   TEXT    NOT NULL,
     checked_at INTEGER NOT NULL,
     PRIMARY KEY (anilist_id, provider)
-);
-
-CREATE TABLE provider_route (
-    anilist_id     INTEGER PRIMARY KEY REFERENCES show(anilist_id) ON DELETE CASCADE,
-    resolved_pref  TEXT NOT NULL
 );
 
 CREATE TABLE catalog_cache (
@@ -336,7 +342,7 @@ durable **`catalog_cache`** table holds those hits.
 | Concern | Rule |
 |---|---|
 | What goes in | AniList-keyed enrichment from Browse search, Discover feeds, and similar list/page queries |
-| What does **not** go in | `list_status`, progress, ratings, notes, sync snapshots, pins, bindings |
+| What does **not** go in | `list_status`, progress, ratings, notes, sync snapshots, last-used, bindings |
 | Read path | Detail card / preview prefers `catalog_cache` by `anilist_id`; network only on miss or explicit refresh / expiry policy |
 | Write path | Upsert on every successful AniList list/search page (and fuller enrich when we already paid for it) |
 | Promote to library | User add / successful `recordPlay` / plan copies enrichment into `show` and stamps `library_added_at` (§3.7). Cache row may remain |
@@ -373,7 +379,7 @@ grid adds a History entry. The fix is an explicit marker column:
 
 | Rule | One sentence |
 |---|---|
-| Show row creation | A `show` row is minted by whichever comes first: binding mint, absence mark, route stamp, or library add. Identity rows are cheap and carry no UI meaning. (Route stamp joined the list at ROD-439: stamp-before-fetch must land for never-resolved shows, 03 §5.3.) |
+| Show row creation | A `show` row is minted by whichever comes first: binding mint, absence mark, or library add. Identity rows are cheap and carry no UI meaning. (Route stamp joined this list at ROD-439 and left it at ROD-525: last-used writes only at a landing, and a landing implies a binding mint already minted the row, so it needs no trigger of its own; 03 §5.3.) |
 | History contents | History = `show` rows with `library_added_at IS NOT NULL`. Nothing else, ever. |
 | Membership set by | Watchlist add (`P` / reveal), user status writers (`setListStatus` / restore), or a **successful `recordPlay`**. Stamp membership **inside** those writers (set-once). Callers gate `recordPlay` with meaningful position (finite pos > 0) + known episode index; do not re-derive membership from isMeaningful alone. Partial watches join History. (sabigoku extension: also the first meaningful position event of a play, and the startup orphan-adoption sweep; 08 §10 ROD-478.) |
 | Membership NOT set by | Episode grid open, availability probe, prewarm, enrichment, Discover/Browse paint, sync `applyPulled`, bind-on-resolve with `visible=false`. Natural-end / `completed` (progress ratchet, §4b) is **not** the membership gate. |
@@ -482,11 +488,11 @@ These are product invariants; only the tables they sit on change.
 | Single `user_version` ladder, one bump at end | migrate() @ freeze | `CLONE` |
 | Enrichment fieldset version heals columns without full TTL | `ENRICHMENT_FIELDSET_VERSION = 5` | `CLONE` idea; renumber for our column set |
 | Upsert must not clobber user state with search/enrichment | user-state columns are **excluded from the `ON CONFLICT … DO UPDATE SET` clause entirely** (`list_status`, `user_rating`, `notes`, `play_count`, `progress`, `library_added_at`, `last_watched_at`); COALESCE guards only nullable enrichment columns | **Not COALESCE.** `COALESCE(excluded.list_status, …)` on a NOT NULL column always takes the excluded value and reintroduces the clobber bug. Split "enrichment patch" vs "user patch" APIs |
-| Pins/absences/routes immune to enrichment upsert | own tables | `CLONE` |
+| Last-used/absences immune to enrichment upsert | own tables | `CLONE` |
 | Absence TTL **7 days**; bind clears absence | `ABSENCE_TTL_SECONDS = 7*24*60*60`; ROD-347 tests | `CLONE` |
-| Preferred re-route uses route stamp vs live pref | ROD-398 / `provider_routes` | `CLONE` intent on `show` id |
+| Last-used leads the open order; no staleness check needed | ROD-525, retires ROD-398's route stamp (03 §5.1/§5.3) | `FIX-IN-RUST`: zigoku had no per-show sticky-provider concept, only the pin + route-stamp pair this replaces |
 | Still-airing totals must not freeze aired-so-far as finale | ROD-419: clear a stale total only when `enrichment_fetched_at IS NOT NULL AND total_episodes IS NULL AND is_still_airing(status)`; never stamp partial field sets | `CLONE` on enrich write rules |
-| Hard delete cascades progress/cache/bindings/pins/absences/routes | zigoku's `deleteAnime` is **binding-scoped** and never touches canonical/pins/absences/routes | `FIX-IN-RUST`: show-wide cascade from the show PK is new behavior, not a clone |
+| Hard delete cascades progress/cache/bindings/last-used/absences | zigoku's `deleteAnime` is **binding-scoped** and never touches canonical/pins/absences/routes | `FIX-IN-RUST`: show-wide cascade from the show PK is new behavior, not a clone |
 | Cover URL never downgrades absolute → relative | ROD-267: case-sensitive `GLOB 'http://*' / 'https://*'` CASE in the upsert; `http`-prefixed garbage neither sticks nor clobbers | `CLONE` |
 | Blank romaji never wipes a stored title | zigoku gated canonical title behind a real-romaji flag (ROD-312, seed vs healed) | Adapted: `NULLIF(…, '')` in the merge treats blank as absence. The full seed-flag gate is not ported: every `Enrichment` here is AniList-sourced, provider seeds never reach these writers (ROD-434 review) |
 | Migration completion is a real runtime check | zigoku checks in every build mode and unwinds via errdefer; a strippable assert is exactly the half-applied-schema bug | `CLONE`: no `debug_assert!` here |
@@ -530,7 +536,7 @@ Not a method-for-method port of `Store` in zigoku. Capabilities the TUI/sync nee
 - upsert user state (status, progress, rating, notes)
 - list history (library `show` rows), get show, delete show (cascade)
 - bind / unbind provider; list bindings for show; lookup show by `(provider, provider_id)`
-- pin / clear pin; mark/check/clear absence; get/set route stamp
+- get/set last-used provider; mark/check/clear absence
 - episode progress get/set/recompute-from-rows; episode cache get/set/invalidate
 - sync dirty set (snapshot vs live status/progress)
 - meta get/set
