@@ -1,29 +1,25 @@
 //! anineko.to `StreamProvider` (ROD-520). Slug-keyed with no canonical
 //! endpoint: `canonical_key` never answers, so every bind runs through title
-//! search and the pure scorers. The search payload carries no AniList/MAL id,
-//! which puts it a full confidence tier below anidb.app (whose detail pages do
-//! yield ids); episode count is the only corroborating signal, and there is no
-//! year at all.
+//! search and the pure scorers. The payload carries no id and no year, so
+//! episode count is the only corroborating signal the scorer ever gets.
 //!
 //! Chain: /ajax/search (JSON) -> /watch/{slug} (episode hrefs) ->
 //! /watch/{slug}/ep-{n} (server buttons, sub/dub fork, inline softsub in the
 //! embed URL) -> embed page (`const src` m3u8, cleartext) -> master.
 //!
-//! Segments are PNG-header cloaked on a shared ad CDN, the same shape megaplay
-//! uses, so the link sets `cloaked_segments` + `decloak_segments` and playback
-//! routes through `proxy::engage`. The IEND box sits at byte 62 but the TS sync
-//! only starts at 252: `proxy::decloak` scans for the sync triple rather than
-//! trusting the PNG length, so the gap costs nothing. Do not "optimize" that
-//! into a fixed-offset skip.
-//!
-//! Nothing in the chain gates on Referer or User-Agent today (verified live
-//! 2026-08-01). Both are sent anyway so a host that turns gating on does not
-//! take the provider down with it.
+//! Segments are PNG-header cloaked on a shared ad CDN, so the link sets
+//! `cloaked_segments` + `decloak_segments` and playback routes through
+//! `proxy::engage`. The IEND box sits at byte 62 but the TS sync only starts at
+//! 252: `proxy::decloak` scans for the sync triple rather than trusting the PNG
+//! length, so the gap costs nothing. Do not "optimize" that into a fixed-offset
+//! skip.
 
 use serde::Deserialize;
 
 use super::http::{Accept, HttpClient, Method, Request};
-use crate::domain::{Enrichment, Quality, StreamLink, Translation, is_absolute_url};
+use crate::domain::{
+    Enrichment, MAX_EPISODE_HINT, Quality, StreamLink, Translation, is_absolute_url,
+};
 use crate::fetchguard::guard_fetch_url;
 use crate::providers::{
     CoverRequest, ProviderError, SearchHit, SearchOptions, StreamProvider, clean_arg,
@@ -89,16 +85,21 @@ fn slug_from_url(url: &str) -> Option<&str> {
 /// Episode count out of a `"TV • 28 Episodes"` meta string. The type token is
 /// deliberately dropped: `SearchHit` has no format field, and adding one to the
 /// shared seam would buy nothing the count does not already give (a movie's
-/// lone episode already contradicts a series total in the scorer). A meta with
-/// no count at all ("TV") yields None, never 0, which the scorer reads as
-/// "unknown" instead of "zero episodes".
+/// lone episode already contradicts a series total in the scorer).
+///
+/// The `Episodes` suffix is REQUIRED, because the same slot also carries a bare
+/// year: the site lists One Piece as `"TV • 1999"`. Reading that as 1999
+/// episodes invents a ~900 episode gap against the real total and the scorer
+/// then rejects the right show. A meta with no count ("TV") and a year-shaped
+/// one both yield None, never 0, which the scorer reads as "unknown" rather
+/// than "zero episodes".
 fn meta_episodes(meta: &str) -> Option<u32> {
     let (_, rest) = meta.split_once('\u{2022}')?;
-    let digits: String = rest
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
+    let rest = rest.trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() || !rest[digits.len()..].trim_start().starts_with("Episode") {
+        return None;
+    }
     digits.parse().ok().filter(|&n| n > 0)
 }
 
@@ -123,11 +124,18 @@ fn parse_search(raw: &[u8]) -> Result<Vec<SearchHit>, ProviderError> {
         .collect())
 }
 
-/// Episode numbers from `/watch/{slug}/ep-{n}` hrefs on the show page, sorted
-/// and deduplicated. Matching the full slug prefix keeps related-show links in
-/// the sidebar out of the listing.
+/// Episode numbers from `watch/{slug}/ep-{n}` hrefs on the show page, sorted,
+/// deduplicated, and clamped like every other episode-minting path.
+///
+/// The needle carries no quote and no leading slash on purpose. Anchoring on
+/// `"/watch/` would make a single-quoted attribute, a relative href, or an
+/// absolute one scan as zero episodes, and zero episodes is an AUTHORITATIVE
+/// not-stocked verdict that persists (03 §4.3). Markup drift must not be able
+/// to mint absence. `/ep-` plus the digits is what disambiguates: a sibling
+/// slug (`{slug}-2`) cannot match, because the next byte after the slug has to
+/// be the `/` of `/ep-`.
 fn parse_episode_numbers(html: &str, slug: &str) -> Vec<u32> {
-    let needle = format!("\"/watch/{slug}/ep-");
+    let needle = format!("watch/{slug}/ep-");
     let mut nums = Vec::new();
     let mut from = 0;
     while let Some(rel) = html[from..].find(&needle) {
@@ -145,7 +153,16 @@ fn parse_episode_numbers(html: &str, slug: &str) -> Vec<u32> {
     }
     nums.sort_unstable();
     nums.dedup();
+    nums.truncate(MAX_EPISODE_HINT as usize);
     nums
+}
+
+/// Cloudflare interstitial served at 200. An empty parse would otherwise read
+/// as "no episodes" and stamp absence. Only the `cf_chl` markers count:
+/// `/cdn-cgi/challenge-platform` ships on good pages, so matching it bare would
+/// take the provider offline whenever the site is merely behind Cloudflare.
+fn is_challenge(html: &str) -> bool {
+    html.contains("cf_chl_opt") || html.contains("__cf_chl")
 }
 
 /// One playable embed off the episode page.
@@ -169,9 +186,13 @@ fn parse_servers(html: &str) -> Vec<Server> {
         };
         let end = start + end_rel;
         let url = &html[start..end];
-        let tail_end = html[end..]
-            .find("</button>")
-            .map_or(html.len(), |i| end + i);
+        // No closing tag means the markup is not what this parser assumes.
+        // Falling back to end-of-document would classify the last server
+        // against the whole page, so a stray "dub" in a footer flips its track.
+        let Some(tail_rel) = html[end..].find("</button>") else {
+            break;
+        };
+        let tail_end = end + tail_rel;
         out.push(Server {
             url: url.to_string(),
             track: track_of(&html[end..tail_end]),
@@ -192,10 +213,26 @@ fn track_of(button_tail: &str) -> Translation {
 }
 
 /// The `const src = "..."` master URL on an embed page. Cleartext, no key
-/// exchange.
+/// exchange. Keeps scanning past a near-miss: the needle is a prefix of
+/// `const srcSet` / `const source`, and one of those earlier in the page must
+/// not hide a real `const src` further down.
 fn parse_embed_src(html: &str) -> Option<&str> {
-    let at = html.find("const src")?;
-    let rest = html[at + "const src".len()..].trim_start();
+    let needle = "const src";
+    let mut from = 0;
+    while let Some(rel) = html[from..].find(needle) {
+        let at = from + rel;
+        from = at + needle.len();
+        if let Some(found) = embed_src_at(&html[from..]) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// One `const src` site: the assignment must follow immediately, else this was
+/// a longer identifier and the caller keeps scanning.
+fn embed_src_at(after_needle: &str) -> Option<&str> {
+    let rest = after_needle.trim_start();
     let rest = rest.strip_prefix('=')?.trim_start();
     let quote = rest.chars().next()?;
     if quote != '"' && quote != '\'' {
@@ -219,8 +256,16 @@ fn subtitle_from_embed_url(embed_url: &str) -> Option<String> {
         .find(|v| is_absolute_url(v) && has_subtitle_extension(v))
 }
 
-/// Extension test against the path only, so a query string or fragment cannot
-/// smuggle the suffix past it.
+/// What may become a play URL or a URL we fetch ourselves under a quality cap.
+/// The master is scraped off a third-party embed page, so it is the site's
+/// choice of address, not ours (03 §6.7).
+fn master_ok(url: &str) -> bool {
+    is_absolute_url(url) && clean_arg(url) && guard_fetch_url(url).is_ok()
+}
+
+/// Extension test against the path only: a `?`/`#` tail must not decide which
+/// param is the sidecar. This is param SELECTION, not a security gate; the
+/// gates are `clean_arg` + `guard_fetch_url` in `guarded_subtitle`.
 fn has_subtitle_extension(url: &str) -> bool {
     let path = url
         .split_once(['?', '#'])
@@ -284,7 +329,13 @@ impl Anineko {
 
     /// Fetch the adaptive master and return the variant matching the quality
     /// cap, or None so resolve falls back to the master ladder.
+    ///
+    /// The master is scraped off a third-party embed page, so WE fetch a URL
+    /// the site chose: it needs the guard in its own right (03 §6.7 names the
+    /// master playlist as a guarded surface). The caller guards it too; this is
+    /// the one that stops the request leaving the process.
     fn cap_variant(&self, master_url: &str, referer: &str, quality: Quality) -> Option<String> {
+        guard_fetch_url(master_url).ok()?;
         let body = self.page_get(master_url, referer).ok()?;
         let variants = super::hls::parse_master_playlist(&String::from_utf8_lossy(&body));
         if variants.is_empty() {
@@ -362,10 +413,18 @@ impl StreamProvider for Anineko {
         let url = format!("{}/watch/{provider_id}", self.host);
         let html = self.page_get(&url, REFERER)?;
         let text = String::from_utf8_lossy(&html);
-        Ok(parse_episode_numbers(&text, provider_id)
-            .into_iter()
-            .map(|n| n.to_string())
-            .collect())
+        let nums = parse_episode_numbers(&text, provider_id);
+        // An empty listing is an AUTHORITATIVE not-stocked verdict that
+        // persists and suppresses later lookups (03 §4.3), so it may only be
+        // returned off a page we can positively identify as this show's. A
+        // challenge page, an app shell, or any markup drift lands here at 200
+        // with nothing parsed, and must read as "learned nothing" instead.
+        if nums.is_empty()
+            && (is_challenge(&text) || !text.contains(&format!("watch/{provider_id}")))
+        {
+            return Err(ProviderError::Decode("not a show page".into()));
+        }
+        Ok(nums.into_iter().map(|n| n.to_string()).collect())
     }
 
     fn resolve(
@@ -394,16 +453,18 @@ impl StreamProvider for Anineko {
             .collect();
         if servers.is_empty() {
             // Past-end, or the track is not stocked. Either way nothing to play.
-            return Err(ProviderError::Decode("no server for track".into()));
+            return Err(ProviderError::Decode("no stream for track".into()));
         }
 
-        for server in servers.iter().take(MAX_EMBED_TRIES) {
-            if !is_absolute_url(&server.url)
-                || !clean_arg(&server.url)
-                || guard_fetch_url(&server.url).is_err()
-            {
-                continue;
-            }
+        // Vet BEFORE taking the budget: a few malformed leading entries must not
+        // spend the allowance and strand the working hosts behind them.
+        for server in servers
+            .iter()
+            .filter(|s| {
+                is_absolute_url(&s.url) && clean_arg(&s.url) && guard_fetch_url(&s.url).is_ok()
+            })
+            .take(MAX_EMBED_TRIES)
+        {
             let embed_referer = format!("{}/", origin_of(&server.url));
             let embed = match self.page_get(&server.url, REFERER) {
                 Ok(body) => String::from_utf8_lossy(&body).into_owned(),
@@ -412,7 +473,18 @@ impl StreamProvider for Anineko {
             let Some(master) = parse_embed_src(&embed) else {
                 continue;
             };
-            if !is_absolute_url(master) || !clean_arg(master) {
+            // Vet here so a refused master hops to the next server. Without it
+            // the cap fetch declines, the fallback launders the same URL into
+            // StreamLink.url, and the refusal resurfaces at play time as a hard
+            // error instead of a recoverable miss.
+            //
+            // No offline test reaches this line: every mock listener is on
+            // loopback, so a private embed is refused above before a master is
+            // ever parsed. `master_ok` and the `cap_variant` guard are both
+            // pinned; this application of them is not. Do not read that as dead
+            // code, a live embed host clears the guard above and then chooses
+            // this URL freely.
+            if !master_ok(master) {
                 continue;
             }
 
@@ -514,6 +586,11 @@ mod tests {
         assert_eq!(meta_episodes("TV \u{2022} Unknown Episodes"), None);
         assert_eq!(meta_episodes("TV \u{2022} 0 Episodes"), None);
         assert_eq!(meta_episodes(""), None);
+        // The same slot carries a bare YEAR: the site lists One Piece as
+        // "TV • 1999". Read as a count it invents a ~900 episode gap and the
+        // scorer rejects the correct show.
+        assert_eq!(meta_episodes("TV \u{2022} 1999"), None);
+        assert_eq!(meta_episodes("Movie \u{2022} 2016"), None);
     }
 
     const SEARCH_FIXTURE: &str = r#"{"success":true,"results":[
@@ -571,6 +648,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_episode_numbers_survives_quote_and_href_style_drift() {
+        // Each of these is valid HTML the site could serve tomorrow. Under the
+        // old `"/watch/` anchor every one scanned as zero episodes, and zero
+        // episodes is a persisted not-stocked verdict, so markup drift alone
+        // could blacklist a show. Retrieval must not depend on quote style.
+        for html in [
+            r#"<a href="/watch/show-a/ep-1"></a><a href="/watch/show-a/ep-2"></a>"#,
+            r#"<a href='/watch/show-a/ep-1'></a><a href='/watch/show-a/ep-2'></a>"#,
+            r#"<a href="watch/show-a/ep-1"></a><a href="watch/show-a/ep-2"></a>"#,
+            r#"<a href="https://anineko.to/watch/show-a/ep-1"></a><a href="https://anineko.to/watch/show-a/ep-2"></a>"#,
+        ] {
+            assert_eq!(
+                parse_episode_numbers(html, "show-a"),
+                vec![1, 2],
+                "drifted markup must still list episodes: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_episode_numbers_does_not_match_a_sibling_slug() {
+        // `/ep-` is what disambiguates: the byte after the slug must be the
+        // slash, so a longer sibling slug cannot bleed into this listing.
+        let html = r#"<a href="/watch/show-a-2/ep-5"></a><a href="/watch/show-a/ep-1"></a>"#;
+        assert_eq!(parse_episode_numbers(html, "show-a"), vec![1]);
+    }
+
+    #[test]
+    fn parse_episode_numbers_clamps_a_hostile_listing() {
+        // Every other episode-minting path clamps to MAX_EPISODE_HINT; an
+        // unbounded listing would push the whole set into the episode cache
+        // and the grid.
+        let flood: String = (1..=MAX_EPISODE_HINT + 500)
+            .map(|n| format!(r#"<a href="/watch/s/ep-{n}"></a>"#))
+            .collect();
+        assert_eq!(
+            parse_episode_numbers(&flood, "s").len(),
+            MAX_EPISODE_HINT as usize
+        );
+    }
+
+    #[test]
     fn parse_episode_numbers_ignores_zero_and_non_numeric() {
         let html = r#"<a href="/watch/s/ep-0"></a><a href="/watch/s/ep-x"></a><a href="/watch/s/ep-7"></a>"#;
         assert_eq!(parse_episode_numbers(html, "s"), vec![7]);
@@ -601,6 +720,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_servers_stops_at_an_unclosed_button() {
+        // Falling back to end-of-document would classify the entry against the
+        // whole page, so a stray "dub" in a footer flips its track and a sub
+        // request then reports no stream. Unbalanced markup is not parseable.
+        let html = r#"<button data-video="https://vivi.test/aaa"> HD-1 <span>Sort Sub</span>
+                      <footer>dubbed releases</footer>"#;
+        assert!(parse_servers(html).is_empty());
+    }
+
+    #[test]
     fn track_of_classifies_the_button_label() {
         assert_eq!(track_of(" HD-1 <span>Sort Sub</span> "), Translation::Sub);
         assert_eq!(track_of(" HD-1 <span>DUB</span> "), Translation::Dub);
@@ -623,6 +752,18 @@ mod tests {
         assert_eq!(parse_embed_src(r#"const src = """#), None);
         assert_eq!(parse_embed_src("const src = notaquote"), None);
         assert_eq!(parse_embed_src("<html>no player</html>"), None);
+    }
+
+    #[test]
+    fn parse_embed_src_scans_past_a_longer_identifier() {
+        // The needle is a prefix of `const srcSet` / `const source`; stopping
+        // at the first near-miss would hide the real declaration below it.
+        let html = r#"const srcSet = "https://wrong.test/a.jpg";
+                      const src = "https://right.test/master.m3u8";"#;
+        assert_eq!(
+            parse_embed_src(html),
+            Some("https://right.test/master.m3u8")
+        );
     }
 
     #[test]
@@ -817,13 +958,6 @@ mod tests {
     }
 
     #[test]
-    fn transport_episodes_empty_page_is_authoritative_not_stocked() {
-        let p = against(response_with_body("200 OK", b"<html>no eps</html>"));
-        let eps = p.episodes("show-a", Translation::Sub, None).unwrap();
-        assert!(eps.is_empty());
-    }
-
-    #[test]
     fn transport_episodes_forbidden_maps_to_taxonomy() {
         // A block must stay an Err: Ok(vec![]) would stamp a false absence.
         let p = against(response_with_body("403 Forbidden", b""));
@@ -834,21 +968,126 @@ mod tests {
     #[test]
     fn transport_resolve_reports_a_track_with_no_servers() {
         // The episode page lists sub only; a dub resolve must fail cleanly
-        // rather than play the sub track.
+        // rather than play the sub track. Match the PAYLOAD, not just the
+        // variant: drop the track filter and this becomes "no playable source",
+        // so a bare Decode(_) assertion passes with sub/dub selection gone.
         let page =
             br#"<button data-video="https://vivi.test/aaa"> HD-1 <span>Sort Sub</span> </button>"#;
         let p = against(response_with_body("200 OK", page));
         let got = p.resolve("show-a", "1", Translation::Dub, Quality::Best);
-        assert!(matches!(got, Err(ProviderError::Decode(_))));
+        assert!(
+            matches!(&got, Err(ProviderError::Decode(m)) if m == "no stream for track"),
+            "expected the track-filter refusal, got {got:?}"
+        );
     }
 
     #[test]
-    fn transport_resolve_skips_a_private_embed_host() {
-        // A loopback data-video must be skipped by the SSRF guard, never
-        // fetched. With no other candidate, resolve fails.
-        let page = br#"<button data-video="http://127.0.0.1:9/embed"> HD-1 <span>Sort Sub</span> </button>"#;
-        let p = against(response_with_body("200 OK", page));
+    fn transport_resolve_never_fetches_a_private_embed_host() {
+        // Bind a real listener and assert NOTHING connects. Asserting only on
+        // the returned error cannot tell "skipped by the guard" from "fetched
+        // and refused": both land on the same Decode, so that assertion passes
+        // with the guard deleted.
+        let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let trap_addr = trap.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if trap.accept().is_ok() {
+                let _ = tx.send(());
+            }
+        });
+        let page = format!(
+            r#"<button data-video="http://{trap_addr}/embed"> HD-1 <span>Sort Sub</span> </button>"#
+        );
+        let p = against(response_with_body("200 OK", page.as_bytes()));
         let got = p.resolve("show-a", "1", Translation::Sub, Quality::Best);
-        assert!(matches!(got, Err(ProviderError::Decode(_))));
+        assert!(matches!(got, Err(ProviderError::Decode(_))), "{got:?}");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the embed url was fetched; the SSRF guard did not fire"
+        );
+    }
+
+    #[test]
+    fn cap_variant_never_fetches_a_private_master_playlist() {
+        // Exercised directly rather than through resolve: every test listener
+        // is on loopback, so a resolve-level attempt is stopped by the EMBED
+        // guard first and can never observe this one. cap_variant is the
+        // chokepoint that stops the request leaving the process.
+        let trap = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let trap_addr = trap.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if trap.accept().is_ok() {
+                let _ = tx.send(());
+            }
+        });
+        let p = Anineko::new().unwrap();
+        let got = p.cap_variant(
+            &format!("http://{trap_addr}/master.m3u8"),
+            "https://vivi.test/",
+            Quality::Best,
+        );
+        assert_eq!(got, None);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the master playlist was fetched despite pointing at a private host"
+        );
+    }
+
+    #[test]
+    fn master_ok_refuses_what_must_never_become_a_play_url() {
+        assert!(master_ok("https://vivi.test/public/stream/x/master.m3u8"));
+        // Private and link-local: under a quality cap we fetch this ourselves,
+        // and the fallback would otherwise hand it to the player.
+        for bad in [
+            "http://127.0.0.1:9/master.m3u8",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/master.m3u8",
+            "/relative/master.m3u8",
+            "https://vivi.test/a b.m3u8",
+            "",
+        ] {
+            assert!(!master_ok(bad), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn transport_episodes_404_errors_rather_than_stamping_absence() {
+        // A dead slug 404s on this site. Ok(vec![]) would burn it in as a
+        // permanent not-stocked verdict; a rename or a pull must stay
+        // recoverable. Pinned offline so CI runs it, not only the live file.
+        let p = against(response_with_body("404 Not Found", b""));
+        let got = p.episodes("gone-show", Translation::Sub, None);
+        assert!(matches!(got, Err(ProviderError::Http { status: 404 })));
+    }
+
+    #[test]
+    fn transport_episodes_refuses_absence_from_a_page_it_cannot_identify() {
+        // 200 with nothing parsed is the dangerous branch: an app shell, or a
+        // challenge served at 200, must read as "learned nothing", never as an
+        // authoritative empty listing.
+        for body in [
+            &b"<html><div id=\"app\"></div></html>"[..],
+            b"<html>window._cf_chl_opt={cvId:'3'}</html>",
+        ] {
+            let p = against(response_with_body("200 OK", body));
+            let got = p.episodes("show-a", Translation::Sub, None);
+            assert!(
+                matches!(got, Err(ProviderError::Decode(_))),
+                "unidentifiable page must not stamp absence, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_episodes_allows_absence_from_a_real_show_page() {
+        // The identity check must not block a GENUINE empty listing: a stocked
+        // show with no episodes yet is a true absence and has to stay one.
+        let page = br#"<html><link rel="canonical" href="https://anineko.to/watch/show-a"><p>no episodes yet</p></html>"#;
+        let p = against(response_with_body("200 OK", page));
+        let eps = p.episodes("show-a", Translation::Sub, None).unwrap();
+        assert!(eps.is_empty());
     }
 }
