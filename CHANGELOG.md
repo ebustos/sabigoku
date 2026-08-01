@@ -17,6 +17,30 @@ release.yml refuses to build a tag whose section is missing or empty, and
 publishes that section verbatim as the release body.
 -->
 
+## [0.1.5] - 2026-08-02
+
+Two new streaming sources and a source-selection overhaul; the fallback pool widens from four to five.
+
+### Added
+
+- **Broader stream fallback**: two new sources join the pool. One that had
+  stopped working is retired. The live count goes from four to five; automatic
+  fallback tries every source in order as before.
+
+### Changed
+
+- **Source selection sticks**: pinning a source is no longer needed. The app
+  remembers the last source that resolved a stream for each show and starts
+  there next time. Press `v` on the detail screen to walk through sources;
+  the cycle debounces rapid presses and the highlight stays where you put it.
+
+### Fixed
+
+- **Stream resolution**: streams from certain sources that failed to load now
+  resolve correctly.
+- **Dead-air gap on source switch**: a brief playback stall that could follow
+  a source change mid-show is gone.
+
 ## [0.1.4] - 2026-08-01
 
 A fourth streaming source, widening the fallback pool from three to four.
@@ -157,6 +181,8 @@ Licensed GPL-3.0-or-later.
 - **`sabigoku update` is not implemented**: it prints a message saying so. There
   is no self-update yet.
 
+[0.1.5]: https://github.com/vantroy/sabigoku/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/vantroy/sabigoku/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/vantroy/sabigoku/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/vantroy/sabigoku/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vantroy/sabigoku/compare/v0.1.0...v0.1.1
