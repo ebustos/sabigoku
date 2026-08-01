@@ -1,0 +1,560 @@
+//! provider_health (ROD-521): grade every provider in `default_registry()`
+//! end to end and report where each one breaks.
+//!
+//! Hits the live sites. Not a test, not in CI: the output is the deliverable
+//! and a provider dying must never redden master.
+//!
+//! Run:  cargo run --example provider_health
+//!       cargo run --example provider_health -- --provider senshi --dub
+//!       SABIGOKU_DEBUG=1 cargo run --example provider_health
+//!
+//! Exit: 0 all healthy, 1 something degraded, 2 something down.
+//!
+//! Sequential on purpose: parallel probes against one host change what the
+//! host does. ~30s healthy, ~10min if everything blackholes.
+//!
+//! Under `--dub` a missing dub reads NOT-STOCKED on track-aware listings
+//! (allanime, anidbapp) and DEGRADED on the rest, which only find out at
+//! resolve. Telling those apart needs provider error text; not worth it.
+
+use std::fmt;
+use std::process::ExitCode;
+use std::time::Instant;
+
+use sabigoku::domain::{Enrichment, Quality, StreamLink, Translation, strip_controls};
+use sabigoku::fetchguard::guard_fetch_url;
+use sabigoku::providers::http::{Accept, HttpClient, Method, Request};
+use sabigoku::providers::{
+    ProviderError, SearchHit, SearchOptions, StreamProvider, default_registry,
+};
+
+/// mpv's own UA (player.rs): a reach that passes here would pass in playback.
+const PLAYER_UA: &str = "Mozilla/5.0 (X11; Linux) Gecko";
+
+/// First bytes only; a full run should cost nothing.
+const REACH_RANGE: &str = "bytes=0-65535";
+
+struct Fixture {
+    anilist_id: i64,
+    mal_id: i64,
+    title: &'static str,
+    /// `count_hint` for listing-less providers (03 §4.3).
+    episodes: u32,
+}
+
+/// Three eras, all universally stocked. Plural on purpose: with one fixture, a
+/// delisting reads as a provider death.
+const FIXTURES: &[Fixture] = &[
+    Fixture {
+        anilist_id: 154587,
+        mal_id: 52991,
+        title: "Sousou no Frieren",
+        episodes: 28,
+    },
+    Fixture {
+        anilist_id: 1,
+        mal_id: 1,
+        title: "Cowboy Bebop",
+        episodes: 26,
+    },
+    Fixture {
+        anilist_id: 21,
+        mal_id: 21,
+        title: "One Piece",
+        episodes: 1100,
+    },
+];
+
+impl Fixture {
+    fn enrichment(&self) -> Enrichment {
+        Enrichment {
+            anilist_id: self.anilist_id,
+            mal_id: Some(self.mal_id),
+            title_romaji: self.title.to_string(),
+            total_episodes: Some(self.episodes),
+            ..Enrichment::default()
+        }
+    }
+}
+
+/// Two orderings, deliberately different. This one ranks which fixture best
+/// represents a provider (`min` across fixtures), so Degraded outranks
+/// NotStocked: it proves bind and list answered. Never reuse it for the
+/// cross-provider rollup, which asks the opposite; `severity` owns that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Verdict {
+    Ok,
+    Degraded,
+    NotStocked,
+    Skip,
+    Down,
+}
+
+impl Verdict {
+    fn label(self) -> &'static str {
+        match self {
+            Verdict::Ok => "OK",
+            Verdict::Degraded => "DEGRADED",
+            Verdict::NotStocked => "NOT-STOCKED",
+            Verdict::Skip => "SKIP",
+            Verdict::Down => "DOWN",
+        }
+    }
+
+    fn severity(self) -> u8 {
+        match self {
+            Verdict::Ok => 0,
+            Verdict::NotStocked => 1,
+            Verdict::Skip => 2,
+            Verdict::Degraded => 3,
+            Verdict::Down => 4,
+        }
+    }
+
+    fn exit(self) -> ExitCode {
+        match self {
+            Verdict::Ok => ExitCode::SUCCESS,
+            Verdict::Down => ExitCode::from(2),
+            _ => ExitCode::from(1),
+        }
+    }
+}
+
+/// One provider against one fixture.
+struct Probe {
+    verdict: Verdict,
+    stages: Vec<String>,
+    detail: Option<String>,
+}
+
+impl Probe {
+    fn graded(verdict: Verdict, stages: Vec<String>, detail: Option<String>) -> Probe {
+        Probe {
+            verdict,
+            stages,
+            detail,
+        }
+    }
+}
+
+impl fmt::Display for Probe {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:<12}", self.verdict.label())?;
+        write!(f, "{}", self.stages.join("  "))?;
+        if let Some(detail) = &self.detail {
+            write!(f, "  {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+fn secs(at: Instant) -> String {
+    format!("{:.2}s", at.elapsed().as_secs_f64())
+}
+
+/// Every provider-controlled string reaching the terminal goes through here:
+/// a CR or an ANSI escape in an id overwrites the row that would have shown a
+/// real failure (`log_url` in providers/http.rs, same reasoning).
+fn safe(s: &str) -> String {
+    let mut out = strip_controls(s.to_string());
+    if out.chars().count() > 80 {
+        out = out.chars().take(80).collect::<String>() + "...";
+    }
+    out
+}
+
+/// The bool is "id-verified", and it caps the probe at Degraded. A search that
+/// answers every query with its top result otherwise resolves an unrelated
+/// show and grades OK.
+fn pick_hit<'a>(hits: &'a [SearchHit], fx: &Fixture) -> (&'a SearchHit, bool) {
+    let keyed = hits
+        .iter()
+        .find(|h| h.anilist_id == Some(fx.anilist_id) || h.mal_id == Some(fx.mal_id));
+    match keyed {
+        Some(hit) => (hit, true),
+        None => (&hits[0], false),
+    }
+}
+
+/// Ranged GET with the link's own headers. A 3xx is not reach: the transport
+/// bans redirects (03 §6.7) so the destination is unknown, and a load-shed
+/// bounce to an interstitial looks identical to a working CDN.
+fn reach(http: &HttpClient, link: &StreamLink) -> Result<String, String> {
+    guard_fetch_url(&link.url).map_err(|e| format!("guard: {e}"))?;
+    let ua = link.user_agent.as_deref().unwrap_or(PLAYER_UA);
+    let mut headers: Vec<(&str, &str)> = vec![("Range", REACH_RANGE)];
+    if let Some(referer) = &link.referer {
+        headers.push(("Referer", referer));
+    }
+    let req = Request {
+        method: Method::Get,
+        url: &link.url,
+        payload: None,
+        user_agent: ua,
+        extra_headers: &headers,
+        accept: Accept::Any2xx,
+        deadline: None,
+    };
+    match http.fetch(&req) {
+        Ok(body) => sniff(&body),
+        Err(ProviderError::Http { status }) if (300..400).contains(&status) => Err(format!(
+            "{status} redirect, destination unverified (transport cannot follow)"
+        )),
+        Err(e) => Err(safe(&e.to_string())),
+    }
+}
+
+/// Anti-bot walls answer 200, so arrival proves nothing. Allowlist only: a
+/// playlist naming at least one reference. Keep it an allowlist when adding
+/// shapes; every blocklist here has been bypassed by a body nobody predicted.
+fn sniff(body: &[u8]) -> Result<String, String> {
+    if body.is_empty() {
+        return Err("empty body (2xx with no bytes)".into());
+    }
+    let head = String::from_utf8_lossy(&body[..body.len().min(4096)]);
+    // trim_start does not eat a BOM; one in front of a challenge page was a
+    // free bypass of every check below.
+    let text = head.trim_start_matches('\u{feff}').trim_start();
+    if !text.starts_with("#EXTM3U") {
+        return Err(format!(
+            "unrecognized body, {}B (not a playlist)",
+            body.len()
+        ));
+    }
+    // The magic bytes are trivially forged; a real playlist names something.
+    let refs = text
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .count();
+    if refs == 0 {
+        return Err(format!("playlist with no references, {}B", body.len()));
+    }
+    Ok(format!("m3u8 {refs} refs {}B", body.len()))
+}
+
+fn probe(provider: &dyn StreamProvider, fx: &Fixture, tt: Translation, http: &HttpClient) -> Probe {
+    let mut stages: Vec<String> = Vec::new();
+    let show = fx.enrichment();
+
+    let at = Instant::now();
+    let (id, verified) = match provider.canonical_key(&show) {
+        Some(key) => {
+            stages.push(format!("bind:canonical({}) {}", safe(&key), secs(at)));
+            (key, true)
+        }
+        None => {
+            if !provider.supports_search() {
+                return Probe::graded(
+                    Verdict::Skip,
+                    stages,
+                    Some("unbindable: no canonical key and no search".into()),
+                );
+            }
+            let opts = SearchOptions {
+                translation: tt,
+                limit: 26,
+                page: 1,
+            };
+            match provider.search(fx.title, &opts) {
+                Err(e) => {
+                    stages.push(format!("bind:search {}", secs(at)));
+                    return Probe::graded(
+                        Verdict::Down,
+                        stages,
+                        Some(format!("search: {}", safe(&e.to_string()))),
+                    );
+                }
+                Ok(hits) if hits.is_empty() => {
+                    stages.push(format!("bind:search 0 hits {}", secs(at)));
+                    return Probe::graded(Verdict::NotStocked, stages, None);
+                }
+                Ok(hits) => {
+                    let (hit, keyed) = pick_hit(&hits, fx);
+                    let how = if keyed { "keyed" } else { "top-hit" };
+                    stages.push(format!(
+                        "bind:search {how}({}) {}",
+                        safe(&hit.provider_id),
+                        secs(at)
+                    ));
+                    (hit.provider_id.clone(), keyed)
+                }
+            }
+        }
+    };
+
+    // Ok(vec![]) is authoritative absence, never a failure (03 §4.3).
+    let at = Instant::now();
+    let labels = match provider.episodes(&id, tt, Some(fx.episodes)) {
+        Err(e) => {
+            stages.push(format!("list {}", secs(at)));
+            return Probe::graded(
+                Verdict::Down,
+                stages,
+                Some(format!("episodes: {}", safe(&e.to_string()))),
+            );
+        }
+        Ok(labels) if labels.is_empty() => {
+            stages.push(format!("list:none {}", secs(at)));
+            return Probe::graded(Verdict::NotStocked, stages, None);
+        }
+        Ok(labels) => {
+            stages.push(format!("list:{} {}", labels.len(), secs(at)));
+            labels
+        }
+    };
+
+    let at = Instant::now();
+    let link = match provider.resolve(&id, &labels[0], tt, Quality::Best) {
+        Err(e) => {
+            stages.push(format!("resolve {}", secs(at)));
+            return Probe::graded(
+                Verdict::Degraded,
+                stages,
+                Some(format!("resolve: {}", safe(&e.to_string()))),
+            );
+        }
+        Ok(link) => {
+            stages.push(format!("resolve:ep{} {}", safe(&labels[0]), secs(at)));
+            link
+        }
+    };
+
+    // Resolve can hand back a well-formed URL the CDN refuses to serve, which
+    // is what a contract test sleeps through.
+    let at = Instant::now();
+    match reach(http, &link) {
+        Err(e) => {
+            stages.push(format!("reach {}", secs(at)));
+            Probe::graded(Verdict::Degraded, stages, Some(format!("reach: {e}")))
+        }
+        Ok(note) if !verified => {
+            stages.push(format!("reach:{note} {}", secs(at)));
+            Probe::graded(
+                Verdict::Degraded,
+                stages,
+                Some("unverified bind: search never id-keyed this hit, the stream may be another show".into()),
+            )
+        }
+        Ok(note) => {
+            stages.push(format!("reach:{note} {}", secs(at)));
+            Probe::graded(Verdict::Ok, stages, None)
+        }
+    }
+}
+
+/// Best fixture wins: one success proves the provider, the rest were stocking
+/// gaps. Except a clean sweep of absence, which given universally-stocked
+/// fixtures is a catalog answering nothing rather than three delistings.
+fn grade(probes: Vec<Probe>) -> (Verdict, Option<String>) {
+    let swept = probes.iter().all(|p| p.verdict == Verdict::NotStocked);
+    if swept {
+        return (
+            Verdict::Down,
+            Some(format!(
+                "every fixture absent ({} of {}); the catalog answers nothing, not a delisting",
+                probes.len(),
+                FIXTURES.len()
+            )),
+        );
+    }
+    let best = probes
+        .into_iter()
+        .min_by_key(|p| p.verdict)
+        .expect("FIXTURES is never empty");
+    (best.verdict, best.detail)
+}
+
+struct Args {
+    provider: Option<String>,
+    translation: Translation,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut provider = None;
+    let mut translation = Translation::Sub;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--provider" => provider = Some(args.next().ok_or("--provider needs a value")?),
+            "--dub" => translation = Translation::Dub,
+            other => {
+                return Err(format!(
+                    "unknown argument {other:?}\nusage: provider_health [--provider NAME] [--dub]"
+                ));
+            }
+        }
+    }
+    Ok(Args {
+        provider,
+        translation,
+    })
+}
+
+fn run() -> Result<Verdict, String> {
+    let args = parse_args()?;
+    let registry = default_registry().map_err(|e| format!("registry: {e}"))?;
+    let http = HttpClient::new().map_err(|e| format!("http client: {e}"))?;
+
+    let providers: Vec<&dyn StreamProvider> = match &args.provider {
+        Some(name) => vec![
+            registry
+                .by_name(name)
+                .ok_or_else(|| format!("unknown provider {name:?}"))?,
+        ],
+        None => registry.iter().collect(),
+    };
+
+    let tt = match args.translation {
+        Translation::Sub => "sub",
+        Translation::Dub => "dub",
+    };
+    println!("probing {} provider(s), {tt}\n", providers.len());
+
+    let mut summary: Vec<(&'static str, Verdict, Option<String>)> = Vec::new();
+    for provider in providers {
+        println!("== {} ==", provider.name());
+        let mut probes = Vec::with_capacity(FIXTURES.len());
+        for fx in FIXTURES {
+            let probe = probe(provider, fx, args.translation, &http);
+            println!("  {:<20} {probe}", fx.title);
+            probes.push(probe);
+        }
+        let (verdict, detail) = grade(probes);
+        println!("  verdict: {}\n", verdict.label());
+        summary.push((provider.name(), verdict, detail));
+    }
+
+    println!("== summary ==");
+    let mut overall = Verdict::Ok;
+    for (name, verdict, detail) in &summary {
+        let detail = detail.as_deref().unwrap_or("");
+        println!("  {name:<12} {:<12} {detail}", verdict.label());
+        if verdict.severity() > overall.severity() {
+            overall = *verdict;
+        }
+    }
+    Ok(overall)
+}
+
+fn main() -> ExitCode {
+    // Log sites are no-ops until a logger installs, so SABIGOKU_DEBUG needs
+    // this. Keep it gated: unconditional, the always-on transport warns
+    // interleave into the table and shred the report.
+    if sabigoku::logging::env_debug() {
+        sabigoku::logging::init_stderr(true);
+    }
+    match run() {
+        Ok(verdict) => {
+            println!("\nworst: {}", verdict.label());
+            verdict.exit()
+        }
+        Err(e) => {
+            eprintln!("provider_health: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Examples need `--all-targets` to run these; plain `cargo test` skips them.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(provider_id: &str, anilist: Option<i64>, mal: Option<i64>) -> SearchHit {
+        SearchHit {
+            provider_id: provider_id.into(),
+            anilist_id: anilist,
+            mal_id: mal,
+            ..SearchHit::default()
+        }
+    }
+
+    #[test]
+    fn sniff_rejects_an_empty_two_hundred() {
+        assert!(sniff(b"").is_err());
+    }
+
+    #[test]
+    fn sniff_rejects_a_challenge_page_hiding_behind_a_bom() {
+        let body = "\u{feff}<!DOCTYPE html><html>captcha</html>".as_bytes();
+        assert!(sniff(body).is_err());
+    }
+
+    #[test]
+    fn sniff_rejects_a_json_block_page() {
+        assert!(sniff(br#"{"blocked":true,"reason":"bot"}"#).is_err());
+    }
+
+    #[test]
+    fn sniff_rejects_a_playlist_header_with_no_references() {
+        assert!(sniff(b"#EXTM3U\n#EXT-X-VERSION:3\n").is_err());
+    }
+
+    #[test]
+    fn sniff_accepts_a_playlist_that_names_a_variant() {
+        let body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nindex.m3u8\n";
+        assert!(sniff(body).is_ok());
+    }
+
+    #[test]
+    fn pick_hit_prefers_an_id_keyed_hit_over_the_top_result() {
+        let fx = &FIXTURES[0];
+        let hits = vec![
+            hit("wrong-show", None, None),
+            hit("right-show", Some(fx.anilist_id), None),
+        ];
+        let (picked, keyed) = pick_hit(&hits, fx);
+        assert_eq!(picked.provider_id, "right-show");
+        assert!(keyed);
+    }
+
+    #[test]
+    fn pick_hit_flags_the_top_hit_fallback_as_unverified() {
+        let hits = vec![hit("whatever-was-first", None, None)];
+        let (picked, keyed) = pick_hit(&hits, &FIXTURES[0]);
+        assert_eq!(picked.provider_id, "whatever-was-first");
+        assert!(!keyed);
+    }
+
+    #[test]
+    fn a_clean_sweep_of_absence_is_a_dead_catalog_not_three_delistings() {
+        let probes = FIXTURES
+            .iter()
+            .map(|_| Probe::graded(Verdict::NotStocked, vec![], None))
+            .collect();
+        let (verdict, detail) = grade(probes);
+        assert_eq!(verdict, Verdict::Down);
+        assert!(detail.is_some());
+    }
+
+    #[test]
+    fn one_stocked_fixture_carries_the_provider() {
+        let probes = vec![
+            Probe::graded(Verdict::NotStocked, vec![], None),
+            Probe::graded(Verdict::Ok, vec![], None),
+            Probe::graded(Verdict::NotStocked, vec![], None),
+        ];
+        assert_eq!(grade(probes).0, Verdict::Ok);
+    }
+
+    #[test]
+    fn rollup_ranks_a_real_failure_above_mere_absence() {
+        assert!(Verdict::Degraded.severity() > Verdict::NotStocked.severity());
+        assert!(Verdict::Down.severity() > Verdict::Degraded.severity());
+        assert!(Verdict::NotStocked.severity() > Verdict::Ok.severity());
+    }
+
+    #[test]
+    fn safe_strips_an_id_that_would_forge_a_report_row() {
+        let forged = "1\x1b[2K\rmegaplay     OK";
+        let out = safe(forged);
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\x1b'));
+    }
+
+    #[test]
+    fn safe_truncates_an_oversize_id() {
+        assert!(safe(&"a".repeat(500)).chars().count() <= 83);
+    }
+}
