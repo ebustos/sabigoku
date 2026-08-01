@@ -1404,8 +1404,11 @@ dims whole; a healthy non-serving token never drops to it.
   marker alone; bold never claims it. The token's marker stays derived, not raw,
   so a provider serving off a still-unchecked entry is `▸` and promotes correctly.
 - **A pin naming a provider outside the registry still renders nowhere**: there is
-  no token to boost. The pin drives resolution while unrendered; §7.5's
-  `v provider` hint is where the key is named.
+  no token to boost. The all-unchecked dim row also stays flat, pin included: the
+  row is a "nothing known yet" placeholder, unreachable by the `v` cycle (which
+  needs a serving grid), and a lone bold token in a dead row would overclaim.
+  The pin drives resolution while unrendered; §7.5's `v provider` hint is where
+  the key is named.
 - **Keybind-hint bold and state bold are different registers** and may coexist in
   one row: the `[v]` hint is bold per §7.5 while a pinned token is bold per this
   section, which is the carve-out to §1.3's "use it once per visual unit". Bold
