@@ -479,9 +479,6 @@ impl EpisodeSession {
             canonical.status.as_deref(),
             deps.unix_now,
         );
-        // Landed hop clears the walk (05 §10.3); no ping-pong of fresh walks.
-        self.walk = None;
-        self.walk_provider = None;
         self.refresh_meta(deps);
         self.land(provider.to_string(), episodes, deps);
         Vec::new()
@@ -572,6 +569,12 @@ impl EpisodeSession {
     /// wraps to episode one.
     fn land(&mut self, provider: String, episodes: Vec<String>, deps: &EpisodeDeps) {
         let Some(aid) = self.for_id else { return };
+        // The single walk retirement point (05 §10.3): a hop can land
+        // synchronously from the episode cache with no worker event, so any
+        // clear that lives only on the event path leaks an armed walk, which
+        // silently eats play fail-overs and holds prewarm off all session.
+        self.walk = None;
+        self.walk_provider = None;
         self.no_source = false;
         self.loading = None;
         self.serving = Some(provider);
@@ -1727,6 +1730,128 @@ mod tests {
             "grid never flips to the provider the user cycled past"
         );
         assert_eq!(rig.world.store.get_provider_pin(5).unwrap(), None);
+    }
+
+    /// ROD-525: a walk hop can land synchronously from the episode cache
+    /// with no worker event; the walk must retire at the landing. Leaked
+    /// armed, it silently eats every later play fail-over and holds prewarm
+    /// off for the rest of the session.
+    #[test]
+    fn cache_hit_walk_landing_retires_the_walk() {
+        let mut rig = Rig::new(vec![
+            StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+            StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+        ]);
+        let c = canonical(5);
+        rig.world.store.add_to_library(&c, 50).unwrap();
+        // Both bound + fresh-cached: engage and the flip hop both land
+        // without a worker.
+        for p in ["megaplay", "senshi"] {
+            rig.world.store.bind_provider(&c, p, "505", 100).unwrap();
+            rig.world
+                .store
+                .set_episode_cache(5, p, Translation::Sub, &["1".into()], Some("FINISHED"), 100)
+                .unwrap();
+        }
+        rig.session.engage(&c, &rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
+
+        rig.session.cycle_pin(&rig.world.deps(""));
+        rig.session.cycle_pin(&rig.world.deps(""));
+        rig.world.now += PIN_SETTLE;
+        let fb = rig.session.maybe_commit_pin(&rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::Hop {
+                provider: "senshi".into()
+            }]
+        );
+        assert_eq!(rig.session.serving(), Some("senshi"), "landed from cache");
+        assert!(rig.session.loading().is_none());
+        assert!(
+            !rig.session.walk_active(),
+            "a synchronous landing retires the walk"
+        );
+    }
+
+    /// ROD-525 acceptance: a play failure on the serving provider always
+    /// answers, a hop while a sibling is reachable, DeadEnd when none is.
+    /// Never silence. Original repro: the flip landed from cache, the leaked
+    /// walk swallowed the fail-over.
+    #[test]
+    fn play_fail_over_after_cache_landing_walks_never_silent() {
+        let mut rig = Rig::new(vec![
+            StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+            StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+        ]);
+        let c = canonical(5);
+        rig.world.store.add_to_library(&c, 50).unwrap();
+        // Both bound + fresh-cached: engage and the flip hop both land
+        // without a worker.
+        for p in ["megaplay", "senshi"] {
+            rig.world.store.bind_provider(&c, p, "505", 100).unwrap();
+            rig.world
+                .store
+                .set_episode_cache(5, p, Translation::Sub, &["1".into()], Some("FINISHED"), 100)
+                .unwrap();
+        }
+        rig.session.engage(&c, &rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        rig.session.cycle_pin(&rig.world.deps(""));
+        rig.session.cycle_pin(&rig.world.deps(""));
+        rig.world.now += PIN_SETTLE;
+        rig.session.maybe_commit_pin(&rig.world.deps(""));
+        assert_eq!(rig.session.serving(), Some("senshi"));
+
+        // senshi's play failed; the fail-over must hop to megaplay, and the
+        // hop lands synchronously off megaplay's own cached grid.
+        let fb =
+            rig.session
+                .play_fail_over(&["senshi".into()], ("1".into(), 1), &rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::Hop {
+                provider: "megaplay".into()
+            }],
+            "the fail-over answers, never silence"
+        );
+        rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
+        assert!(!rig.session.walk_active());
+
+        // With the sibling freshly absent instead, the answer is DeadEnd.
+        let mut dead = Rig::new(vec![
+            StubProvider::new("megaplay").with_key("505"),
+            StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+        ]);
+        let c = canonical(6);
+        dead.world.store.add_to_library(&c, 50).unwrap();
+        dead.world
+            .store
+            .mark_provider_absent(&c, "megaplay", 900)
+            .unwrap();
+        dead.session.engage(&c, &dead.world.deps(""));
+        dead.world.settle(&mut dead.session, "");
+        assert_eq!(dead.session.serving(), Some("senshi"));
+        let fb =
+            dead.session
+                .play_fail_over(&["senshi".into()], ("1".into(), 1), &dead.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::DeadEnd],
+            "an exhausted fail-over says so, never an empty vec"
+        );
     }
 
     /// ROD-524: `v` during a live play fail-over is accepted, and a settle
