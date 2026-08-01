@@ -234,15 +234,25 @@ impl ProviderRegistry {
 }
 
 /// The live provider set. Construction order IS the default fallback order (03
-/// §3.1): megaplay, senshi, allanime. Building the clients is offline. Both the
-/// TUI boot and the CLI play path build from here so the lineup never forks.
+/// §3.1). Building the clients is offline. Both the TUI boot and the CLI play
+/// path build from here so the lineup never forks.
 pub fn default_registry() -> Result<ProviderRegistry, ProviderError> {
     Ok(ProviderRegistry::new(vec![
         Box::new(megaplay::MegaPlay::new()?) as Box<dyn StreamProvider>,
         Box::new(senshi::Senshi::new()?),
-        Box::new(allanime::AllAnime::new()?),
         Box::new(anibd::AniBd::new()?),
         Box::new(anidbapp::AniDbApp::new()?),
+    ]))
+}
+
+/// Shelved providers: built on request, never in the live walk. Nothing in the
+/// app may merge this into `default_registry()`; the only sanctioned reader is
+/// the health probe, which needs a handle to tell a revived provider from a
+/// dead one. Persisted bindings naming a shelved provider stay retired (03
+/// §3.2) because the app never sees this registry.
+pub fn retired_registry() -> Result<ProviderRegistry, ProviderError> {
+    Ok(ProviderRegistry::new(vec![
+        Box::new(allanime::AllAnime::new()?) as Box<dyn StreamProvider>,
     ]))
 }
 
@@ -354,7 +364,6 @@ mod tests {
         ProviderRegistry::new(vec![
             Box::new(Fake("megaplay", false)),
             Box::new(Fake("senshi", true)),
-            Box::new(Fake("allanime", true)),
             Box::new(Fake("anibd", false)),
             Box::new(Fake("anidbapp", true)),
         ])
@@ -370,7 +379,7 @@ mod tests {
         let reg = default_registry().expect("offline construction");
         assert_eq!(
             names(&reg.iter().collect::<Vec<_>>()),
-            ["megaplay", "senshi", "allanime", "anibd", "anidbapp"]
+            ["megaplay", "senshi", "anibd", "anidbapp"]
         );
         assert!(
             !reg.primary().supports_search(),
@@ -381,6 +390,19 @@ mod tests {
                 .is_some_and(|p| p.name() == "senshi"),
             "a stock run binds the first searchable provider"
         );
+    }
+
+    /// The shelf must stay disjoint from the live set. A name in both means a
+    /// revival landed in `retired_registry` instead of `default_registry`, and
+    /// the app would keep walking past a provider that works.
+    #[test]
+    fn shelved_providers_are_not_live() {
+        let live = default_registry().expect("offline construction");
+        let shelf = retired_registry().expect("offline construction");
+        assert_eq!(names(&shelf.iter().collect::<Vec<_>>()), ["allanime"]);
+        for p in shelf.iter() {
+            assert!(live.by_name(p.name()).is_none(), "{} is live", p.name());
+        }
     }
 
     fn names(providers: &[&dyn StreamProvider]) -> Vec<&'static str> {
@@ -405,7 +427,7 @@ mod tests {
 
     #[test]
     fn preferred_named() {
-        assert_eq!(registry().preferred(Some("allanime")).name(), "allanime");
+        assert_eq!(registry().preferred(Some("anidbapp")).name(), "anidbapp");
     }
 
     #[test]
@@ -421,7 +443,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             names(&reg.ordered(None)),
-            vec!["megaplay", "senshi", "allanime", "anibd", "anidbapp"]
+            vec!["megaplay", "senshi", "anibd", "anidbapp"]
         );
     }
 
@@ -430,7 +452,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             names(&reg.ordered(Some("senshi"))),
-            vec!["senshi", "megaplay", "allanime", "anibd", "anidbapp"]
+            vec!["senshi", "megaplay", "anibd", "anidbapp"]
         );
     }
 
@@ -439,7 +461,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             names(&reg.ordered(Some("gogo"))),
-            vec!["megaplay", "senshi", "allanime", "anibd", "anidbapp"]
+            vec!["megaplay", "senshi", "anibd", "anidbapp"]
         );
     }
 
@@ -448,7 +470,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             names(&reg.ordered(Some("megaplay"))),
-            vec!["megaplay", "senshi", "allanime", "anibd", "anidbapp"]
+            vec!["megaplay", "senshi", "anibd", "anidbapp"]
         );
     }
 
@@ -473,8 +495,8 @@ mod tests {
     fn preferred_searchable_honors_a_capable_preference() {
         let reg = registry();
         assert_eq!(
-            reg.preferred_searchable(Some("allanime")).map(|p| p.name()),
-            Some("allanime")
+            reg.preferred_searchable(Some("anidbapp")).map(|p| p.name()),
+            Some("anidbapp")
         );
     }
 
@@ -500,7 +522,7 @@ mod tests {
         let reg = registry();
         assert_eq!(
             reg.iter().map(|p| p.name()).collect::<Vec<_>>(),
-            vec!["megaplay", "senshi", "allanime", "anibd", "anidbapp"]
+            vec!["megaplay", "senshi", "anibd", "anidbapp"]
         );
     }
 
