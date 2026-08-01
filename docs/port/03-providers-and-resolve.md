@@ -16,7 +16,7 @@
 |---|---|
 | **AniList** | User-facing catalog: Browse search, Discover, enrichment, sync. Never "search all stream sites." |
 | **Stream providers** | Bind a show to a playable catalog id, list episodes, resolve a stream URL. |
-| **Resolve orchestration** | Given `anilist_id` (+ optional pin/pref), pick provider, fetch grid, play, fallback, warm. |
+| **Resolve orchestration** | Given `anilist_id` (+ last-used/pref, ROD-525), pick provider, fetch grid, play, fallback, warm. |
 | **Player** | Spawn mpv, observe position, optional AniSkip scripts. |
 
 Discovery is not multiprovider search. Provider `search` exists only for **binding**
@@ -85,13 +85,14 @@ test over `default_registry` pins the live lineup against exactly this drift.
 
 ### 3.3 When preference applies
 
-**Pin or global preferred_provider** shapes **new** resolution and the fallback walk
-snapshot. Paths that already own a concrete binding use `by_name(binding.provider)`.
+**Last-used (per show) or global `preferred_provider`** shapes **new** resolution
+and the fallback walk snapshot (§5.1, ROD-525). Paths that already own a concrete
+binding use `by_name(binding.provider)`.
 
-Under sabigoku identity (02): almost every open is AniList-keyed. Preference + pin
-are first-class. zigoku's legacy "provider-keyed `.direct` must not re-route" still
-applies when the UI is explicitly on a **chosen binding** (manual flip, pin cycle),
-not when inventing a provider for a naked AniList id.
+Under sabigoku identity (02): almost every open is AniList-keyed. Last-used and
+preference are first-class. zigoku's legacy "provider-keyed `.direct` must not
+re-route" still applies when the UI is explicitly on a **chosen binding** (a
+manual walk, `v`), not when inventing a provider for a naked AniList id.
 
 ---
 
@@ -108,54 +109,42 @@ binding beats a fresh key on an earlier provider. Within a tier, **effective ord
 | **B Id match** | Inside tier-C search results: MAL/AniList id agreement (ROD-342) | Prefer over fuzzy title match |
 | **C Search** | Title/catalog search + scorer | `best_id_match` then `best_provider_match`; below floor → no bind |
 
-### 4.1 Classifier: the two real entry paths (no unified pseudocode exists)
+### 4.1 Classifier: one entry path (ROD-525; Path 2 was never wired)
 
-Round 1 verification (ROD-430): zigoku has **no single classifier**. Two entry
-paths treat the pin differently, and the port `CLONE`s the split (it is what every
-app test pins; inventing a unified rule matches nothing):
+Round 1 verification (ROD-430) found zigoku has **no single classifier** and
+described the port as `CLONE`ing a two-path split, canonical open vs History
+open, plus a third manual-flip path. **ROD-525 verification against the sabigoku
+code (2026-08-01) found that split was never real:** `resolve::open_history` and
+the pin hard-restriction below it have **no caller**. Every History open has
+always run the canonical-open algorithm. This is doc/code drift discovered at
+ROD-525, not a deliberate simplification, and it is recorded here rather than
+silently deleted: the second path in the original port design was dead on
+arrival, and the false-green ledger row it produced is retired in a later code
+chunk (not this one).
 
-**Path 1: canonical open (Browse open, Discover zoom, add-to-watchlist).**
-Pin folds into *effective preference*, nothing more:
+**The one open algorithm (Browse open, Discover zoom, add-to-watchlist, History
+open, all of them).** Last-used folds into *effective preference*, nothing more:
 
 ```
 open(show: AniListId):
-  order = ordered(pin orelse preferred)          // pin-first, then construction
-  for p in order: if binding(p) exists → Bound   // ANY binding wins tier 0:
-                                                 // a non-pinned binding beats an
-                                                 // unbound pin here
+  order = ordered(last_used(show) orelse preferred)  // last-used first, then construction
+  for p in order: if binding(p) exists → Bound        // ANY binding wins tier 0:
+                                                       // a binding the walk didn't
+                                                       // start on still wins here
   for p in order: if key = p.canonical_key(show) → TierA { p, key }
   → NeedsSearch (tier C across all non-absent providers, same order)
 ```
 
-**Path 2: History record open** (full algorithm; pin is only one arm):
+No pin arm, no hard restriction, no separate route-preferred call: last-used is
+one entry in `ordered`, the same mechanism `preferred` already used. A History
+open and a Browse open of the same show run the identical function; there is no
+second algorithm left to describe.
 
-```
-openHistory(rec):
-  if rec has no binding (zigoku: unbound sentinel):
-    clear grid + pending_bind; cancel any parked fallback walk;
-    disarm resume-demote; mark no-source; refresh pin/avail meta; return
-  if pin set:
-    if pin registered AND pin != rec.source AND pin has binding:
-      open that pin binding; return
-    // pin == rec.source, retired name, or unbound pin: fall through
-    // pin set ⇒ routePreferred no-ops (pin overrides)
-  else if unpinned:
-    if routePreferred(rec.anilist_id)  // ROD-398 / §5.3: stamp / force pref
-      return
-  open rec.source / rec.source_id     // owning provider on the History row
-```
-
-**Pin hard restriction (the pin arm only):** only the pin's own binding is
-looked up. An unbound pin never silently borrows another provider's binding. If
-the pin has no binding (or is retired / already `rec.source`), there is no pin
-tier walk; control falls through. With pin still set, `routePreferred` no-ops, so
-fallthrough opens `rec.source`. Unpinned History opens still run preferred
-re-route before the record's provider (05 §10.2).
-
-**Path 3: manual pin set (`v` flip).** Single-provider walk on the target
-provider, probing through fresh absence; a miss keeps the pin and toasts. Tag
-the walk origin as **`pin_flip`** (not the same as forced-preferred; see §5.3
-K-2 fence).
+**Manual walk (`v`).** Not a resolve entry path: it is a live action on an
+already-open grid, not a way of arriving at one. Full mechanics moved to §5.2
+(absence-probe scope) and 05 §10.5 (the walk contract); this section no longer
+lists it as a third path, because outside its own single hop it does not touch
+the classifier above at all.
 
 zigoku also had `.direct` for provider-keyed selections where `sel.id` was already
 a provider handle. Under 02, that collapses to **Bound** or an explicit binding
@@ -188,76 +177,60 @@ Pure functions; worker does network search, then scores offline.
 
 ---
 
-## 5. Pins, absences, routes
+## 5. Last-used and absences
 
 All keyed by **`anilist_id`** (02). Own tables; enrichment upserts never touch them.
 
-### 5.1 Pin
+### 5.1 Last-used (ROD-525; retires the pin)
 
-- At most one provider per show.
-- Overrides global preferred for effective preference and History open.
-- UI: cycle unpinned → each live provider → unpinned (`v` @ freeze).
-- Setting a pin may start a **manual one-provider walk** (probe even through fresh absence).
-- Exhausted manual flip: toast like "no match on {name}, pin kept"; pin is not cleared.
-- Retired pin name (`by_name` null): do not fetch foreign id on primary (mis-key). Clear or ignore.
+The two-tier preference (global `preferred_provider` + per-show pin) is retired.
+In its place: the app remembers the provider each show **last successfully
+served from**.
+
+- At most one provider per show, or unset.
+- **Written only at a landing** (a confirmation write, never speculative; a
+  landing on the walk-order head is a write-that-clears, deleting any stored
+  row, not a skipped write), and
+  only when it differs from the walk-order head. A landing is a successful
+  episode fetch or stream resolve on that provider (§6.1, §6.3), auto or manual.
+- Opens start at last-used (§4.1: `ordered(last_used orelse preferred)`) and walk
+  on failure like any other open; every landing updates it, including a landing
+  onto a provider a show had migrated away from before.
+- No hard restriction: last-used is one entry in `ordered`, and tier 0 (**any**
+  binding) still wins over it exactly as it always did (§4). A show whose
+  last-used provider lost its binding just falls through to the next provider in
+  `ordered`, the same as a stale `preferred_provider` always has.
+- Per-show **language** intent, the pin's original motive, is deferred to a
+  future epic: it will eventually filter `ordered` before last-used is applied.
 
 ### 5.2 Absence (negative cache)
 
 - Row `(anilist_id, provider, checked_at)` = definitive not stocked.
 - **TTL @ freeze: 7 days.** Fresh absence ⇒ skip automatic probe/search; **bindings always win.**
-- Manual walks (`v` flip, the one-shot forced-preferred probe) may probe anyway.
-  ("Manual" here = probe-through-absence behavior; it is orthogonal to the walk
-  **origin** tag in §5.3 — the K-2 continuation walk is `forced_preferred` origin
-  but non-manual.)
+- **Manual-walk probe scope (ROD-525):** the `v` walk probes through fresh
+  absence on the **first hop only**, the provider the user pressed toward.
+  Every hop after that respects absence like any auto walk. Probing the whole
+  circle would relocate the ROD-524 fetch fan-out from press-time to miss-time;
+  one paid hop plus a silent circle keeps a `v` press bounded regardless of how
+  many providers are stale.
 - Successful bind **deletes** absence for that pair (bound and absent never coexist).
 - Availability UI: `unchecked` | `bound` | `absent` (derived; only absence is stored).
 
-### 5.3 Route stamp (preferred re-route, ROD-398)
+### 5.3 Route stamp and forced-preferred: retired, no replacement guard (ROD-525)
 
-Per-show record: `resolved_pref` = the global `preferred_provider` this show last
-**settled** under.
+The route-stamp mechanism (`ProviderRoute`, the settled-pref comparison, the K-2
+forced-preferred continuation walk) is **deleted, not replaced**. Its entire job
+was protecting a **speculative** write: the stamp had to land *before* the fetch
+it gated ("stamp-before-fetch, so a miss cannot loop forever") because a stale
+stamp could re-arm the same forced probe on every later open. Last-used (§5.1)
+is written only at a confirmed landing, never speculatively, so the failure mode
+the stamp guarded against cannot occur: a landing that never happens cannot loop,
+and a landing that does happen is, by definition, not a miss. No replacement
+guard is needed because there is nothing left for a guard to protect.
 
-| Situation | Behavior |
-|---|---|
-| Pin set | Route stamp ignored; pin wins |
-| Settled pref == live pref and binding exists | Open that binding |
-| Settled pref == live pref, no binding | Fall through to normal open of existing state |
-| Stale or missing stamp | Force preferred once (tier 0 / A / C on that provider only); **stamp before fetch** so a miss cannot loop forever |
-| Empty preferred config | Follow-leader / construction order; route helper no-ops |
-
-**Pin supremacy** and **stamp-before-fetch** are `CLONE` contracts.
-
-**After a forced-preferred miss (`FIX-IN-RUST`, closes ledger K-2).**
-
-At freeze, a stale-stamp re-route onto a search-only preferred provider arms a
-**single-provider** walk tagged the same way as a pin flip (`manual = true`);
-when the search misses, that walk is exhausted, the grid stays blank/stale, and
-no existing binding on any other provider is consulted. That is bug K-2, live in
-zigoku. Both origins share one flag at freeze; sabigoku must **not**.
-
-**Walk origin (required tag, not a single `manual` bit):**
-
-| Origin | Armed by | On exhaust / miss |
-|---|---|---|
-| `forced_preferred` | §5.3 stale-stamp re-route, pinless | K-2 law below |
-| `pin_flip` | Path 3 / `v` | **Stop.** Pin kept. Pin-kept toast. **No** full walk, **no** borrow of another provider's binding. |
-
-**K-2 law (only `forced_preferred`):** when that one-shot preferred probe misses:
-
-1. **Clear** the exhausted one-shot walk (there is nothing left to advance).
-2. **Begin a new** full ordered fallback walk: non-manual (respect fresh absence),
-   preferred marked already-tried, **existing bindings first**, then tier A/C on
-   the rest. Do not re-enter the pin-kept exhaust path.
-3. Route stamp is already advanced (stamp-before-fetch) and **stays**; do not
-   clear it on miss (second open must not re-force forever).
-4. Absence rules unchanged: empty `Ok([])` still marks absence (§4.3); a search
-   miss without an authoritative empty listing does not invent a new absence rule.
-5. Toast: distinct reroute-miss copy — **not** "no match on {name}, pin kept"
-   (that copy is pin_flip only).
-6. The grid must never stay blank while a binding exists.
-
-Unifying "any single-provider miss → full bindings-first walk" breaks pin law.
-Path 3 stays stop-and-keep-pin forever.
+The K-2 bug (07 bug ledger) closes as **moot**, retired along with the mechanism
+it lived in, not fixed within it: there is no forced single-provider probe left
+to dead-end.
 
 ---
 
@@ -268,13 +241,12 @@ Path 3 stays stop-and-keep-pin forever.
 High-level:
 
 1. Clear stale in-flight bind/walk/play-search want (walk hops reinstall their walk).
-2. Refresh pin + availability cache for the open `anilist_id`.
+2. Refresh last-used + availability cache for the open `anilist_id`.
 3. Maybe enrichment refresh (independent of episode cache).
-4. **Preferred re-route** if unpinned and stamp stale (§5.3).
-5. Else pin's binding if pin set and bound.
-6. Else classifier → bound / tier A / needs search.
-7. Episode list cache hit → paint grid; else spawn worker.
-8. User-driven open: **do not** arm resume-demote. Only auto-resume landing does.
+4. Classifier (§4.1) with `order = ordered(last_used orelse preferred)` → bound / tier A / needs search.
+5. Episode list cache hit → paint grid; else spawn worker.
+6. User-driven open: **do not** arm resume-demote. Only auto-resume landing does.
+7. On landing, write last-used when the landed provider differs from the walk-order head (§5.1).
 
 **Do not join** a prior episode worker on the UI thread. Detach + drain; keep-check drops
 stale results (`ZIG-SHAPE` → Rust: generation token / `anilist_id` + cancel flag).
@@ -344,6 +316,9 @@ After a **failed** episode fetch or stream open, if the show has `anilist_id`:
 - One hop per failure event (single-flight with episode/play guards).
 - Play continuation: after hop grid lands, **remap episode** (exact raw label, else
   1-based ordinal) and relaunch; walk stays armed (no ping-pong of fresh walks).
+- **Landing writes last-used** (§5.1) exactly as any other landing does, whether
+  the walk was armed by a play/fetch failure or by a manual `v` (05 §10.5),
+  including a landing on a provider a show had already migrated away from.
 - Rescue cancels background prewarm (CDN budget).
 
 **Resume demote (ROD-229):** auto-resume open sets `resume_landing_pending`. Failure
@@ -520,7 +495,7 @@ Rust: prefer explicit `ResolveSession` / generation counters over seven peer boo
 
 ## 12. Store capabilities this chapter needs (from 02)
 
-- get/set pin, absence (fresh?), route stamp
+- get/set last-used, absence (fresh?)
 - list/get binding by `(anilist_id, provider)` and reverse `(provider, provider_id)`
 - upsert binding on successful episodes
 - episode list cache get/set
@@ -556,8 +531,9 @@ Rust: prefer explicit `ResolveSession` / generation counters over seven peer boo
 
 - [ ] Tier order is binding-first, then key, then search (not provider-major on first open)
 - [ ] Empty episodes ⇒ absence; errors do not
-- [ ] Pin overrides preferred; route stamp does not fight pin
-- [ ] Stale preferred re-route stamps before fetch (no loop)
+- [ ] Last-used leads `ordered`; any binding still wins tier 0 regardless (§4.1, §5.1)
+- [ ] Last-used writes only at a landing, never speculatively (§5.1)
+- [ ] Manual walk probes fresh absence on the first hop only, not the whole circle (§5.2)
 - [ ] Resume demote only on auto-resume walk exhaust
 - [ ] No `unbound` / provider-primary library identity required
 - [ ] Tier-C thresholds and id-match vetoes named

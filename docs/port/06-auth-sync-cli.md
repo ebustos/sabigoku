@@ -60,7 +60,7 @@ Rules:
 | `landing` | `"history"` | history\|browse\|last_watched |
 | `title_language` | `"romaji"` | romaji\|english\|native |
 | `discover_cover_concurrency` | `4` | clamp **[1, 16]** at read |
-| `preferred_provider` | `""` | empty = registry construction order |
+| `preferred_provider` | `""` | Walk-order head when a show has no last-used provider yet (03 §5.1); empty = registry construction order. CLI query path (§7.3) still reads it directly (ROD-491 stands) |
 | `anilist_sync_enabled` | `true` | master switch; off = inert sync rail, **token stays** |
 | `check_for_updates` | `true` | boot GitHub check gate |
 

@@ -19,7 +19,7 @@ use crate::domain::{
 };
 use crate::error::Error;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// SQLITE_BUSY wait set in `open` (ROD-287 mechanism). Writer-vs-writer only
 /// (WAL lets readers through). Short: real collisions are sub-20ms and the
@@ -196,6 +196,26 @@ UPDATE show SET progress_stamped_at = (
     SELECT MAX(ep.updated_at) FROM episode_progress ep
     WHERE ep.anilist_id = show.anilist_id AND ep.fully_watched = 1
 );
+";
+
+/// ROD-525: pin (forced per-show provider) and route stamp (a config
+/// generation marker, not a serving record) retire in favor of last-used.
+/// Seed only pins whose provider holds a binding for the show: a kept flip
+/// miss leaves a pin naming a provider that never served, and seeding it
+/// would point the open at a known-dead route.
+const MIGRATION_V3: &str = "
+CREATE TABLE provider_last_used (
+    anilist_id INTEGER PRIMARY KEY REFERENCES show(anilist_id) ON DELETE CASCADE,
+    provider   TEXT NOT NULL
+);
+INSERT INTO provider_last_used (anilist_id, provider)
+    SELECT p.anilist_id, p.provider FROM provider_pin p
+    WHERE EXISTS (
+        SELECT 1 FROM provider_binding b
+        WHERE b.anilist_id = p.anilist_id AND b.provider = p.provider
+    );
+DROP TABLE provider_pin;
+DROP TABLE provider_route;
 ";
 
 /// Which enrichment column set a row was filled under (02 §5 CLONE idea,
@@ -1186,60 +1206,34 @@ impl Store {
         Ok(ProviderAvailability::Unchecked)
     }
 
-    /// Per-show forced provider (ROD-345), returned verbatim; unknown names
-    /// degrade at the registry, not here. None clears.
-    pub fn set_provider_pin(&self, anilist_id: i64, provider: Option<&str>) -> Result<(), Error> {
+    /// The provider this show last successfully served from (ROD-525).
+    /// Confirmation write: minted only at a landing, never before a fetch, or
+    /// a show migrates to a provider that just failed it. None clears. The
+    /// show row exists by write time (the landing's bind minted it, ROD-327).
+    pub fn set_last_used(&self, anilist_id: i64, provider: Option<&str>) -> Result<(), Error> {
         match provider {
             Some(p) => self.conn.execute(
-                "INSERT INTO provider_pin (anilist_id, provider) VALUES (?1, ?2)
+                "INSERT INTO provider_last_used (anilist_id, provider) VALUES (?1, ?2)
                  ON CONFLICT(anilist_id) DO UPDATE SET provider = excluded.provider",
                 (anilist_id, p),
             )?,
             None => self.conn.execute(
-                "DELETE FROM provider_pin WHERE anilist_id = ?1",
+                "DELETE FROM provider_last_used WHERE anilist_id = ?1",
                 [anilist_id],
             )?,
         };
         Ok(())
     }
 
-    pub fn get_provider_pin(&self, anilist_id: i64) -> Result<Option<String>, Error> {
+    pub fn get_last_used(&self, anilist_id: i64) -> Result<Option<String>, Error> {
         self.conn
             .query_row(
-                "SELECT provider FROM provider_pin WHERE anilist_id = ?1",
+                "SELECT provider FROM provider_last_used WHERE anilist_id = ?1",
                 [anilist_id],
                 |row| row.get(0),
             )
             .optional()
             .map_err(Error::from)
-    }
-
-    /// The preferred_provider this show last settled under (ROD-398), or None
-    /// (never stale-resolved).
-    pub fn get_route_pref(&self, anilist_id: i64) -> Result<Option<String>, Error> {
-        self.conn
-            .query_row(
-                "SELECT resolved_pref FROM provider_route WHERE anilist_id = ?1",
-                [anilist_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Error::from)
-    }
-
-    /// Mints the identity row when absent, like the absence mark: the stamp
-    /// is stamp-BEFORE-fetch (03 §5.3), so it must land for shows that have
-    /// never resolved. No membership (02 §3.7).
-    pub fn set_route_pref(&self, e: &Enrichment, pref: &str) -> Result<(), Error> {
-        let tx = immediate_tx(&self.conn)?;
-        ensure_show_row(&tx, e)?;
-        tx.execute(
-            "INSERT INTO provider_route (anilist_id, resolved_pref) VALUES (?1, ?2)
-             ON CONFLICT(anilist_id) DO UPDATE SET resolved_pref = excluded.resolved_pref",
-            (e.anilist_id, pref),
-        )?;
-        tx.commit()?;
-        Ok(())
     }
 
     /// Upsert resume for (show, track, episode label). fully_watched derives
@@ -1900,9 +1894,15 @@ impl Store {
                     ),
                 )?;
             }
+            // Same rule as the V3 seed, checked against LANDED rows, not the
+            // source batch: OR IGNORE above can drop a binding, and a pin
+            // must never seed a provider that has no binding on disk.
             if let Some(pin) = &show.pin {
                 tx.execute(
-                    "INSERT OR IGNORE INTO provider_pin (anilist_id, provider) VALUES (?1, ?2)",
+                    "INSERT OR IGNORE INTO provider_last_used (anilist_id, provider)
+                     SELECT ?1, ?2 WHERE EXISTS (
+                        SELECT 1 FROM provider_binding b
+                        WHERE b.anilist_id = ?1 AND b.provider = ?2)",
                     (show.enrichment.anilist_id, pin),
                 )?;
             }
@@ -2087,6 +2087,10 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
     if v < 2 {
         tx.execute_batch(MIGRATION_V2)?;
         v = 2;
+    }
+    if v < 3 {
+        tx.execute_batch(MIGRATION_V3)?;
+        v = 3;
     }
 
     // Real runtime check in every build mode: a strippable assert here is
@@ -2316,8 +2320,7 @@ mod tests {
             "episode_progress",
             "provider_absence",
             "provider_binding",
-            "provider_pin",
-            "provider_route",
+            "provider_last_used",
             "show",
         ] {
             assert!(names.iter().any(|n| n == table), "missing table {table}");
@@ -3039,45 +3042,84 @@ mod tests {
     }
 
     #[test]
-    fn pin_and_route_round_trip() {
+    fn last_used_round_trip() {
         let store = Store::open_memory().unwrap();
         store
             .bind_provider(&sample(54), "senshi", "s54", 100)
             .unwrap();
-        assert_eq!(store.get_provider_pin(54).unwrap(), None);
-        store.set_provider_pin(54, Some("senshi")).unwrap();
+        assert_eq!(store.get_last_used(54).unwrap(), None);
+        store.set_last_used(54, Some("senshi")).unwrap();
+        assert_eq!(store.get_last_used(54).unwrap().as_deref(), Some("senshi"));
+        store.set_last_used(54, Some("megaplay")).unwrap();
         assert_eq!(
-            store.get_provider_pin(54).unwrap().as_deref(),
-            Some("senshi")
-        );
-        store.set_provider_pin(54, Some("megaplay")).unwrap();
-        assert_eq!(
-            store.get_provider_pin(54).unwrap().as_deref(),
+            store.get_last_used(54).unwrap().as_deref(),
             Some("megaplay")
         );
-        store.set_provider_pin(54, None).unwrap();
-        assert_eq!(store.get_provider_pin(54).unwrap(), None);
+        store.set_last_used(54, None).unwrap();
+        assert_eq!(store.get_last_used(54).unwrap(), None);
+    }
 
-        assert_eq!(store.get_route_pref(54).unwrap(), None);
-        store.set_route_pref(&sample(54), "senshi").unwrap();
-        assert_eq!(store.get_route_pref(54).unwrap().as_deref(), Some("senshi"));
-        store.set_route_pref(&sample(54), "megaplay").unwrap();
+    /// ROD-525 V3: pins seed last-used only where the provider actually
+    /// served (has a binding); a kept-miss pin and every route row seed
+    /// nothing, and both tables drop.
+    #[test]
+    fn v2_database_migrates_pins_to_last_used_binding_gated() {
+        let path = tmp_db("v2-upgrade.db");
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(MIGRATION_V1).unwrap();
+        raw.execute_batch(MIGRATION_V2).unwrap();
+        raw.pragma_update(None, "user_version", 2).unwrap();
+        for id in [1, 2, 3] {
+            raw.execute(
+                "INSERT INTO show (anilist_id, title_romaji, progress) VALUES (?1, 'Held', 0)",
+                [id],
+            )
+            .unwrap();
+        }
+        // Show 1: pin senshi WITH a senshi binding -> seeds.
+        // Show 2: pin senshi, binding only on megaplay (kept miss) -> no seed.
+        // Show 3: no pin, a route row only -> no seed.
+        raw.execute(
+            "INSERT INTO provider_binding (anilist_id, provider, provider_id, bound_at)
+             VALUES (1, 'senshi', 's1', 100), (2, 'megaplay', 'm2', 100)",
+            [],
+        )
+        .unwrap();
+        raw.execute(
+            "INSERT INTO provider_pin (anilist_id, provider) VALUES (1, 'senshi'), (2, 'senshi')",
+            [],
+        )
+        .unwrap();
+        raw.execute(
+            "INSERT INTO provider_route (anilist_id, resolved_pref) VALUES (3, 'senshi')",
+            [],
+        )
+        .unwrap();
+        drop(raw);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.get_last_used(1).unwrap().as_deref(), Some("senshi"));
         assert_eq!(
-            store.get_route_pref(54).unwrap().as_deref(),
-            Some("megaplay")
+            store.get_last_used(2).unwrap(),
+            None,
+            "kept miss never seeds"
         );
-
-        // The stamp mints the identity row for a never-resolved show
-        // (stamp-before-fetch must land, 03 §5.3); no membership.
-        store.set_route_pref(&sample(77), "senshi").unwrap();
-        assert_eq!(store.get_route_pref(77).unwrap().as_deref(), Some("senshi"));
-        assert!(
-            store
-                .list_history()
-                .unwrap()
-                .iter()
-                .all(|s| s.enrichment.anilist_id != 77)
+        assert_eq!(
+            store.get_last_used(3).unwrap(),
+            None,
+            "route rows seed nothing"
         );
+        let gone: u32 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('provider_pin', 'provider_route')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0, "both retired tables drop");
     }
 
     #[test]
@@ -4683,8 +4725,9 @@ mod tests {
         assert_eq!(bindings[0].provider, "senshi");
         assert_eq!(bindings[0].provider_id, "77");
         assert_eq!(
-            store.get_provider_pin(7).unwrap().as_deref(),
-            Some("senshi")
+            store.get_last_used(7).unwrap().as_deref(),
+            Some("senshi"),
+            "imported pin has a senshi binding, so it seeds last-used"
         );
     }
 

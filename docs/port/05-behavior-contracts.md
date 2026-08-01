@@ -42,7 +42,7 @@ remain **law** for their domains; this chapter focuses on **TUI + cross-cutting*
 behavior. Pointers:
 
 - Domain enums, afterPlay, isStillAiring, titles → domain tests + 02 §4
-- Schema, pins, absences, routes, migrate → store tests + 02
+- Schema, last-used, absences, migrate → store tests + 02
 - Registry order, tier match floors → source/resolver tests + 03
 - Sync push/pull/reconcile → 06 (cites below only when TUI arms them)
 
@@ -113,7 +113,7 @@ Cites: h/l browse tests, single-column ROD-194, arrow parity ROD-156.
 |---|---|
 | **Given** focused library show, not currently playing | |
 | **When** `X` then `y` | |
-| **Then** show deleted with cascade (progress, cache, bindings, pin/absence/route); cursor held sensibly | |
+| **Then** show deleted with cascade (progress, cache, bindings, last-used/absence); cursor held sensibly | |
 | **Must not** delete on `X` alone; `q` does not confirm; re-`X` re-arms; Esc/other cancels; only `y` fires | |
 | **Must not** delete the currently-playing show | |
 | **When** only show deleted | first-run / empty history state |
@@ -225,7 +225,7 @@ Cites: `enrichment_refreshed overwrites…`, `answered=false skips…` (ROD-182/
 
 ---
 
-## 10. Resolve, preferred, pin, fallback, prewarm
+## 10. Resolve, preferred, last-used, fallback, prewarm
 
 Full pipeline law is **03**. These TUI contracts pin orchestration scars:
 
@@ -256,18 +256,18 @@ Round-1 review found this cluster (14 tests) cited nowhere in the bible.
 | Browse scroll does **not** fetch episodes; detail entry lazy-loads | `browse scrolling fires zero episode fetches…` |
 | Superseded episode prefetch abandoned, not joined | `ROD-179: a superseded episode prefetch…` |
 
-### 10.2 Preferred re-route (ROD-398)
+### 10.2 Preferred re-route: retired (ROD-525)
 
-| Contract | Cites |
-|---|---|
-| Unpinned History open re-routes off stale binding to preferred | `ROD-398: an unpinned History open re-routes…` |
-| Pin ignores global preference | `…pinned show ignores…` |
-| Settled under pref opens pref binding directly | `…already settled…` |
-| Browse open of bound canonical honors preference | `…Browse open…` |
-| Settled pref never bound → fall back **without** re-search loop | `…never bound falls back without re-searching…` |
-| Stale + search-only preferred → Tier C once | `…forces a search-only preferred…` |
-| Re-route carries progress (sibling union → show progress) | `…carries progress…` **PORT** to single show progress |
-| Auto-resume onto stale Tier-C still arms demote | `…still arms the demote contract…` |
+The ROD-398 contract this section cited (route-stamp settled-vs-live comparison,
+force-preferred-once, stamp-before-fetch) is deleted along with `provider_route`;
+03 §5.3 records why no replacement guard is needed. What survives of its job,
+"which provider does an open try first," is now just "last-used leads `ordered`"
+(03 §4.1/§5.1), a single rule with no staleness state of its own, covered by
+§10.5 below. No contract, and no zigoku cites, remain to list here.
+
+Progress still carries across a landing exactly as it did across the old
+re-route (raise-only `MAX(progress, union)`, 02 §4b); that rule did not move,
+only the trigger that used to gate it.
 
 ### 10.3 Fallback / absence / empty (ROD-346/347/368)
 
@@ -297,18 +297,29 @@ Round-1 review found this cluster (14 tests) cited nowhere in the bible.
 | Add success triggers warm; busy/repeat silent | `an add success triggers the warm…` |
 | Cancel flag honored | `prewarmTask… honors the cancel flag` |
 
-### 10.5 Pin cycle `v` (ROD-345/355/357)
+### 10.5 `v` walk (ROD-345/355/357, redesigned ROD-525)
 
-| Contract | Cites |
+The pin-cycle mechanism these tickets originally described is retired (§10.2);
+the rows below are new law with **no zigoku cite**. The ROD-345/355/357 tests
+that lived under this section number at freeze covered the pin, not this walk.
+
+| Contract | Note |
 |---|---|
-| Cycle unpinned → each provider → unpinned | `v cycles unpinned -> alpha -> beta…` |
-| History open redirects to pinned sibling binding | `History open redirects to the pinned…` |
-| Pin leads automatic fallback order | `the pin leads the automatic fallback walk's order…` |
-| Retired pin name → unpinned, no re-route | `v with a retired… wraps to unpinned…` |
-| Flip keeps cursor on in-progress episode | `v flip landing keeps the cursor…` |
-| Flip onto unbound provider does fresh resolve | `v onto an unbound provider resolves fresh…` **PORT** no binding |
-| Recover from failed-flip unbound via focused show | ROD-357 cluster |
-| Manual tier-C miss toast names **target** provider | `…names the flipped-to provider…` |
+| `v` advances to the **next provider in registry (construction) order** and tries it live | Not preference order; a fixed reference order, same one DESIGN §5.3a already uses for the provider row's display order, so repeated presses are predictable |
+| A miss (not stocked, or unreachable) **walks on automatically** to the next provider | No stop-and-keep; the old "pin kept" behavior is gone entirely |
+| **Dead end** only when the full circle exhausts back to the provider the walk started from | Says so via toast (DESIGN §4.10); never a silent stop |
+| **Settle window preserved** (ROD-524): a press burst inside the window moves the target in memory and re-arms; at most one live flip fires when the burst stops | Fires from the **settled index**; wraps the same as any other hop. No per-press fetch fan-out |
+| First hop probes through fresh absence (the provider the user pressed toward); every hop after that respects absence like any other walk | 03 §5.2 |
+| A landing (including onto a provider the show had already migrated away from) **rewrites last-used** | 03 §5.1/§6.1/§6.4; same write path as any other landing, manual or automatic |
+| Manual-walk hops surface on the provider row's **probing token**, not a per-hop toast | DESIGN §5.3a. Auto fallback hops keep their §10.3 hop toast; a manual walk only toasts on dead end |
+| No pin, no `PinKept`, no per-show restriction on History opens | Superseded by §10.2; a History open runs the identical classifier as any other open (03 §4.1) |
+
+**Silent migration is an accepted cost, stated plainly in DESIGN §5.3a and §10**
+(not this chapter's job to hedge it): nothing re-probes a provider a show has
+migrated away from except another manual `v` (§10.4 prewarm only probes
+*unchecked* providers). Mid-walk, before the hop lands, the serving marker is
+stale; the probing token above is what the user is actually reading during that
+window.
 
 ### 10.6 Resume landing (ROD-229 / 259)
 
@@ -428,7 +439,7 @@ Resume ratios and fully_watched: **02** / store tests.
 | Contract | Cites |
 |---|---|
 | Meta field order and `?` degrade | ROD-260/261 meta tests |
-| Provider caption: serving leads; markers; dim; shed order vs Pinned | ROD-348/356/397 |
+| Provider caption: serving leads; markers; dim; no shed rank (not a field) | ROD-348/356/397; ROD-525 |
 | Browse preview hides stale episode grid from History | ROD-222 |
 | episodeGridVisible in zoom | ROD-222 |
 | detailSyncTarget rules for browse/history | ROD-156 |
@@ -455,7 +466,7 @@ These are easy to break in the port if only unit-tested in isolation:
 | Upsert/enrich never clobbers user state | P-add, re-search, enrichment_refreshed |
 | Progress on show, not forked per provider | preferred re-route "carries progress" |
 | catalog_cache for Discover/Browse paint | feed persist + detail open without refetch |
-| Pin/absence/route off enrichment path | caption + resolve tests |
+| Last-used/absence off enrichment path | caption + resolve tests |
 
 ---
 

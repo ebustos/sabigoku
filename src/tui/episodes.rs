@@ -13,9 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::domain::{self, Enrichment, Translation};
 use crate::providers::ProviderRegistry;
-use crate::resolve::{
-    self, Exhausted, Hop, ResolveTarget, ResolveWorld, RouteAction, Walk, WalkOrigin,
-};
+use crate::resolve::{self, Exhausted, Hop, ResolveTarget, ResolveWorld, Walk, WalkOrigin};
 use crate::resolver;
 use crate::store::{ProviderAvailability, Store};
 use crate::tui::clock::{AsyncStart, Debounce};
@@ -67,10 +65,6 @@ impl ResolveWorld for WorldView<'_> {
             .collect()
     }
 
-    fn registered(&self, provider: &str) -> bool {
-        self.registry.by_name(provider).is_some()
-    }
-
     fn binding(&self, anilist_id: i64, provider: &str) -> Option<String> {
         self.store
             .bindings_for(anilist_id)
@@ -90,12 +84,8 @@ impl ResolveWorld for WorldView<'_> {
         self.registry.by_name(provider)?.canonical_key(canonical)
     }
 
-    fn pin(&self, anilist_id: i64) -> Option<String> {
-        self.store.get_provider_pin(anilist_id).ok().flatten()
-    }
-
-    fn route_pref(&self, anilist_id: i64) -> Option<String> {
-        self.store.get_route_pref(anilist_id).ok().flatten()
+    fn last_used(&self, anilist_id: i64) -> Option<String> {
+        self.store.get_last_used(anilist_id).ok().flatten()
     }
 
     fn global_pref(&self) -> String {
@@ -111,25 +101,13 @@ pub enum Feedback {
     Fail { provider: String, class: FetchClass },
     /// The walk moved: `trying {provider}…`.
     Hop { provider: String },
-    /// Forced-preferred miss (K-2 step 5): distinct copy, never "pin kept".
-    NoMatch { provider: String },
-    /// Pin-flip miss: pin kept, stop (03 §5.3).
-    PinKept { provider: String },
-    /// Ordinary walk exhausted with nothing landed.
+    /// The walk exhausted the circle with nothing landed. The one exhaust
+    /// (ROD-525): silence is never an outcome.
     DeadEnd,
-    /// The pin flip's walk could not even run (worker spawn failure); pin
-    /// kept, distinct from a walk that ran and missed (DESIGN 4.10).
-    PinUnreachable { provider: String },
-    /// `v` pinned the provider already serving the grid; no hop.
-    PinSet { provider: String },
-    /// `v` cycled past the last provider back to unpinned.
-    PinCleared,
-    /// `v` while the resolve is still in flight.
-    PinPending,
-    /// `v` with no episode source to pin against.
-    PinNothing,
-    /// The pin write itself failed.
-    PinSaveFailed { clearing: bool },
+    /// `v` before the first grid resolves.
+    CyclePending,
+    /// `v` with no episode source to walk from.
+    CycleNothing,
 }
 
 #[derive(Default)]
@@ -150,18 +128,17 @@ pub struct EpisodeSession {
     /// pending_bind). Token-guarded like everything else in flight.
     mint_pending: bool,
     walk: Option<Walk>,
-    /// Name behind a live single-provider walk, for the miss copy.
+    /// Provider of the hop currently in flight; the row's probing token
+    /// (DESIGN 5.3a, ROD-525). Cleared wherever the walk retires.
     walk_provider: Option<String>,
     /// Pre-flip cursor identity `(raw label, 1-based ordinal)`: a flip
     /// landing keeps the cursor on the in-progress episode (05 §10.5).
     remap_from: Option<(String, u32)>,
-    /// Pin + per-provider availability, refreshed on engage and on every
-    /// bind/absence write (03 §6.1 step 2) so draw never reads the store.
-    pin: Option<String>,
-    /// Settle window for the `v` cycle (ROD-524): armed = `pin` holds an edit
-    /// the store does not have yet. `maybe_commit_pin` writes and walks on
-    /// fire; anything that abandons the show first must `flush_pin_edit`.
-    pin_debounce: Debounce,
+    /// The `v` cycle's aim, in memory only (ROD-524/525): a burst advances
+    /// it paying no fetches, the settle starts the manual walk there, the
+    /// landing writes last-used. Abandoning the show just drops it.
+    cycle_aim: Option<String>,
+    cycle_debounce: Debounce,
     avail: Vec<(String, ProviderAvailability)>,
     generation: Generation,
     drain: Drain,
@@ -184,8 +161,8 @@ impl EpisodeSession {
         self.walk = None;
         self.walk_provider = None;
         self.remap_from = None;
-        self.pin = None;
-        self.pin_debounce.disarm();
+        self.cycle_aim = None;
+        self.cycle_debounce.disarm();
         self.avail.clear();
     }
 
@@ -198,45 +175,11 @@ impl EpisodeSession {
         if held && (self.loading.is_some() || !self.episodes.is_empty() || self.no_source) {
             return Vec::new();
         }
-        let flush_fb = self.flush_pin_edit(deps.store);
         self.reset();
         self.for_id = Some(aid);
         self.canonical = Some(canonical.clone());
         self.track = Some(deps.translation);
         self.refresh_meta(deps);
-
-        // 03 §6.1 step 4: the preferred re-route runs before the classifier.
-        let routed = resolve::route_preferred(&deps.world(), canonical);
-        let action = match &routed.stamp {
-            // Stamp-before-fetch (03 §5.3): a forced probe that fired without
-            // its stamp would re-force on every open. If the stamp write
-            // fails, open normally instead of forcing unstamped.
-            Some(stamp) if deps.store.set_route_pref(canonical, stamp).is_err() => {
-                RouteAction::None
-            }
-            _ => routed.action,
-        };
-        let mut fb = flush_fb;
-        fb.extend(match action {
-            RouteAction::None => self.engage_classify(canonical, deps),
-            RouteAction::OpenBinding { provider, id } => {
-                self.open_bound(provider, id, deps);
-                Vec::new()
-            }
-            RouteAction::FetchTierA { provider, key, .. } => {
-                self.fire_fetch(provider, key, true, deps);
-                Vec::new()
-            }
-            RouteAction::Walk(walk) => {
-                self.walk_provider = Some(deps.global_pref.to_string());
-                self.walk = Some(*walk);
-                self.advance_walk(false, deps)
-            }
-        });
-        fb
-    }
-
-    fn engage_classify(&mut self, canonical: &Enrichment, deps: &EpisodeDeps) -> Vec<Feedback> {
         match resolve::classify_open(&deps.world(), canonical) {
             ResolveTarget::Bound { provider, id, .. } => {
                 self.open_bound(provider, id, deps);
@@ -247,7 +190,7 @@ impl EpisodeSession {
                 Vec::new()
             }
             ResolveTarget::NeedsSearch { .. } => {
-                let walk = Walk::fallback(&deps.world(), canonical.clone(), None);
+                let walk = Walk::auto(&deps.world(), canonical.clone(), None);
                 self.walk = Some(walk);
                 self.advance_walk(false, deps)
             }
@@ -335,6 +278,13 @@ impl EpisodeSession {
     /// One hop per call (03 §6.4). `announce` gates the hop toast: the walk's
     /// opening attempt is not a hop, only a move after a miss/failure is.
     fn advance_walk(&mut self, announce: bool, deps: &EpisodeDeps) -> Vec<Feedback> {
+        // Manual walks announce on the probing token, never per-hop toasts
+        // (05 §10.5); auto walks keep the hop toast.
+        let announce = announce
+            && self
+                .walk
+                .as_ref()
+                .is_some_and(|w| w.origin() == WalkOrigin::Auto);
         let step = {
             let world = deps.world();
             self.walk.as_mut().map(|w| w.advance(&world))
@@ -353,6 +303,7 @@ impl EpisodeSession {
                         provider: provider.clone(),
                     });
                 }
+                self.walk_provider = Some(provider.clone());
                 // A bound hop paints from an unexpired cache like a bound
                 // open; only a fresh tier-A key must go to the network.
                 let running = if bind.is_some() {
@@ -361,7 +312,7 @@ impl EpisodeSession {
                     self.open_bound(provider.clone(), id, deps)
                 };
                 if !running {
-                    fb.extend(self.hop_unreachable(provider));
+                    fb.extend(self.hop_unreachable(deps));
                 }
                 fb
             }
@@ -372,29 +323,15 @@ impl EpisodeSession {
                         provider: provider.clone(),
                     });
                 }
+                self.walk_provider = Some(provider.clone());
                 if !self.fire_search(provider.clone(), deps) {
-                    fb.extend(self.hop_unreachable(provider));
+                    fb.extend(self.hop_unreachable(deps));
                 }
                 fb
             }
-            Err(Exhausted::Continue(cont)) => {
-                // K-2 law (03 §5.3): the forced-preferred miss rolls into a
-                // bindings-first full walk; the grid must never stay blank
-                // while a binding exists.
-                let missed = self.walk_provider.take().unwrap_or_default();
-                self.walk = Some(*cont);
-                let mut fb = vec![Feedback::NoMatch { provider: missed }];
-                fb.extend(self.advance_walk(true, deps));
-                fb
-            }
-            Err(Exhausted::PinKept) => {
-                let target = self.walk_provider.take().unwrap_or_default();
-                self.walk = None;
-                self.loading = None;
-                vec![Feedback::PinKept { provider: target }]
-            }
             Err(Exhausted::DeadEnd) => {
                 self.walk = None;
+                self.walk_provider = None;
                 self.loading = None;
                 if self.episodes.is_empty() {
                     self.no_source = true;
@@ -405,22 +342,11 @@ impl EpisodeSession {
     }
 
     /// A hop whose worker never started: no event will ever advance the walk,
-    /// so clear it instead of leaving it dangling. A pin flip surfaces this
-    /// as its own DESIGN 4.10 row (`couldn't reach {provider}`, freeze
-    /// parity: the walk could not even run, distinct from ran-and-missed);
-    /// other origins stay silent, matching the fire_* spawn-fail policy.
-    fn hop_unreachable(&mut self, provider: String) -> Vec<Feedback> {
-        let origin = self.walk.as_ref().map(Walk::origin);
-        self.walk = None;
-        self.walk_provider = None;
-        if origin == Some(WalkOrigin::PinFlip) {
-            vec![Feedback::PinUnreachable { provider }]
-        } else {
-            if self.episodes.is_empty() {
-                self.no_source = true;
-            }
-            Vec::new()
-        }
+    /// so walk on to the next provider instead of leaving it dangling
+    /// (ROD-525: a spawn failure is one more miss, never a stop). Bounded by
+    /// the circle; the exhaust is the ordinary DeadEnd.
+    fn hop_unreachable(&mut self, deps: &EpisodeDeps) -> Vec<Feedback> {
+        self.advance_walk(false, deps)
     }
 
     /// Failed or empty fetch: begin/continue the fallback walk (03 §6.4). A
@@ -431,7 +357,7 @@ impl EpisodeSession {
             let Some(canonical) = self.canonical.clone() else {
                 return Vec::new();
             };
-            self.walk = Some(Walk::fallback(&deps.world(), canonical, Some(failed)));
+            self.walk = Some(Walk::auto(&deps.world(), canonical, Some(failed)));
         }
         self.advance_walk(true, deps)
     }
@@ -479,9 +405,6 @@ impl EpisodeSession {
             canonical.status.as_deref(),
             deps.unix_now,
         );
-        // Landed hop clears the walk (05 §10.3); no ping-pong of fresh walks.
-        self.walk = None;
-        self.walk_provider = None;
         self.refresh_meta(deps);
         self.land(provider.to_string(), episodes, deps);
         Vec::new()
@@ -572,8 +495,32 @@ impl EpisodeSession {
     /// wraps to episode one.
     fn land(&mut self, provider: String, episodes: Vec<String>, deps: &EpisodeDeps) {
         let Some(aid) = self.for_id else { return };
+        // The single walk retirement point (05 §10.3): a hop can land
+        // synchronously from the episode cache with no worker event, so any
+        // clear that lives only on the event path leaks an armed walk, which
+        // silently eats play fail-overs and holds prewarm off all session.
+        self.walk = None;
+        self.walk_provider = None;
         self.no_source = false;
         self.loading = None;
+        // Last-used is a confirmation write (03 §5.1, ROD-525): minted only
+        // here, only when it differs from the walk-order head, best-effort.
+        // Head resolution mirrors ordered(): an unregistered config name
+        // falls back to construction order, so the differs-from-head check
+        // never writes a redundant row for the true default.
+        let head = if deps.registry.by_name(deps.global_pref).is_some() {
+            deps.global_pref
+        } else {
+            deps.registry.primary().name()
+        };
+        let _ = deps
+            .store
+            .set_last_used(aid, (provider != head).then_some(provider.as_str()));
+        // A landing resolves the aim, except one still inside its window: a
+        // burst in flight is the user's live press, never the walk's to eat.
+        if !self.cycle_debounce.is_armed() {
+            self.cycle_aim = None;
+        }
         self.serving = Some(provider);
         self.watched = deps
             .store
@@ -602,15 +549,12 @@ impl EpisodeSession {
         self.episodes = episodes;
     }
 
-    /// Pin + availability snapshot for the meta rail (03 §6.1 step 2). Read
+    /// Availability snapshot for the meta rail (03 §6.1 step 2). Read
     /// failures degrade to unchecked; the rail dims, nothing wedges.
+    /// Last-used never surfaces here: it is an internal walk default
+    /// (DESIGN 5.3a), read from the store by the engine alone.
     fn refresh_meta(&mut self, deps: &EpisodeDeps) {
         let Some(aid) = self.for_id else { return };
-        // An armed window means `pin` is ahead of the store; a bind landing
-        // mid-window must not clobber the user's cycle with the stale row.
-        if !self.pin_debounce.is_armed() {
-            self.pin = deps.store.get_provider_pin(aid).ok().flatten();
-        }
         self.avail = deps
             .registry
             .iter()
@@ -624,92 +568,72 @@ impl EpisodeSession {
             .collect();
     }
 
-    /// `v` cycle (03 §5.1, DESIGN 6.1): unpinned, then each live registry
-    /// provider in construction order, then unpinned. Each press moves the
-    /// pin in memory and re-arms the settle window; the store write and any
-    /// flip walk wait for `maybe_commit_pin` (ROD-524), so cycling past a
-    /// provider never pays its fetch. Only a grid-less resolve blocks the
-    /// cycle; a flip in flight is cycled past freely and superseded at settle.
-    pub fn cycle_pin(&mut self, deps: &EpisodeDeps) -> Vec<Feedback> {
+    /// `v` walk (03 §5.2, DESIGN 6.1, ROD-525): advance the aim one provider
+    /// through the registry circle, wrapping past the end. Each press moves
+    /// the aim in memory and re-arms the settle window; the walk waits for
+    /// `maybe_commit_cycle`, so a burst pays no intermediate fetches. There
+    /// is no store write anywhere in the cycle: last-used is minted by the
+    /// landing. Only a grid-less resolve blocks the cycle; a walk in flight
+    /// is cycled past freely and superseded at settle.
+    pub fn cycle_provider(&mut self, deps: &EpisodeDeps) -> Vec<Feedback> {
         if self.for_id.is_none() {
-            return vec![Feedback::PinNothing];
+            return vec![Feedback::CycleNothing];
         }
         if self.serving.is_none() {
             return if self.loading.is_some() {
-                vec![Feedback::PinPending]
+                vec![Feedback::CyclePending]
             } else {
-                vec![Feedback::PinNothing]
+                vec![Feedback::CycleNothing]
             };
         }
         let order: Vec<String> = deps.registry.iter().map(|p| p.name().to_string()).collect();
-        let next = match self.pin.as_deref() {
-            None => order.first().cloned(),
-            Some(pin) => match order.iter().position(|n| n == pin) {
-                Some(i) => order.get(i + 1).cloned(),
-                // A retired pin name wraps straight to unpinned (05 §10.5).
-                None => None,
-            },
+        // Base: the live aim inside a burst, else the serving provider. A
+        // serving name outside the registry degrades to the circle head.
+        let base = self.cycle_aim.as_deref().or(self.serving.as_deref());
+        let ix = base.and_then(|b| order.iter().position(|n| n == b));
+        let next = match ix {
+            Some(i) => order[(i + 1) % order.len()].clone(),
+            None => order.first().cloned().unwrap_or_default(),
         };
-        self.pin_debounce.arm(deps.now, PIN_SETTLE);
-        match next {
-            Some(target) => {
-                self.pin = Some(target.clone());
-                vec![Feedback::PinSet { provider: target }]
-            }
-            None => {
-                self.pin = None;
-                vec![Feedback::PinCleared]
-            }
-        }
+        self.cycle_debounce.arm(deps.now, PIN_SETTLE);
+        self.cycle_aim = Some(next.clone());
+        vec![Feedback::Hop { provider: next }]
     }
 
-    /// Settle side of the `v` cycle, ticked from `App::on_tick`: one store
-    /// write and at most one flip walk per burst.
-    pub fn maybe_commit_pin(&mut self, deps: &EpisodeDeps) -> Vec<Feedback> {
-        if !self.pin_debounce.fire(deps.now) {
+    /// Settle side of the `v` walk, ticked from `App::on_tick`: at most one
+    /// manual walk per burst, started at the settled aim. The walk wraps the
+    /// circle on its own; a miss walks on (ROD-525).
+    pub fn maybe_commit_cycle(&mut self, deps: &EpisodeDeps) -> Vec<Feedback> {
+        if !self.cycle_debounce.fire(deps.now) {
             return Vec::new();
         }
-        let Some(aid) = self.for_id else {
-            return Vec::new();
-        };
-        if deps
-            .store
-            .set_provider_pin(aid, self.pin.as_deref())
-            .is_err()
-        {
-            // Re-arm: `fire` already disarmed, and a disarmed window drops the
-            // `refresh_meta` guard, so the failed edit would silently revert
-            // to the store row. Armed again, the next tick retries the write.
-            self.pin_debounce.arm(deps.now, PIN_SETTLE);
-            return vec![Feedback::PinSaveFailed {
-                clearing: self.pin.is_none(),
-            }];
-        }
-        let Some(target) = self.pin.clone() else {
-            // Cleared: the serving grid stands, never a re-route (05 §10.5).
-            self.drop_stale_walk();
+        // Clone, not take: the aim outlives the settle so a press during the
+        // walk it started advances PAST the hanging provider instead of
+        // re-aiming at it. The landing clears it.
+        let Some(target) = self.cycle_aim.clone() else {
             return Vec::new();
         };
         if self.serving.as_deref() == Some(target.as_str()) {
+            // Wrapped back onto the serving provider: nothing to walk; a
+            // stale walk from an earlier settle dies instead of landing a
+            // provider the user cycled past.
+            self.cycle_aim = None;
             self.drop_stale_walk();
             return Vec::new();
         }
         let Some(canonical) = self.canonical.clone() else {
             return Vec::new();
         };
-        // Path 3 (03 §4.1): single-provider walk on the target, probing
-        // through fresh absence. `target` comes from the live registry, which
-        // is the pin_flip precondition.
+        self.drop_stale_walk();
         self.remap_from = self
             .episodes
             .get(self.cursor)
             .map(|label| (label.clone(), self.cursor as u32 + 1));
-        self.walk_provider = Some(target.clone());
-        self.walk = Some(Walk::pin_flip(canonical, target));
+        self.walk = Some(Walk::manual(&deps.world(), canonical, &target));
         self.advance_walk(true, deps)
     }
 
-    /// A settle that needs no walk while an earlier flip is still in flight:
+    /// A settle that needs no walk while an earlier one is still in flight:
     /// letting it land would flip the grid to a provider the user already
     /// cycled past, so it dies here.
     fn drop_stale_walk(&mut self) {
@@ -722,29 +646,6 @@ impl EpisodeSession {
         self.loading = None;
         self.mint_pending = false;
         self.remap_from = None;
-    }
-
-    /// Commit a pending pin edit outside its settle window: the write
-    /// survives, the flip does not (the show or track it targeted is going
-    /// away). Runs before any reset that would drop the edit.
-    pub fn flush_pin_edit(&mut self, store: &Store) -> Vec<Feedback> {
-        if !self.pin_debounce.is_armed() {
-            return Vec::new();
-        }
-        let Some(aid) = self.for_id else {
-            self.pin_debounce.disarm();
-            return Vec::new();
-        };
-        if store.set_provider_pin(aid, self.pin.as_deref()).is_err() {
-            // Stay armed for the same reason as `maybe_commit_pin`: most
-            // callers reset right after and drop the edit anyway, but a
-            // disarmed window would let a future call site silently revert.
-            return vec![Feedback::PinSaveFailed {
-                clearing: self.pin.is_none(),
-            }];
-        }
-        self.pin_debounce.disarm();
-        Vec::new()
     }
 
     /// Play-fallback hop (03 §6.4): a failed play walks to a sibling exactly
@@ -765,7 +666,7 @@ impl EpisodeSession {
         let Some(canonical) = self.canonical.clone() else {
             return Vec::new();
         };
-        let mut walk = Walk::fallback(&deps.world(), canonical, None);
+        let mut walk = Walk::auto(&deps.world(), canonical, None);
         for provider in tried {
             walk.mark_tried(provider);
         }
@@ -844,10 +745,6 @@ impl EpisodeSession {
         self.serving.as_deref()
     }
 
-    pub fn pin(&self) -> Option<&str> {
-        self.pin.as_deref()
-    }
-
     pub fn avail(&self) -> &[(String, ProviderAvailability)] {
         &self.avail
     }
@@ -863,6 +760,18 @@ impl EpisodeSession {
     /// A fallback walk is armed (03 §6.4); the prewarm walk yields to it.
     pub fn walk_active(&self) -> bool {
         self.walk.is_some()
+    }
+
+    /// The selection cursor for the provider row (DESIGN 5.3a): the aim
+    /// while the `v` window is armed (each press must visibly move it), then
+    /// the provider the in-flight walk hop is probing. None at rest; the
+    /// landing's `▸` takes over.
+    pub fn probing(&self) -> Option<&str> {
+        if self.cycle_debounce.is_armed() {
+            return self.cycle_aim.as_deref();
+        }
+        self.loading.as_ref()?;
+        self.walk_provider.as_deref()
     }
 
     /// A background write changed availability for `anilist_id` (prewarm,
@@ -900,18 +809,31 @@ impl EpisodeSession {
     pub(crate) fn seeded(
         for_id: i64,
         serving: Option<&str>,
-        pin: Option<&str>,
         avail: Vec<(String, ProviderAvailability)>,
         episodes: Vec<String>,
     ) -> EpisodeSession {
         EpisodeSession {
             for_id: Some(for_id),
             serving: serving.map(str::to_string),
-            pin: pin.map(str::to_string),
             avail,
             episodes,
             ..EpisodeSession::default()
         }
+    }
+
+    /// Render-test seed for the mid-walk state: a hop in flight on `provider`.
+    pub(crate) fn with_probing(mut self, provider: &str) -> EpisodeSession {
+        self.walk_provider = Some(provider.to_string());
+        self.loading = Some(AsyncStart::new(Instant::now()));
+        self
+    }
+
+    /// Render-test seed for the armed-window state: the aim on `provider`,
+    /// no walk fired yet.
+    pub(crate) fn with_aim(mut self, provider: &str) -> EpisodeSession {
+        self.cycle_aim = Some(provider.to_string());
+        self.cycle_debounce.arm(Instant::now(), PIN_SETTLE);
+        self
     }
 }
 
@@ -1339,61 +1261,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_stamp_forces_pref_and_stamps_before_fetch() {
-        let mut rig = Rig::new(vec![
-            StubProvider::new("megaplay").with_key("505"),
-            StubProvider::new("senshi")
-                .with_key("505")
-                .with_episodes(eps(&["1"])),
-        ]);
-        let c = canonical(5);
-        rig.world.store.set_route_pref(&c, "megaplay").unwrap();
-        rig.session.engage(&c, &rig.world.deps("senshi"));
-        // The write-then-fire ordering contract: the stamp is on disk while
-        // the forced fetch is still in flight.
-        assert_eq!(
-            rig.world.store.get_route_pref(5).unwrap().as_deref(),
-            Some("senshi"),
-            "stamp lands BEFORE the fetch (03 5.3)"
-        );
-        rig.world.settle(&mut rig.session, "senshi");
-        assert_eq!(rig.session.serving(), Some("senshi"));
-    }
-
-    #[test]
-    fn forced_preferred_miss_continues_bindings_first_k2() {
-        // Pref senshi is search-only and misses; a binding exists on
-        // allanime. The K-2 continuation must land it, with the distinct
-        // no-match copy and no pin-kept path.
-        let mut rig = Rig::new(vec![
-            StubProvider::new("megaplay"),
-            StubProvider::new("senshi").with_search(Ok(Vec::new())),
-            StubProvider::new("allanime").with_episodes(eps(&["1", "2", "3"])),
-        ]);
-        let c = canonical(5);
-        rig.world
-            .store
-            .bind_provider(&c, "allanime", "aa-9", 100)
-            .unwrap();
-        rig.session.engage(&c, &rig.world.deps("senshi"));
-        let fb = rig.world.settle(&mut rig.session, "senshi");
-        assert!(
-            fb.contains(&Feedback::NoMatch {
-                provider: "senshi".into()
-            }),
-            "{fb:?}"
-        );
-        assert!(!fb.iter().any(|f| matches!(f, Feedback::PinKept { .. })));
-        assert_eq!(rig.session.serving(), Some("allanime"));
-        assert_eq!(rig.session.grid().len(), 3);
-        // Stamp stayed (already advanced); the second open must not re-force.
-        assert_eq!(
-            rig.world.store.get_route_pref(5).unwrap().as_deref(),
-            Some("senshi")
-        );
-    }
-
-    #[test]
     fn superseded_result_is_dropped_not_installed() {
         let mut rig = Rig::new(vec![
             StubProvider::new("megaplay")
@@ -1559,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn pin_cycle_sets_flips_and_clears() {
+    fn cycle_aims_walks_and_remembers_on_landing() {
         let mut rig = Rig::new(vec![
             StubProvider::new("megaplay")
                 .with_key("505")
@@ -1574,69 +1441,79 @@ mod tests {
         assert_eq!(rig.session.serving(), Some("megaplay"));
         rig.session.cursor_by(1);
 
-        // v #1: pins the serving provider in memory; nothing is written or
-        // fired until the window settles, then the write lands without a hop.
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
-        assert_eq!(
-            fb,
-            vec![Feedback::PinSet {
-                provider: "megaplay".into()
-            }]
-        );
-        assert_eq!(rig.session.pin(), Some("megaplay"), "rail is optimistic");
-        assert_eq!(
-            rig.world.store.get_provider_pin(5).unwrap(),
-            None,
-            "no write inside the window"
-        );
-        assert!(
-            rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty(),
-            "window not elapsed"
-        );
-        rig.world.now += PIN_SETTLE;
-        assert!(rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty());
-        assert_eq!(
-            rig.world.store.get_provider_pin(5).unwrap().as_deref(),
-            Some("megaplay")
-        );
-        assert!(rig.session.loading().is_none(), "no re-route fired");
-
-        // v #2: pins senshi; the settle re-routes through the one-provider
-        // flip and the landing keeps the cursor on the in-progress episode.
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
-        assert_eq!(
-            fb,
-            vec![Feedback::PinSet {
-                provider: "senshi".into()
-            }]
-        );
-        rig.world.now += PIN_SETTLE;
-        let fb = rig.session.maybe_commit_pin(&rig.world.deps(""));
+        // v: aims the next provider in the circle; nothing is written or
+        // fired until the window settles.
+        let fb = rig.session.cycle_provider(&rig.world.deps(""));
         assert_eq!(
             fb,
             vec![Feedback::Hop {
                 provider: "senshi".into()
             }]
         );
+        assert_eq!(
+            rig.session.probing(),
+            Some("senshi"),
+            "the cursor follows the aim inside the window"
+        );
+        assert_eq!(
+            rig.world.store.get_last_used(5).unwrap(),
+            None,
+            "no write inside the window"
+        );
+        assert!(
+            rig.session
+                .maybe_commit_cycle(&rig.world.deps(""))
+                .is_empty(),
+            "window not elapsed"
+        );
+        rig.world.now += PIN_SETTLE;
+        let fb = rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        assert!(
+            fb.is_empty(),
+            "manual hops are silent; the row carries them"
+        );
+        assert_eq!(
+            rig.session.probing(),
+            Some("senshi"),
+            "the in-flight hop lights the probing token"
+        );
         let fb = rig.world.settle(&mut rig.session, "");
         assert!(fb.is_empty());
         assert_eq!(rig.session.serving(), Some("senshi"));
-        assert_eq!(rig.session.cursor(), 1, "flip landing keeps the cursor");
+        assert_eq!(rig.session.probing(), None, "landing clears the probe");
+        assert_eq!(rig.session.cursor(), 1, "walk landing keeps the cursor");
         assert_eq!(rig.world.store.bindings_for(5).unwrap().len(), 2);
+        assert_eq!(
+            rig.world.store.get_last_used(5).unwrap().as_deref(),
+            Some("senshi"),
+            "the landing is the confirmation write"
+        );
 
-        // v #3: past the last provider wraps to unpinned; never re-routes.
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
-        assert_eq!(fb, vec![Feedback::PinCleared]);
+        // v again: wraps past the end of the circle back to megaplay; the
+        // landing matches the walk-order head, so the row clears.
+        let fb = rig.session.cycle_provider(&rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::Hop {
+                provider: "megaplay".into()
+            }]
+        );
         rig.world.now += PIN_SETTLE;
-        assert!(rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty());
-        assert_eq!(rig.world.store.get_provider_pin(5).unwrap(), None);
-        assert_eq!(rig.session.serving(), Some("senshi"));
+        rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
+        assert_eq!(
+            rig.world.store.get_last_used(5).unwrap(),
+            None,
+            "landing on the head clears the memory"
+        );
     }
 
-    /// ROD-524: a burst of presses is one write and one fetch on settle;
-    /// providers cycled past inside the window are never fetched.
+    /// ROD-524/525: a burst of presses is one walk on settle; providers
+    /// cycled past inside the window are never fetched, and nothing is
+    /// written until the landing.
     #[test]
-    fn pin_burst_commits_once_and_skips_intermediates() {
+    fn cycle_burst_walks_once_and_skips_intermediates() {
         let mut rig = Rig::new(vec![
             StubProvider::new("megaplay")
                 .with_key("505")
@@ -1651,46 +1528,49 @@ mod tests {
         rig.world.settle(&mut rig.session, "");
         assert_eq!(rig.session.serving(), Some("megaplay"));
 
-        // Three presses 100ms apart; each re-arms the window.
-        rig.session.cycle_pin(&rig.world.deps(""));
+        // Two presses 100ms apart: senshi, then anibd; each re-arms.
+        rig.session.cycle_provider(&rig.world.deps(""));
         rig.world.now += Duration::from_millis(100);
-        rig.session.cycle_pin(&rig.world.deps(""));
-        rig.world.now += Duration::from_millis(100);
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
+        let fb = rig.session.cycle_provider(&rig.world.deps(""));
         assert_eq!(
             fb,
-            vec![Feedback::PinSet {
+            vec![Feedback::Hop {
                 provider: "anibd".into()
             }]
         );
 
         // 200ms later the last press's window is still open.
         rig.world.now += Duration::from_millis(200);
-        assert!(rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty());
-        assert_eq!(rig.world.store.get_provider_pin(5).unwrap(), None);
+        assert!(
+            rig.session
+                .maybe_commit_cycle(&rig.world.deps(""))
+                .is_empty()
+        );
+        assert_eq!(rig.world.store.get_last_used(5).unwrap(), None);
 
         rig.world.now += Duration::from_millis(100);
-        let fb = rig.session.maybe_commit_pin(&rig.world.deps(""));
+        let fb = rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        assert!(fb.is_empty(), "manual hops are silent");
         assert_eq!(
-            fb,
-            vec![Feedback::Hop {
-                provider: "anibd".into()
-            }],
-            "one hop, straight to the final target"
-        );
-        assert_eq!(
-            rig.world.store.get_provider_pin(5).unwrap().as_deref(),
-            Some("anibd")
+            rig.session.probing(),
+            Some("anibd"),
+            "one walk, straight to the settled aim"
         );
         let fb = rig.world.settle(&mut rig.session, "");
         assert!(fb.is_empty(), "senshi was never touched");
         assert_eq!(rig.session.serving(), Some("anibd"));
+        assert_eq!(
+            rig.world.store.get_last_used(5).unwrap().as_deref(),
+            Some("anibd"),
+            "the landing writes the memory"
+        );
     }
 
-    /// ROD-524 core: a flip in flight never blocks the cycle, and a settle
-    /// that needs no walk kills the stale flip instead of letting it land.
+    /// ROD-524 core, ROD-525 shape: a walk in flight never blocks the
+    /// cycle, and a settle whose aim wrapped back to serving kills the stale
+    /// walk instead of letting it land.
     #[test]
-    fn pin_cycle_during_inflight_flip_supersedes() {
+    fn cycle_during_inflight_walk_supersedes() {
         let mut rig = Rig::new(vec![
             StubProvider::new("megaplay")
                 .with_key("505")
@@ -1704,21 +1584,29 @@ mod tests {
         rig.world.settle(&mut rig.session, "");
         assert_eq!(rig.session.serving(), Some("megaplay"));
 
-        // Pin megaplay, settle, then pin senshi and let its flip fire.
-        rig.session.cycle_pin(&rig.world.deps(""));
+        // Aim senshi and let its walk fire.
+        rig.session.cycle_provider(&rig.world.deps(""));
         rig.world.now += PIN_SETTLE;
-        rig.session.maybe_commit_pin(&rig.world.deps(""));
-        rig.session.cycle_pin(&rig.world.deps(""));
-        rig.world.now += PIN_SETTLE;
-        rig.session.maybe_commit_pin(&rig.world.deps(""));
-        assert!(rig.session.loading().is_some(), "senshi flip in flight");
+        rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        assert!(rig.session.loading().is_some(), "senshi walk in flight");
 
-        // A flip in flight never blocks the cycle.
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
-        assert_eq!(fb, vec![Feedback::PinCleared]);
+        // A walk in flight never blocks the cycle; the aim advances PAST
+        // the hanging provider and wraps to serving.
+        let fb = rig.session.cycle_provider(&rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::Hop {
+                provider: "megaplay".into()
+            }],
+            "the press advances from the aim, not from serving"
+        );
         rig.world.now += PIN_SETTLE;
-        assert!(rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty());
-        assert!(rig.session.loading().is_none(), "stale flip dropped");
+        assert!(
+            rig.session
+                .maybe_commit_cycle(&rig.world.deps(""))
+                .is_empty()
+        );
+        assert!(rig.session.loading().is_none(), "stale walk dropped");
         let fb = rig.world.settle(&mut rig.session, "");
         assert!(fb.is_empty(), "superseded landing is silent");
         assert_eq!(
@@ -1726,15 +1614,130 @@ mod tests {
             Some("megaplay"),
             "grid never flips to the provider the user cycled past"
         );
-        assert_eq!(rig.world.store.get_provider_pin(5).unwrap(), None);
+        assert_eq!(rig.world.store.get_last_used(5).unwrap(), None);
     }
 
-    /// ROD-524: `v` during a live play fail-over is accepted, and a settle
-    /// that re-pins the serving provider kills the recovery walk. The user's
-    /// explicit pin outranks the hunt: no stuck spinner, no toast from the
-    /// discarded walk.
+    /// ROD-525: a walk hop can land synchronously from the episode cache
+    /// with no worker event; the walk must retire at the landing. Leaked
+    /// armed, it silently eats every later play fail-over and holds prewarm
+    /// off for the rest of the session.
     #[test]
-    fn pin_to_serving_during_play_fail_over_supersedes_the_recovery() {
+    fn cache_hit_walk_landing_retires_the_walk() {
+        let mut rig = Rig::new(vec![
+            StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+            StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+        ]);
+        let c = canonical(5);
+        rig.world.store.add_to_library(&c, 50).unwrap();
+        // Both bound + fresh-cached: engage and the flip hop both land
+        // without a worker.
+        for p in ["megaplay", "senshi"] {
+            rig.world.store.bind_provider(&c, p, "505", 100).unwrap();
+            rig.world
+                .store
+                .set_episode_cache(5, p, Translation::Sub, &["1".into()], Some("FINISHED"), 100)
+                .unwrap();
+        }
+        rig.session.engage(&c, &rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
+
+        rig.session.cycle_provider(&rig.world.deps(""));
+        rig.world.now += PIN_SETTLE;
+        let fb = rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        assert!(fb.is_empty(), "manual hops are silent");
+        assert_eq!(rig.session.serving(), Some("senshi"), "landed from cache");
+        assert!(rig.session.loading().is_none());
+        assert!(
+            !rig.session.walk_active(),
+            "a synchronous landing retires the walk"
+        );
+    }
+
+    /// ROD-525 acceptance: a play failure on the serving provider always
+    /// answers, a hop while a sibling is reachable, DeadEnd when none is.
+    /// Never silence. Original repro: the flip landed from cache, the leaked
+    /// walk swallowed the fail-over.
+    #[test]
+    fn play_fail_over_after_cache_landing_walks_never_silent() {
+        let mut rig = Rig::new(vec![
+            StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+            StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+        ]);
+        let c = canonical(5);
+        rig.world.store.add_to_library(&c, 50).unwrap();
+        // Both bound + fresh-cached: engage and the flip hop both land
+        // without a worker.
+        for p in ["megaplay", "senshi"] {
+            rig.world.store.bind_provider(&c, p, "505", 100).unwrap();
+            rig.world
+                .store
+                .set_episode_cache(5, p, Translation::Sub, &["1".into()], Some("FINISHED"), 100)
+                .unwrap();
+        }
+        rig.session.engage(&c, &rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        rig.session.cycle_provider(&rig.world.deps(""));
+        rig.world.now += PIN_SETTLE;
+        rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        assert_eq!(rig.session.serving(), Some("senshi"));
+
+        // senshi's play failed; the fail-over must hop to megaplay, and the
+        // hop lands synchronously off megaplay's own cached grid.
+        let fb =
+            rig.session
+                .play_fail_over(&["senshi".into()], ("1".into(), 1), &rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::Hop {
+                provider: "megaplay".into()
+            }],
+            "the fail-over answers, never silence"
+        );
+        rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
+        assert!(!rig.session.walk_active());
+
+        // With the sibling freshly absent instead, the answer is DeadEnd.
+        let mut dead = Rig::new(vec![
+            StubProvider::new("megaplay").with_key("505"),
+            StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(eps(&["1"])),
+        ]);
+        let c = canonical(6);
+        dead.world.store.add_to_library(&c, 50).unwrap();
+        dead.world
+            .store
+            .mark_provider_absent(&c, "megaplay", 900)
+            .unwrap();
+        dead.session.engage(&c, &dead.world.deps(""));
+        dead.world.settle(&mut dead.session, "");
+        assert_eq!(dead.session.serving(), Some("senshi"));
+        let fb =
+            dead.session
+                .play_fail_over(&["senshi".into()], ("1".into(), 1), &dead.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::DeadEnd],
+            "an exhausted fail-over says so, never an empty vec"
+        );
+    }
+
+    /// ROD-524/525: `v` during a live play fail-over is accepted, and a
+    /// settle whose aim wrapped back to serving kills the recovery walk: the
+    /// user's explicit choice outranks the hunt, no stuck spinner, no toast
+    /// from the discarded walk.
+    #[test]
+    fn cycle_to_serving_during_play_fail_over_supersedes_the_recovery() {
         let mut rig = Rig::new(vec![
             StubProvider::new("megaplay")
                 .with_key("505")
@@ -1759,30 +1762,33 @@ mod tests {
         );
         assert!(rig.session.loading().is_some(), "recovery fetch in flight");
 
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
+        // Two presses wrap the aim back onto serving; the settle kills the
+        // recovery instead of walking.
+        rig.session.cycle_provider(&rig.world.deps(""));
+        let fb = rig.session.cycle_provider(&rig.world.deps(""));
         assert_eq!(
             fb,
-            vec![Feedback::PinSet {
+            vec![Feedback::Hop {
                 provider: "megaplay".into()
             }]
         );
         rig.world.now += PIN_SETTLE;
-        assert!(rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty());
+        assert!(
+            rig.session
+                .maybe_commit_cycle(&rig.world.deps(""))
+                .is_empty()
+        );
         assert!(rig.session.loading().is_none(), "no stuck spinner");
         let fb = rig.world.settle(&mut rig.session, "");
         assert!(fb.is_empty(), "the discarded walk lands silently");
         assert_eq!(rig.session.serving(), Some("megaplay"));
-        assert_eq!(
-            rig.world.store.get_provider_pin(5).unwrap().as_deref(),
-            Some("megaplay")
-        );
     }
 
-    /// ROD-524: an earlier flip landing inside a newer window refreshes meta
-    /// from the store; that read must not clobber the uncommitted edit, or
-    /// the settle writes the stale row back and the user's press vanishes.
+    /// ROD-524/525: an earlier walk landing inside a newer window must not
+    /// eat the live aim; the burst is the user's press, and its settle still
+    /// fires.
     #[test]
-    fn bind_landing_mid_window_never_clobbers_the_edit() {
+    fn landing_mid_window_never_eats_the_live_aim() {
         let mut rig = Rig::new(vec![
             StubProvider::new("megaplay")
                 .with_key("505")
@@ -1794,35 +1800,37 @@ mod tests {
         let c = canonical(5);
         rig.session.engage(&c, &rig.world.deps(""));
         rig.world.settle(&mut rig.session, "");
-        rig.session.cycle_pin(&rig.world.deps(""));
-        rig.world.now += PIN_SETTLE;
-        rig.session.maybe_commit_pin(&rig.world.deps(""));
-        rig.session.cycle_pin(&rig.world.deps(""));
-        rig.world.now += PIN_SETTLE;
-        rig.session.maybe_commit_pin(&rig.world.deps(""));
+        assert_eq!(rig.session.serving(), Some("megaplay"));
 
-        // Third press opens a new window, then the senshi flip lands inside
-        // it: its token is still current, so the grid flips and the bind
-        // write refreshes meta.
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
-        assert_eq!(fb, vec![Feedback::PinCleared]);
+        // Aim senshi, let the walk fire, then press again (wraps to
+        // megaplay) while the senshi fetch is still in flight.
+        rig.session.cycle_provider(&rig.world.deps(""));
+        rig.world.now += PIN_SETTLE;
+        rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        rig.session.cycle_provider(&rig.world.deps(""));
+
+        // The senshi landing arrives inside the new window: current token,
+        // grid flips, but the armed aim survives.
         rig.world.settle(&mut rig.session, "");
         assert_eq!(rig.session.serving(), Some("senshi"));
-        assert_eq!(rig.session.pin(), None, "the edit survives the landing");
-
-        rig.world.now += PIN_SETTLE;
-        assert!(rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty());
         assert_eq!(
-            rig.world.store.get_provider_pin(5).unwrap(),
-            None,
-            "the settle writes the edit, not the stale store row"
+            rig.session.probing(),
+            Some("megaplay"),
+            "the landing resolves its own walk, never the live press"
         );
+
+        // The settle then honors the press: back to megaplay off its cache.
+        rig.world.now += PIN_SETTLE;
+        rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
     }
 
-    /// ROD-524: leaving the show inside the window keeps the chosen pin but
-    /// never pays a fetch for a show the user already left.
+    /// ROD-525: leaving the show inside the window drops the aim whole:
+    /// nothing fired, nothing written, nothing remembered for a show the
+    /// user walked away from.
     #[test]
-    fn show_switch_flushes_the_pin_write_without_the_flip() {
+    fn show_switch_drops_the_cycle_aim() {
         let mut rig = Rig::new(vec![
             StubProvider::new("megaplay")
                 .with_key("505")
@@ -1837,124 +1845,49 @@ mod tests {
         rig.world.settle(&mut rig.session, "");
         assert_eq!(rig.session.serving(), Some("megaplay"));
 
-        // v v: pin senshi in memory, then open another show mid-window.
-        rig.session.cycle_pin(&rig.world.deps(""));
-        rig.session.cycle_pin(&rig.world.deps(""));
-        assert_eq!(rig.session.pin(), Some("senshi"));
+        rig.session.cycle_provider(&rig.world.deps(""));
+        assert_eq!(rig.session.probing(), Some("senshi"));
         rig.session.engage(&canonical(6), &rig.world.deps(""));
-        assert_eq!(
-            rig.world.store.get_provider_pin(5).unwrap().as_deref(),
-            Some("senshi"),
-            "the edit survives the switch"
-        );
         rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"), "show 6 resolves");
         assert_eq!(
-            rig.session.serving(),
-            Some("megaplay"),
-            "show 6 resolves normally; no senshi flip fired for show 5"
+            rig.world.store.get_last_used(5).unwrap(),
+            None,
+            "the abandoned aim never wrote"
         );
         rig.world.now += PIN_SETTLE;
         assert!(
-            rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty(),
-            "the flushed window never fires again"
+            rig.session
+                .maybe_commit_cycle(&rig.world.deps(""))
+                .is_empty(),
+            "the dropped window never fires"
         );
+        assert!(!rig.session.walk_active());
     }
 
     #[test]
-    fn pin_flip_miss_keeps_pin_and_grid() {
-        // Pre-pinned megaplay; the cycle moves to senshi, which has no key
-        // and a failing search. The miss keeps the senshi pin AND the
-        // megaplay grid.
-        let mut rig = Rig::new(vec![
-            StubProvider::new("megaplay")
-                .with_key("505")
-                .with_episodes(eps(&["1"])),
-            StubProvider::new("senshi"),
-        ]);
-        let c = canonical(5);
-        rig.world.store.add_to_library(&c, 50).unwrap();
-        rig.world
-            .store
-            .set_provider_pin(5, Some("megaplay"))
-            .unwrap();
-        rig.session.engage(&c, &rig.world.deps(""));
-        rig.world.settle(&mut rig.session, "");
-        assert_eq!(rig.session.serving(), Some("megaplay"));
-
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
-        assert_eq!(
-            fb,
-            vec![Feedback::PinSet {
-                provider: "senshi".into()
-            }]
-        );
-        rig.world.now += PIN_SETTLE;
-        let fb = rig.session.maybe_commit_pin(&rig.world.deps(""));
-        assert_eq!(
-            fb,
-            vec![Feedback::Hop {
-                provider: "senshi".into()
-            }]
-        );
-        let fb = rig.world.settle(&mut rig.session, "");
-        assert!(
-            fb.contains(&Feedback::PinKept {
-                provider: "senshi".into()
-            }),
-            "{fb:?}"
-        );
-        assert_eq!(
-            rig.world.store.get_provider_pin(5).unwrap().as_deref(),
-            Some("senshi"),
-            "the miss keeps the pin (03 5.1)"
-        );
-        assert_eq!(rig.session.serving(), Some("megaplay"), "grid survives");
-        assert_eq!(rig.session.grid(), ["1"]);
-    }
-
-    #[test]
-    fn retired_pin_wraps_straight_to_unpinned() {
-        let mut rig = Rig::new(vec![
-            StubProvider::new("megaplay")
-                .with_key("505")
-                .with_episodes(eps(&["1"])),
-        ]);
-        let c = canonical(5);
-        rig.world.store.add_to_library(&c, 50).unwrap();
-        rig.world.store.set_provider_pin(5, Some("gogo")).unwrap();
-        rig.session.engage(&c, &rig.world.deps(""));
-        rig.world.settle(&mut rig.session, "");
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
-        assert_eq!(fb, vec![Feedback::PinCleared]);
-        rig.world.now += PIN_SETTLE;
-        assert!(rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty());
-        assert_eq!(rig.world.store.get_provider_pin(5).unwrap(), None);
-        assert!(rig.session.loading().is_none(), "no re-route on a retire");
-    }
-
-    #[test]
-    fn pin_gates_on_source_and_inflight() {
-        // Nothing engaged: nothing to pin.
+    fn cycle_gates_on_source_and_first_resolve() {
+        // Nothing engaged: nothing to walk from.
         let mut rig = Rig::new(vec![StubProvider::new("megaplay")]);
-        let fb = rig.session.cycle_pin(&rig.world.deps(""));
-        assert_eq!(fb, vec![Feedback::PinNothing]);
+        let fb = rig.session.cycle_provider(&rig.world.deps(""));
+        assert_eq!(fb, vec![Feedback::CycleNothing]);
 
-        // Fetch in flight: still resolving.
+        // First resolve in flight: still resolving.
         let mut busy = Rig::new(vec![StubProvider::new("megaplay").with_key("505")]);
         busy.session.engage(&canonical(5), &busy.world.deps(""));
         assert!(busy.session.loading().is_some());
-        let fb = busy.session.cycle_pin(&busy.world.deps(""));
-        assert_eq!(fb, vec![Feedback::PinPending]);
+        let fb = busy.session.cycle_provider(&busy.world.deps(""));
+        assert_eq!(fb, vec![Feedback::CyclePending]);
         busy.world.settle(&mut busy.session, "");
 
-        // Exhausted no-source state: nothing to pin either.
+        // Exhausted no-source state: nothing to walk from either.
         assert!(busy.session.no_source());
-        let fb = busy.session.cycle_pin(&busy.world.deps(""));
-        assert_eq!(fb, vec![Feedback::PinNothing]);
+        let fb = busy.session.cycle_provider(&busy.world.deps(""));
+        assert_eq!(fb, vec![Feedback::CycleNothing]);
     }
 
     #[test]
-    fn engage_refreshes_pin_and_availability_for_the_rail() {
+    fn engage_refreshes_last_used_and_availability_for_the_rail() {
         let mut rig = Rig::new(vec![
             StubProvider::new("megaplay")
                 .with_key("505")
@@ -1963,9 +1896,8 @@ mod tests {
         ]);
         let c = canonical(5);
         rig.world.store.add_to_library(&c, 50).unwrap();
-        rig.world.store.set_provider_pin(5, Some("senshi")).unwrap();
+        rig.world.store.set_last_used(5, Some("senshi")).unwrap();
         rig.session.engage(&c, &rig.world.deps(""));
-        assert_eq!(rig.session.pin(), Some("senshi"));
         assert_eq!(
             rig.session.avail(),
             [
@@ -1974,11 +1906,14 @@ mod tests {
             ]
         );
         rig.world.settle(&mut rig.session, "");
-        // The landing minted the megaplay binding; availability follows.
+        // senshi cannot answer (no key, no search hit), the walk lands
+        // megaplay, and the landing REWRITES the memory: megaplay is the
+        // walk-order head, so the row clears (ROD-525 confirmation write).
         assert_eq!(
             rig.session.avail()[0],
             ("megaplay".to_string(), ProviderAvailability::Bound)
         );
+        assert_eq!(rig.world.store.get_last_used(5).unwrap(), None);
     }
 
     #[test]

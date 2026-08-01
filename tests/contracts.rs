@@ -216,8 +216,9 @@ const CONTRACTS: &[Contract] = &[
     ),
     c(
         "10.1",
-        "history open fetches on the owning provider; pin opens only its own binding",
-        Seeded("resolve::history_pin_opens_only_its_own_binding"),
+        "history opens run the one canonical path (ROD-525: the Path 2 pin \
+         restriction was never wired; the false-green cite is retired)",
+        Seeded("resolve::classify_is_tier_major_binding_beats_earlier_key"),
     ),
     c(
         "10.1",
@@ -226,20 +227,13 @@ const CONTRACTS: &[Contract] = &[
     ),
     c(
         "10.2",
-        "unpinned open re-routes off stale binding to preferred (ROD-398)",
-        Seeded("resolve::route_stale_forces_once_and_stamps_before_fetch"),
-    ),
-    c(
-        "10.2",
-        "settled under pref opens the binding directly, no restamp loop",
-        Seeded("resolve::route_settled_opens_binding_without_restamp"),
+        "last-used leads the effective order; landing is the only write (ROD-525)",
+        Seeded("tui::episodes::cycle_aims_walks_and_remembers_on_landing"),
     ),
     c(
         "10.3",
         "failed fetch hops provider-major: binding, absence, key, then search",
-        Seeded(
-            "resolve::fallback_walk_is_provider_major_binding_then_absence_then_key_then_search",
-        ),
+        Seeded("resolve::auto_walk_is_provider_major_binding_then_absence_then_key_then_search"),
     ),
     c(
         "10.3",
@@ -298,13 +292,13 @@ const CONTRACTS: &[Contract] = &[
     ),
     c(
         "10.5",
-        "v cycles unpinned -> each provider -> unpinned; pin keeps on miss",
-        Seeded("resolve::pin_flip_probes_through_absence_and_keeps_pin_on_miss"),
+        "v walks the circle from the aim, first hop probes absence, miss walks on",
+        Seeded("resolve::manual_walk_probes_absence_on_first_hop_only"),
     ),
     c(
         "10.5",
-        "v flip keeps cursor on the in-progress episode (R-9); retired pin unpins",
-        Seeded("tui::episodes::pin_cycle_sets_flips_and_clears"),
+        "v walk landing keeps the cursor on the in-progress episode (R-9)",
+        Seeded("tui::episodes::cycle_aims_walks_and_remembers_on_landing"),
     ),
     c(
         "10.6",
@@ -549,20 +543,20 @@ const LEDGER: &[BugCheck] = &[
     ),
     b(
         "K-2",
-        "FIX-IN-RUST: search-only preferred miss falls back, no blank dead-end",
-        Seeded("resolve::forced_preferred_miss_triggers_k2_continuation_not_dead_end"),
+        "moot since ROD-525: no forced-preferred probe exists to miss; the walk \
+         is the only open path and dead-ends only on a full circle",
+        Seeded("tui::episodes::play_fail_over_after_cache_landing_walks_never_silent"),
     ),
     b(
         "R-1",
         "CLONE: preferred/pin/fallback/empty/demote matrix",
-        Seeded(
-            "resolve::fallback_walk_is_provider_major_binding_then_absence_then_key_then_search",
-        ),
+        Seeded("resolve::auto_walk_is_provider_major_binding_then_absence_then_key_then_search"),
     ),
     b(
         "R-2",
-        "CLONE: manual flip to empty keeps pin, falls back, names the miss",
-        Seeded("tui::episodes::pin_flip_miss_keeps_pin_and_grid"),
+        "manual walk onto an empty provider walks on; the circle never strands \
+         the grid (ROD-525 rewrite of the pin-kept clone)",
+        Seeded("tui::app::v_onto_a_dead_provider_walks_on"),
     ),
     b(
         "R-3",
@@ -596,8 +590,8 @@ const LEDGER: &[BugCheck] = &[
     ),
     b(
         "R-9",
-        "CLONE: provider flip keeps the in-progress episode cursor",
-        Seeded("tui::app::v_cycles_the_pin_with_toasts_and_flip"),
+        "CLONE: provider walk keeps the in-progress episode cursor",
+        Seeded("tui::app::v_walks_the_provider_circle_with_toasts"),
     ),
     b(
         "R-10",
