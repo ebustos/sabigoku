@@ -919,11 +919,10 @@ fn meta_line(fields: &[MetaField], palette: &Palette) -> Line<'static> {
 /// segment: the pin takes `fg` + bold on ANY marker, serving takes `fg`,
 /// everything else stays `fg2`.
 ///
-/// The pin lift is deliberately ungated (ROD-524 ratification, replacing the
-/// confirmed-marker gate): the highlight IS the user's selection, and PinKept
-/// or a transient miss parks the pin on `?`/`-` tokens, where a gate made the
-/// selection look like it snapped back to the serving provider. The marker
-/// still carries availability; bold never claims it.
+/// Do not re-add a marker gate on the pin lift: PinKept and transient misses
+/// make pin-on-unconfirmed the ordinary state, and a gated pin reads as the
+/// app dropping the selection (§5.3a, ROD-524). The marker carries
+/// availability; bold never claims it.
 fn provider_line(session: &EpisodeSession, palette: &Palette) -> Option<Line<'static>> {
     let (tokens, dim) = provider_value(session)?;
     let mut spans: Vec<Span<'static>> = Vec::new();

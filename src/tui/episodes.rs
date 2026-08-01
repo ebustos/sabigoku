@@ -677,6 +677,10 @@ impl EpisodeSession {
             .set_provider_pin(aid, self.pin.as_deref())
             .is_err()
         {
+            // Re-arm: `fire` already disarmed, and a disarmed window drops the
+            // `refresh_meta` guard, so the failed edit would silently revert
+            // to the store row. Armed again, the next tick retries the write.
+            self.pin_debounce.arm(deps.now, PIN_SETTLE);
             return vec![Feedback::PinSaveFailed {
                 clearing: self.pin.is_none(),
             }];
@@ -727,15 +731,19 @@ impl EpisodeSession {
         if !self.pin_debounce.is_armed() {
             return Vec::new();
         }
-        self.pin_debounce.disarm();
         let Some(aid) = self.for_id else {
+            self.pin_debounce.disarm();
             return Vec::new();
         };
         if store.set_provider_pin(aid, self.pin.as_deref()).is_err() {
+            // Stay armed for the same reason as `maybe_commit_pin`: most
+            // callers reset right after and drop the edit anyway, but a
+            // disarmed window would let a future call site silently revert.
             return vec![Feedback::PinSaveFailed {
                 clearing: self.pin.is_none(),
             }];
         }
+        self.pin_debounce.disarm();
         Vec::new()
     }
 
@@ -1705,7 +1713,7 @@ mod tests {
         rig.session.maybe_commit_pin(&rig.world.deps(""));
         assert!(rig.session.loading().is_some(), "senshi flip in flight");
 
-        // The old guard returned PinPending here; the cycle must run.
+        // A flip in flight never blocks the cycle.
         let fb = rig.session.cycle_pin(&rig.world.deps(""));
         assert_eq!(fb, vec![Feedback::PinCleared]);
         rig.world.now += PIN_SETTLE;
@@ -1719,6 +1727,55 @@ mod tests {
             "grid never flips to the provider the user cycled past"
         );
         assert_eq!(rig.world.store.get_provider_pin(5).unwrap(), None);
+    }
+
+    /// ROD-524: `v` during a live play fail-over is accepted, and a settle
+    /// that re-pins the serving provider kills the recovery walk. The user's
+    /// explicit pin outranks the hunt: no stuck spinner, no toast from the
+    /// discarded walk.
+    #[test]
+    fn pin_to_serving_during_play_fail_over_supersedes_the_recovery() {
+        let mut rig = Rig::new(vec![
+            StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(eps(&["1", "2"])),
+            StubProvider::new("senshi")
+                .with_key("505")
+                .with_episodes(eps(&["1", "2"])),
+        ]);
+        let c = canonical(5);
+        rig.session.engage(&c, &rig.world.deps(""));
+        rig.world.settle(&mut rig.session, "");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
+
+        let fb =
+            rig.session
+                .play_fail_over(&["megaplay".into()], ("1".into(), 1), &rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::Hop {
+                provider: "senshi".into()
+            }]
+        );
+        assert!(rig.session.loading().is_some(), "recovery fetch in flight");
+
+        let fb = rig.session.cycle_pin(&rig.world.deps(""));
+        assert_eq!(
+            fb,
+            vec![Feedback::PinSet {
+                provider: "megaplay".into()
+            }]
+        );
+        rig.world.now += PIN_SETTLE;
+        assert!(rig.session.maybe_commit_pin(&rig.world.deps("")).is_empty());
+        assert!(rig.session.loading().is_none(), "no stuck spinner");
+        let fb = rig.world.settle(&mut rig.session, "");
+        assert!(fb.is_empty(), "the discarded walk lands silently");
+        assert_eq!(rig.session.serving(), Some("megaplay"));
+        assert_eq!(
+            rig.world.store.get_provider_pin(5).unwrap().as_deref(),
+            Some("megaplay")
+        );
     }
 
     /// ROD-524: an earlier flip landing inside a newer window refreshes meta
