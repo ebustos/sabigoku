@@ -7,6 +7,7 @@
 pub mod allanime;
 pub mod anibd;
 pub mod anidbapp;
+pub mod anineko;
 pub mod hls;
 pub mod http;
 pub mod megaplay;
@@ -242,6 +243,7 @@ pub fn default_registry() -> Result<ProviderRegistry, ProviderError> {
         Box::new(senshi::Senshi::new()?),
         Box::new(anibd::AniBd::new()?),
         Box::new(anidbapp::AniDbApp::new()?),
+        Box::new(anineko::Anineko::new()?),
     ]))
 }
 
@@ -379,7 +381,7 @@ mod tests {
         let reg = default_registry().expect("offline construction");
         assert_eq!(
             names(&reg.iter().collect::<Vec<_>>()),
-            ["megaplay", "senshi", "anibd", "anidbapp"]
+            ["megaplay", "senshi", "anibd", "anidbapp", "anineko"]
         );
         assert!(
             !reg.primary().supports_search(),
