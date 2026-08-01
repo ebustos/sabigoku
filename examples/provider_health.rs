@@ -10,21 +10,12 @@
 //!
 //! Exit: 0 all healthy, 1 something degraded, 2 something down.
 //!
-//! Every grade here is allowed to say "I could not confirm this", and several
-//! do. A tool that guesses OK is worse than no tool: it is the thing that let
-//! a provider die unnoticed in the first place.
+//! Sequential on purpose: parallel probes against one host change what the
+//! host does. ~30s healthy, ~10min if everything blackholes.
 //!
-//! Worst-case wall clock is roughly 10 minutes (5 providers, 3 fixtures, 4
-//! network calls each, all blackholing to the transport's 10s deadline). A
-//! healthy full run is about 30 seconds. There is no concurrency on purpose;
-//! parallel probes against the same host change what the host does.
-//!
-//! `--dub` grades loosely, and how loosely depends on the provider. Where the
-//! episode listing is track-aware (allanime, anidbapp) a missing dub is an
-//! authoritative empty listing and reads NOT-STOCKED. Where the listing
-//! ignores translation (megaplay, senshi, anibd) the absence only surfaces at
-//! resolve and reads DEGRADED. Separating the two would mean matching on
-//! provider error text, which breaks the moment a site rewords.
+//! Under `--dub` a missing dub reads NOT-STOCKED on track-aware listings
+//! (allanime, anidbapp) and DEGRADED on the rest, which only find out at
+//! resolve. Telling those apart needs provider error text; not worth it.
 
 use std::fmt;
 use std::process::ExitCode;
@@ -37,12 +28,10 @@ use sabigoku::providers::{
     ProviderError, SearchHit, SearchOptions, StreamProvider, default_registry,
 };
 
-/// mpv's own UA (player.rs), so a reach probe that passes means the player's
-/// fetch would too. A provider-supplied UA on the link still wins.
+/// mpv's own UA (player.rs): a reach that passes here would pass in playback.
 const PLAYER_UA: &str = "Mozilla/5.0 (X11; Linux) Gecko";
 
-/// First bytes only; enough to prove the CDN serves us, small enough that a
-/// full run costs nothing.
+/// First bytes only; a full run should cost nothing.
 const REACH_RANGE: &str = "bytes=0-65535";
 
 struct Fixture {
@@ -53,8 +42,8 @@ struct Fixture {
     episodes: u32,
 }
 
-/// Three eras, all universally stocked. Plural on purpose: one fixture makes a
-/// delisting look like a provider death (ROD-521).
+/// Three eras, all universally stocked. Plural on purpose: with one fixture, a
+/// delisting reads as a provider death.
 const FIXTURES: &[Fixture] = &[
     Fixture {
         anilist_id: 154587,
@@ -88,14 +77,10 @@ impl Fixture {
     }
 }
 
-/// Declaration order is the per-fixture preference, and `min` across fixtures
-/// picks a provider's grade: one fixture reaching Ok proves the provider works,
-/// whatever the others did. Degraded beats NotStocked here because it carries
-/// more signal (bind and list both answered), not because it is milder.
-///
-/// Do NOT reuse this order to roll providers up into one headline. That
-/// question is "what is the worst thing on the board", which ranks the
-/// variants differently; `severity` owns it.
+/// Two orderings, deliberately different. This one ranks which fixture best
+/// represents a provider (`min` across fixtures), so Degraded outranks
+/// NotStocked: it proves bind and list answered. Never reuse it for the
+/// cross-provider rollup, which asks the opposite; `severity` owns that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Verdict {
     Ok,
@@ -116,7 +101,6 @@ impl Verdict {
         }
     }
 
-    /// How alarming, for the cross-provider rollup.
     fn severity(self) -> u8 {
         match self {
             Verdict::Ok => 0,
@@ -136,8 +120,7 @@ impl Verdict {
     }
 }
 
-/// One provider against one fixture: the grade plus the stage trail that
-/// produced it.
+/// One provider against one fixture.
 struct Probe {
     verdict: Verdict,
     stages: Vec<String>,
@@ -169,11 +152,9 @@ fn secs(at: Instant) -> String {
     format!("{:.2}s", at.elapsed().as_secs_f64())
 }
 
-/// Provider-controlled text (ids, episode labels, decode errors quoting a
-/// response body) reaches a terminal here. Same reasoning as `log_url` in
-/// providers/http.rs: a bare CR or an ANSI escape in a search-hit id can
-/// overwrite the line that would have shown a real failure, forging the report
-/// a human reads. Truncated because an id is not a payload.
+/// Every provider-controlled string reaching the terminal goes through here:
+/// a CR or an ANSI escape in an id overwrites the row that would have shown a
+/// real failure (`log_url` in providers/http.rs, same reasoning).
 fn safe(s: &str) -> String {
     let mut out = strip_controls(s.to_string());
     if out.chars().count() > 80 {
@@ -182,11 +163,9 @@ fn safe(s: &str) -> String {
     out
 }
 
-/// Prefer a hit the provider itself id-keyed to the fixture; fall back to the
-/// site's top result. The bool is whether the bind was id-verified, and it
-/// caps the whole probe: a search backend that degrades to answering every
-/// query with its top result would otherwise resolve, reach, and grade OK on
-/// an unrelated show, which is precisely the death this tool exists to catch.
+/// The bool is "id-verified", and it caps the probe at Degraded. A search that
+/// answers every query with its top result otherwise resolves an unrelated
+/// show and grades OK.
 fn pick_hit<'a>(hits: &'a [SearchHit], fx: &Fixture) -> (&'a SearchHit, bool) {
     let keyed = hits
         .iter()
@@ -197,13 +176,9 @@ fn pick_hit<'a>(hits: &'a [SearchHit], fx: &Fixture) -> (&'a SearchHit, bool) {
     }
 }
 
-/// Ranged GET with the link's own headers.
-///
-/// A 3xx is NOT graded reachable. The transport bans redirects so a provider
-/// URL cannot escape the fetchguard (03 §6.7), which leaves the destination
-/// unknown: mpv would follow it, and it is just as likely to be a working CDN
-/// as a bounce to an interstitial. Reporting "unverified" is the only truthful
-/// grade available without a header-returning seam in providers/http.rs.
+/// Ranged GET with the link's own headers. A 3xx is not reach: the transport
+/// bans redirects (03 §6.7) so the destination is unknown, and a load-shed
+/// bounce to an interstitial looks identical to a working CDN.
 fn reach(http: &HttpClient, link: &StreamLink) -> Result<String, String> {
     guard_fetch_url(&link.url).map_err(|e| format!("guard: {e}"))?;
     let ua = link.user_agent.as_deref().unwrap_or(PLAYER_UA);
@@ -229,21 +204,16 @@ fn reach(http: &HttpClient, link: &StreamLink) -> Result<String, String> {
     }
 }
 
-/// Status alone is not reach: an anti-bot wall serves its challenge as a 200,
-/// so anything that merely arrived would grade a corpse healthy.
-///
-/// Allowlist, not blocklist. Every provider resolves to an HLS playlist today,
-/// so a playlist carrying at least one real reference is the only shape this
-/// can affirm. Everything else is reported with its size and left ungraded
-/// rather than guessed at, which is also how a future non-HLS provider will
-/// announce itself instead of silently reading as broken.
+/// Anti-bot walls answer 200, so arrival proves nothing. Allowlist only: a
+/// playlist naming at least one reference. Keep it an allowlist when adding
+/// shapes; every blocklist here has been bypassed by a body nobody predicted.
 fn sniff(body: &[u8]) -> Result<String, String> {
     if body.is_empty() {
         return Err("empty body (2xx with no bytes)".into());
     }
     let head = String::from_utf8_lossy(&body[..body.len().min(4096)]);
-    // A BOM is not whitespace, so trim_start alone would let a byte-order-mark
-    // in front of a challenge page walk past every check below.
+    // trim_start does not eat a BOM; one in front of a challenge page was a
+    // free bypass of every check below.
     let text = head.trim_start_matches('\u{feff}').trim_start();
     if !text.starts_with("#EXTM3U") {
         return Err(format!(
@@ -251,8 +221,7 @@ fn sniff(body: &[u8]) -> Result<String, String> {
             body.len()
         ));
     }
-    // #EXTM3U with nothing under it is what a stub or a truncated error page
-    // looks like; a real playlist names a variant or a segment.
+    // The magic bytes are trivially forged; a real playlist names something.
     let refs = text
         .lines()
         .skip(1)
@@ -351,8 +320,8 @@ fn probe(provider: &dyn StreamProvider, fx: &Fixture, tt: Translation, http: &Ht
         }
     };
 
-    // The stage a contract test cannot cover: resolve can hand back a
-    // well-formed URL that the CDN refuses to serve.
+    // Resolve can hand back a well-formed URL the CDN refuses to serve, which
+    // is what a contract test sleeps through.
     let at = Instant::now();
     match reach(http, &link) {
         Err(e) => {
@@ -374,13 +343,9 @@ fn probe(provider: &dyn StreamProvider, fx: &Fixture, tt: Translation, http: &Ht
     }
 }
 
-/// A provider's grade is its best fixture: one success proves the provider
-/// works and the rest were stocking gaps.
-///
-/// The exception is a clean sweep of absence. The fixtures are chosen to be
-/// universally stocked, so all of them missing is not three delistings, it is
-/// a catalog or search endpoint answering "nothing" to everything, which reads
-/// far too calm as NOT-STOCKED.
+/// Best fixture wins: one success proves the provider, the rest were stocking
+/// gaps. Except a clean sweep of absence, which given universally-stocked
+/// fixtures is a catalog answering nothing rather than three delistings.
 fn grade(probes: Vec<Probe>) -> (Verdict, Option<String>) {
     let swept = probes.iter().all(|p| p.verdict == Verdict::NotStocked);
     if swept {
@@ -473,10 +438,9 @@ fn run() -> Result<Verdict, String> {
 }
 
 fn main() -> ExitCode {
-    // Opt-in only. The provider log sites (ROD-483) are no-ops until a logger
-    // is installed, so without this SABIGOKU_DEBUG does nothing; installing it
-    // unconditionally is worse, because the always-on transport warns
-    // interleave into the table and shred the report they are meant to explain.
+    // Log sites are no-ops until a logger installs, so SABIGOKU_DEBUG needs
+    // this. Keep it gated: unconditional, the always-on transport warns
+    // interleave into the table and shred the report.
     if sabigoku::logging::env_debug() {
         sabigoku::logging::init_stderr(true);
     }
@@ -492,9 +456,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Not reached by `cargo test` (examples need `--all-targets`), but these are
-/// the pure deciders behind every grade and both ROD-521 reviewers landed real
-/// bugs in them, so they get a net.
+/// Examples need `--all-targets` to run these; plain `cargo test` skips them.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,7 +477,6 @@ mod tests {
 
     #[test]
     fn sniff_rejects_a_challenge_page_hiding_behind_a_bom() {
-        // trim_start does not eat U+FEFF, so the BOM was a free bypass.
         let body = "\u{feff}<!DOCTYPE html><html>captcha</html>".as_bytes();
         assert!(sniff(body).is_err());
     }
@@ -527,7 +488,6 @@ mod tests {
 
     #[test]
     fn sniff_rejects_a_playlist_header_with_no_references() {
-        // Magic bytes are cheap to forge; a stub carries no variant or segment.
         assert!(sniff(b"#EXTM3U\n#EXT-X-VERSION:3\n").is_err());
     }
 
@@ -551,8 +511,6 @@ mod tests {
 
     #[test]
     fn pick_hit_flags_the_top_hit_fallback_as_unverified() {
-        // The flag is what stops a search that answers everything with its
-        // top result from grading OK on an unrelated show.
         let hits = vec![hit("whatever-was-first", None, None)];
         let (picked, keyed) = pick_hit(&hits, &FIXTURES[0]);
         assert_eq!(picked.provider_id, "whatever-was-first");
@@ -582,8 +540,6 @@ mod tests {
 
     #[test]
     fn rollup_ranks_a_real_failure_above_mere_absence() {
-        // The per-fixture Ord says the opposite on purpose; reusing it here
-        // would print "worst: NOT-STOCKED" while a provider was degraded.
         assert!(Verdict::Degraded.severity() > Verdict::NotStocked.severity());
         assert!(Verdict::Down.severity() > Verdict::Degraded.severity());
         assert!(Verdict::NotStocked.severity() > Verdict::Ok.severity());
