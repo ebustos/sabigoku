@@ -915,14 +915,14 @@ fn meta_line(fields: &[MetaField], palette: &Palette) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The dedicated provider row under the compact line (§5.3a). Pin and serving
-/// are per-token boosts on the luminance ladder, never a text segment: serving
-/// takes `fg`, pinned takes `fg` + bold, every other token stays `fg2`.
+/// The dedicated provider row under the compact line (§5.3a). Never a text
+/// segment: the pin takes `fg` + bold on ANY marker, serving takes `fg`,
+/// everything else stays `fg2`.
 ///
-/// The pin boost is gated on a confirmed marker (`▸` or `+`): a pin on an
-/// unchecked or absent provider gets no lift, so `?` can never visually
-/// outrank a `+`. The gate reads the derived marker, not the raw availability,
-/// so a provider serving off a still-unchecked entry promotes correctly.
+/// Do not re-add a marker gate on the pin lift: PinKept and transient misses
+/// make pin-on-unconfirmed the ordinary state, and a gated pin reads as the
+/// app dropping the selection (§5.3a, ROD-524). The marker carries
+/// availability; bold never claims it.
 fn provider_line(session: &EpisodeSession, palette: &Palette) -> Option<Line<'static>> {
     let (tokens, dim) = provider_value(session)?;
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -932,7 +932,7 @@ fn provider_line(session: &EpisodeSession, palette: &Palette) -> Option<Line<'st
         }
         let style = if dim {
             Style::new().fg(palette.fg3)
-        } else if token.pinned && matches!(token.marker, '▸' | '+') {
+        } else if token.pinned {
             Style::new().fg(palette.fg).add_modifier(Modifier::BOLD)
         } else if token.serving {
             Style::new().fg(palette.fg)
@@ -1494,11 +1494,14 @@ mod tests {
         assert!(provider_line(&EpisodeSession::default(), palette).is_none());
     }
 
+    /// ROD-524 ratification: the highlight IS the selection. A pin on an
+    /// unconfirmed provider (mid-cycle, PinKept, transient miss) takes the
+    /// full lift; a gate here made the selection appear to snap back to the
+    /// serving provider, which reads as the app overriding the user.
     #[test]
-    fn pin_boost_needs_a_confirmed_marker() {
+    fn pin_highlight_is_ungated_selection() {
         use crate::store::ProviderAvailability::{Absent, Bound, Unchecked};
         let palette = &crate::tui::theme::TERMINAL_GHOST;
-        // A pin on a still-unchecked provider must never outrank the bound one.
         let unchecked = EpisodeSession::seeded(
             1,
             None,
@@ -1508,11 +1511,12 @@ mod tests {
         );
         let line = provider_line(&unchecked, palette).unwrap();
         let pin = token_style(&line, "?senshi");
-        assert!(!is_bold(pin), "? never lifts");
-        assert_eq!(pin.fg, Some(palette.fg2));
+        assert!(is_bold(pin), "the selection is bold on ?");
+        assert_eq!(pin.fg, Some(palette.fg), "and takes the full lift");
         assert_eq!(token_style(&line, "+megaplay").fg, Some(palette.fg2));
 
-        // Same gate on a provider confirmed absent.
+        // Same on a provider confirmed absent: a kept pin stays the
+        // highlight; the `-` marker carries the availability verdict.
         let absent = EpisodeSession::seeded(
             1,
             None,
@@ -1520,10 +1524,9 @@ mod tests {
             vec![("senshi".into(), Absent)],
             vec!["1".into()],
         );
-        assert!(!is_bold(token_style(
-            &provider_line(&absent, palette).unwrap(),
-            "-senshi"
-        )));
+        let kept = token_style(&provider_line(&absent, palette).unwrap(), "-senshi");
+        assert!(is_bold(kept), "a kept pin on absent stays the highlight");
+        assert_eq!(kept.fg, Some(palette.fg));
 
         // Nothing known: the row dims whole and the gate leaves it flat.
         let bare = EpisodeSession::seeded(
@@ -1538,8 +1541,8 @@ mod tests {
         assert_eq!(token.fg, Some(palette.fg3));
         assert!(!is_bold(token), "the dim row admits no boost");
 
-        // Serving off a still-unchecked entry: the gate reads the derived
-        // marker, so `▸` promotes even though the availability says otherwise.
+        // Serving off a still-unchecked entry: the derived `▸` marker wins
+        // over the raw availability, so the token promotes.
         let racing = EpisodeSession::seeded(
             1,
             Some("megaplay"),
@@ -1551,7 +1554,7 @@ mod tests {
         assert_eq!(line_text(&line), "▸megaplay · [v]");
         let token = token_style(&line, "▸megaplay");
         assert_eq!(token.fg, Some(palette.fg), "serving is never the dim row");
-        assert!(is_bold(token), "a serving pin target is confirmed");
+        assert!(is_bold(token), "serving + pinned is one bold token");
 
         // A pin outside the registry renders nowhere at all.
         let retired = EpisodeSession::seeded(
