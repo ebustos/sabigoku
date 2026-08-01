@@ -29,6 +29,7 @@ use sabigoku::providers::http::{Accept, HttpClient, Method, Request};
 use sabigoku::providers::{
     ProviderError, SearchHit, SearchOptions, StreamProvider, default_registry, retired_registry,
 };
+use sabigoku::resolver;
 
 /// mpv's own UA (player.rs): a reach that passes here would pass in playback.
 const PLAYER_UA: &str = "Mozilla/5.0 (X11; Linux) Gecko";
@@ -40,6 +41,9 @@ struct Fixture {
     anilist_id: i64,
     mal_id: i64,
     title: &'static str,
+    /// Verbatim AniList `title.english`. The scorer reads every title form, so
+    /// omitting it makes a tier-C provider look worse here than in the app.
+    title_english: &'static str,
     /// `count_hint` for listing-less providers (03 §4.3).
     episodes: u32,
 }
@@ -51,18 +55,26 @@ const FIXTURES: &[Fixture] = &[
         anilist_id: 154587,
         mal_id: 52991,
         title: "Sousou no Frieren",
+        // U+2019, exactly as AniList serves it. Do NOT "fix" this to an ASCII
+        // apostrophe: sites spell it ASCII, normalize_title drops ASCII
+        // punctuation but passes U+2019 through, and the mismatch is why this
+        // fixture cannot bind on a title-matched provider (ROD-526). Straighten
+        // it here and the probe reports a match the app does not make.
+        title_english: "Frieren: Beyond Journey\u{2019}s End",
         episodes: 28,
     },
     Fixture {
         anilist_id: 1,
         mal_id: 1,
         title: "Cowboy Bebop",
+        title_english: "Cowboy Bebop",
         episodes: 26,
     },
     Fixture {
         anilist_id: 21,
         mal_id: 21,
         title: "One Piece",
+        title_english: "ONE PIECE",
         episodes: 1100,
     },
 ];
@@ -73,6 +85,7 @@ impl Fixture {
             anilist_id: self.anilist_id,
             mal_id: Some(self.mal_id),
             title_romaji: self.title.to_string(),
+            title_english: Some(self.title_english.to_string()),
             total_episodes: Some(self.episodes),
             ..Enrichment::default()
         }
@@ -143,8 +156,11 @@ impl fmt::Display for Probe {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:<12}", self.verdict.label())?;
         write!(f, "{}", self.stages.join("  "))?;
+        // Own line, indented past the title column: appended inline, a long
+        // detail pushes the row past the terminal and the stage list wraps
+        // mid-token, which is where a real failure stops being readable.
         if let Some(detail) = &self.detail {
-            write!(f, "  {detail}")?;
+            write!(f, "\n  {:<20} {:<12}{detail}", "", "")?;
         }
         Ok(())
     }
@@ -165,17 +181,22 @@ fn safe(s: &str) -> String {
     out
 }
 
-/// The bool is "id-verified", and it caps the probe at Degraded. A search that
-/// answers every query with its top result otherwise resolves an unrelated
-/// show and grades OK.
-fn pick_hit<'a>(hits: &'a [SearchHit], fx: &Fixture) -> (&'a SearchHit, bool) {
-    let keyed = hits
-        .iter()
-        .find(|h| h.anilist_id == Some(fx.anilist_id) || h.mal_id == Some(fx.mal_id));
-    match keyed {
-        Some(hit) => (hit, true),
-        None => (&hits[0], false),
+/// Bind exactly as the app binds (`workers::probe_candidate`): id match first,
+/// then the fuzzy scorer. `None` is a real answer, the walk would hop rather
+/// than bind, so the probe must not invent a binding the app would refuse.
+///
+/// Taking `hits[0]` instead would test a path production never runs. It also
+/// misgrades both ways: a provider that cannot id-key at all (anineko carries
+/// no ids by design) could never clear an id check, while a catalog answering
+/// every query with an unrelated top result would resolve it and grade OK.
+/// `best_provider_match` is the defense against the latter, and it is the same
+/// one the app relies on, so the probe should not hand-roll a weaker version.
+fn pick_hit<'a>(hits: &'a [SearchHit], fx: &Fixture) -> Option<(&'a SearchHit, bool)> {
+    let show = fx.enrichment();
+    if let Some(ix) = resolver::best_id_match(&show, hits) {
+        return Some((&hits[ix], true));
     }
+    resolver::best_provider_match(&show, hits).map(|ix| (&hits[ix], false))
 }
 
 /// Ranged GET with the link's own headers. A 3xx is not reach: the transport
@@ -240,10 +261,12 @@ fn probe(provider: &dyn StreamProvider, fx: &Fixture, tt: Translation, http: &Ht
     let show = fx.enrichment();
 
     let at = Instant::now();
-    let (id, verified) = match provider.canonical_key(&show) {
+    // How it bound rides the stage label; the verdict no longer forks on it,
+    // because the scorers already refuse what an id check was standing in for.
+    let id = match provider.canonical_key(&show) {
         Some(key) => {
             stages.push(format!("bind:canonical({}) {}", safe(&key), secs(at)));
-            (key, true)
+            key
         }
         None => {
             if !provider.supports_search() {
@@ -271,16 +294,32 @@ fn probe(provider: &dyn StreamProvider, fx: &Fixture, tt: Translation, http: &Ht
                     stages.push(format!("bind:search 0 hits {}", secs(at)));
                     return Probe::graded(Verdict::NotStocked, stages, None);
                 }
-                Ok(hits) => {
-                    let (hit, keyed) = pick_hit(&hits, fx);
-                    let how = if keyed { "keyed" } else { "top-hit" };
-                    stages.push(format!(
-                        "bind:search {how}({}) {}",
-                        safe(&hit.provider_id),
-                        secs(at)
-                    ));
-                    (hit.provider_id.clone(), keyed)
-                }
+                Ok(hits) => match pick_hit(&hits, fx) {
+                    // Hits came back and the scorers refused all of them. The
+                    // app would hop, so this is "not stocked under a name we
+                    // can match", not a failure to report against the site.
+                    None => {
+                        stages.push(format!(
+                            "bind:search {} hits, no match {}",
+                            hits.len(),
+                            secs(at)
+                        ));
+                        return Probe::graded(
+                            Verdict::NotStocked,
+                            stages,
+                            Some("search answered but nothing scored high enough to bind".into()),
+                        );
+                    }
+                    Some((hit, keyed)) => {
+                        let how = if keyed { "keyed" } else { "matched" };
+                        stages.push(format!(
+                            "bind:search {how}({}) {}",
+                            safe(&hit.provider_id),
+                            secs(at)
+                        ));
+                        hit.provider_id.clone()
+                    }
+                },
             }
         }
     };
@@ -329,14 +368,6 @@ fn probe(provider: &dyn StreamProvider, fx: &Fixture, tt: Translation, http: &Ht
         Err(e) => {
             stages.push(format!("reach {}", secs(at)));
             Probe::graded(Verdict::Degraded, stages, Some(format!("reach: {e}")))
-        }
-        Ok(note) if !verified => {
-            stages.push(format!("reach:{note} {}", secs(at)));
-            Probe::graded(
-                Verdict::Degraded,
-                stages,
-                Some("unverified bind: search never id-keyed this hit, the stream may be another show".into()),
-            )
         }
         Ok(note) => {
             stages.push(format!("reach:{note} {}", secs(at)));
