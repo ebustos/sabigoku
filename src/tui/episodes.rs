@@ -65,10 +65,6 @@ impl ResolveWorld for WorldView<'_> {
             .collect()
     }
 
-    fn registered(&self, provider: &str) -> bool {
-        self.registry.by_name(provider).is_some()
-    }
-
     fn binding(&self, anilist_id: i64, provider: &str) -> Option<String> {
         self.store
             .bindings_for(anilist_id)
@@ -509,10 +505,13 @@ impl EpisodeSession {
         self.loading = None;
         // Last-used is a confirmation write (03 §5.1, ROD-525): minted only
         // here, only when it differs from the walk-order head, best-effort.
-        let head = if deps.global_pref.is_empty() {
-            deps.registry.primary().name()
-        } else {
+        // Head resolution mirrors ordered(): an unregistered config name
+        // falls back to construction order, so the differs-from-head check
+        // never writes a redundant row for the true default.
+        let head = if deps.registry.by_name(deps.global_pref).is_some() {
             deps.global_pref
+        } else {
+            deps.registry.primary().name()
         };
         let _ = deps
             .store

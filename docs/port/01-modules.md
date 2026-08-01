@@ -87,7 +87,7 @@ this table is law:
 | Module | Responsibility | Deep doc |
 |---|---|---|
 | **domain** | Show, binding DTOs, ListStatus, Translation, Quality, EpisodeLabel, StreamLink, title helpers, after_play / is_still_airing | 02 §4 |
-| **store** | SQLite: `show`, `catalog_cache`, bindings, progress, pins/absences/routes, migrate, history queries | 02 |
+| **store** | SQLite: `show`, `catalog_cache`, bindings, progress, last-used/absences, migrate, history queries | 02 |
 | **source / providers** | `StreamProvider` trait, registry order, megaplay/senshi/allanime (+ http/hls helpers) | 03 |
 | **resolver** | Pure tier-B/C matchers (id + fuzzy) | 03 §4.2 |
 | **anilist** | GraphQL search, discover axes, enrich, list push/pull | 06 + DESIGN data reality |
@@ -97,7 +97,7 @@ this table is law:
 | **config / paths** | User prefs, preferred_provider, palette, mpv_path, DB path | 06 |
 | **player** | mpv spawn, IPC position, StreamLink flags | 03 §7 |
 | **aniskip** | Skip times → mpv script | 03 §9 |
-| **resolve (orch.)** | Tiers, pin/pref/route, fallback walk, prewarm fire, episode/play fire | 03, 05 §10 |
+| **resolve (orch.)** | Tiers, last-used-first effective order, the Manual/Auto walk, prewarm fire, episode/play fire | 03, 05 §10 |
 | **tui** | App state, input, render, workers, event loop | 04, 05, DESIGN |
 | **cover** | Fetch/decode pixels, caches | 04 §7.3–7.4 |
 | **update / updatecheck** | Release check / apply | 06 |
@@ -159,14 +159,13 @@ enter Discover → per-axis slot cache hit? else discoverFeedTask
     → Enter → same resolve path as Browse (anilist_id)
 ```
 
-### 4.4 Preferred re-route / fallback
+### 4.4 Open / fallback (ROD-525: one path, no forcing)
 
 ```
 open show (anilist_id)
-    → pin? → that binding
-    → else route stamp vs preferred (03 §5.3)
-    → else classifier + ordered(pref)
-on fail → FallbackWalk hop (bound → A → C) → demote only if resume-armed (05)
+    → classifier + ordered(last_used ?? global) (03 §4.1/§5.1)
+on fail → Auto walk hop (bound → A → C) → demote only if resume-armed (05)
+landing → writes provider_last_used (cleared on the walk-order head)
 ```
 
 ### 4.5 CLI sync (non-TUI)
@@ -189,7 +188,7 @@ sabigoku sync → open store → auth credentials
 | **resolver** pure; no network | Worker searches, then scores. zigoku's resolver imports `anilist` for its pure scoring helpers even though it never calls the network functions; in Rust either hoist the scorer into a shared module or consciously accept the HTTP-capable dep (M1 decision) |
 | **tui/render** should not write store | Draw pure (04); mutations in tick/handlers |
 | **anilist** is the only user-facing catalog client | Providers do not power Discover/Browse search |
-| Enrichment upserts never touch pins/absences/routes | 02/03 |
+| Enrichment upserts never touch last-used/absences | 02/03 |
 
 ---
 

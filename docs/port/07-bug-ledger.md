@@ -52,7 +52,7 @@ this chapter is the **disposition index**.
 | ID | Symptom | Disposition | Sabigoku plan |
 |---|---|---|---|
 | K-1 | Resume marker one episode behind after **source switch** when labels disagree | `OPEN` (deferred UX) | **02 L1:** string equality for progress; no auto-remap in M1, so the limitation **ships**. Human-in-the-loop repair UX = **future ticket**. (Round-1 relabel: the old `FIX-IN-RUST` tag implied an M1 fix that is not scoped) |
-| K-2 | First open under **search-only preferred** can show **empty grid** instead of falling back to an existing binding | `FIX-IN-RUST` | **03 §5.3** "after a forced-preferred miss": continue the walk / land on an existing binding; no blank dead-end. Also split the miss toast: zigoku reuses the pin-kept copy for this pinless miss |
+| K-2 | First open under **search-only preferred** can show **empty grid** instead of falling back to an existing binding | `FIX-IN-RUST`; moot since ROD-525 (mechanism retired) | **03 §5.3** "after a forced-preferred miss": continue the walk / land on an existing binding; no blank dead-end. Also split the miss toast: zigoku reuses the pin-kept copy for this pinless miss |
 
 ---
 
@@ -60,8 +60,8 @@ this chapter is the **disposition index**.
 
 | ID | Symptom (old bug) | Disposition | Notes |
 |---|---|---|---|
-| R-1 | Preferred re-route / pin / fallback / empty listing / demote contracts | `CLONE` | Full matrix **03** + **05 §10** (ROD-343–357, 368, 398, 229) |
-| R-2 | Manual flip to empty source dead-ends | `CLONE` | 0.4.4: keep pin, fall back, name miss |
+| R-1 | Preferred re-route / pin / fallback / empty listing / demote contracts | `CLONE`; re-dispositioned by ROD-525 (last-used + one walk) | Full matrix **03** + **05 §10** (ROD-343–357, 368, 398, 229) |
+| R-2 | Manual flip to empty source dead-ends | `CLONE`; ROD-525: the manual walk walks on instead | 0.4.4: keep pin, fall back, name miss |
 | R-3 | Backup-only shows empty grid, no walk | `CLONE` | 0.4.1 multiprovider walk before give up |
 | R-4 | Empty listing bound as success | `CLONE` | ROD-368: empty walks ladder |
 | R-5 | Stream open / CDN block fails hard | `CLONE` | 0.3.0 retry + toast; play retry 3× open-fail only (**04**) |
@@ -183,7 +183,7 @@ Freeze tip already includes **ROD-419** (stale totals). Log newer zigoku fixes h
 
 ## 10. Adversarial checklist (ROD-430)
 
-- [ ] K-1 and K-2 have explicit sabigoku plans (not silent CLONE of the hole)
+- [x] K-1 and K-2 have explicit sabigoku plans (K-2 retired outright with its mechanism, ROD-525)
 - [ ] ID-1/ID-2 match 02 locked decisions
 - [ ] No row requires reintroducing `SOURCE_UNBOUND` or provider-primary PK
 - [ ] Playback/resume scars point at 05/03

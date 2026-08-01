@@ -7,7 +7,7 @@
 
 | Case | zigoku @ freeze | sabigoku | Verdict | zigoku site | Source |
 |---|---|---|---|---|---|
-| K-2 forced-preferred walk dead-end | Stale-stamp re-route onto a search-only preferred provider exhausts a single-provider walk and strands the grid while bindings exist | Walk-origin tag split; K-2 law in 03 §5.3 | **Backport** | `tui/resolve_state.zig`, `tui/app.zig` | 07 K-2, ROD-430 |
+| K-2 forced-preferred walk dead-end | Stale-stamp re-route onto a search-only preferred provider exhausts a single-provider walk and strands the grid while bindings exist | Walk-origin tag split; K-2 law in 03 §5.3 (law retired in sabigoku by ROD-525; row kept as the freeze-era record) | **Backport** | `tui/resolve_state.zig`, `tui/app.zig` | 07 K-2, ROD-430 |
 | Non-sync 429 classification | Any non-200 collapses to no-answer; hammering risk called out in 06 §8b | Distinct rate-limited error class, no client retry | **Backport** | `anilist.zig` `postGql` | ROD-435 |
 | Control-char strip coverage | `stripControls` drops C0 + DEL only; C1, bidi overrides, zero-width pass into terminal cells (RTL title spoofing reproduced) | Widened filter: C1 + U+202A-2E + U+2066-69 + U+200B-D + U+FEFF | **Backport** | `anilist.zig` `stripControls` | ROD-435 chaos pass |
 | HTTP redirect handling on catalog POSTs | `std.http.Client` redirect behavior unaudited; a followed redirect can re-route the request off-host | Redirects refused on the catalog client | **Needs check** first: confirm what zig std does at freeze, then decide | `anilist.zig` `fetchGql` | ROD-435 chaos pass |

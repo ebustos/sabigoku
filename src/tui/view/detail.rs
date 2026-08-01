@@ -1483,10 +1483,6 @@ mod tests {
         assert!(provider_line(&EpisodeSession::default(), palette).is_none());
     }
 
-    /// ROD-524 ratification: the highlight IS the selection. A pin on an
-    /// unconfirmed provider (mid-cycle, PinKept, transient miss) takes the
-    /// full lift; a gate here made the selection appear to snap back to the
-    /// serving provider, which reads as the app overriding the user.
     /// ROD-525: the probing token is ungated, bold+fg on any marker, because
     /// mid-walk it is the only truthful selection signal; the dim row stays
     /// flat (no hop can be in flight with zero knowledge AND no serving grid

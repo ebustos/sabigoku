@@ -1,18 +1,16 @@
-//! Resolve orchestration (03 §4-5): the tier classifier, the two pin
-//! asymmetries, the preferred re-route with its stamp-before-fetch guard, and
-//! the fallback walk carrying the origin tag that fixes bug K-2.
+//! Resolve orchestration (03 §4-5): the tier classifier and the walk, in its
+//! two origins (Manual wraps the registry circle from the aim, Auto respects
+//! absence) with one exhaust: DeadEnd, said out loud (ROD-525).
 //!
 //! Headless by design. Every decision is a pure function over a
 //! `ResolveWorld` (the store + registry reads it needs) returning an action;
-//! the TUI worker layer (ROD-439) performs the fetch/search/stamp the action
+//! the TUI worker layer (ROD-439) performs the fetch/search the action
 //! names. No threads, no network, no `Store` here, so the walk contracts are
 //! pinned by offline tests.
 //!
-//! Two distinct pin rules live here and must not be merged (03 §4.1):
-//! Path 1 (canonical open) folds the pin into effective preference, so ANY
-//! binding wins tier 0 (a non-pinned binding beats an unbound pin). Path 2
-//! (History open) treats the pin as a hard restriction: only the pin's own
-//! binding is consulted, never borrowed from another provider.
+//! Last-used folds into effective preference only (03 §5.1): ANY binding
+//! wins tier 0, and the write is a landing-time confirmation owned by the
+//! transport, never minted here.
 
 use crate::domain::Enrichment;
 
@@ -23,10 +21,6 @@ pub trait ResolveWorld {
     /// Registry order with `pref` first when live, then construction order
     /// (03 §3.2). Empty/unknown `pref` yields plain construction order.
     fn ordered(&self, pref: Option<&str>) -> Vec<String>;
-
-    /// Whether `provider` is a live registry member (a retired pin name is
-    /// not: it must never fetch its foreign id on primary, 03 §5.1).
-    fn registered(&self, provider: &str) -> bool;
 
     /// Stored binding provider_id for `(anilist_id, provider)`.
     fn binding(&self, anilist_id: i64, provider: &str) -> Option<String>;
@@ -336,9 +330,6 @@ mod tests {
                 }
             }
             out
-        }
-        fn registered(&self, provider: &str) -> bool {
-            self.order.iter().any(|p| p == provider)
         }
         fn binding(&self, aid: i64, provider: &str) -> Option<String> {
             self.bindings.get(&(aid, provider.to_string())).cloned()

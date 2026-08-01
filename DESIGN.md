@@ -1137,17 +1137,11 @@ state.now` escalation.
 | `sync_flushed` | pull reconciled remote changes (`reconciled > 0`) | info | `↓ N from AniList` | no |
 | `sync_flushed` | push landed (`pushed > 0`) | info | `↑ N to AniList` | no |
 | `update_available` | boot check found a strictly newer release (06 §6.1) | info | `update available: vX.Y.Z` | no |
-| Provider fallback hop | the resolve walk moves to the next registry provider | warn | `trying {provider}…` (or `{prev} failed, trying {provider}…`) | no |
-| Provider pin: hop | pinning a different provider than the one serving the grid re-routes it through a one-provider fallback walk (reuses the hop toast) | warn | `trying {provider}…` (or `{prev} failed, trying {provider}…`) | no |
-| Provider pin: set, no hop needed | `v` pins the provider already serving the grid | success | `pinned to {provider}` | no |
-| Provider pin: cleared | `v` cycles past the last provider back to unpinned | info | `provider pin cleared` | no |
-| Provider pin: hop failed | the pin's one-provider walk could not even run (worker spawn failure; freeze: `advanceFallback` returned false). Distinct from a walk that ran and missed | warn | `couldn't reach {provider}` | no |
-| Provider pin: flip missed | the pin's one-provider walk ran (probe/search) and found no match; the pin is kept (03 §5.1, ROD-439) | warn | `no match on {provider}, pin kept` | no |
-| Provider pin: nothing to pin | `v` pressed with no focused episode source | info | `no source: nothing to pin` | no |
-| Provider pin: row not minted yet | `v` pressed before the serving provider's binding row is minted (only happens on `episodes_done`) | info | `still resolving, try again shortly` | no |
-| Provider pin: store write failed | the pin write errors on set or clear | error | `couldn't save the provider pin` / `couldn't clear the provider pin` | no |
-| Resolve walk exhausted | every provider tried or skipped, no grid landed (§4.6 `no source` state) | error | `no source found` | no |
-| Forced-preferred miss | the §5.3 stale-stamp probe missed; the K-2 continuation walk begins | warn | `no match on {provider}` (distinct from the pin-kept copy by law) | no |
+| Auto walk hop | a post-failure (auto) walk moves to the next provider; manual `v` hops stay off the toast rail, the §5.3a cursor carries them (ROD-525) | warn | `trying {provider}…` (or `{prev} failed, trying {provider}…`) | no |
+| Cycle press | `v` aims the next provider in the circle; the settle fires the walk 300ms later (05 §10.5) | warn | `trying {provider}…` | no |
+| Cycle: nothing to walk from | `v` pressed with no focused episode source | info | `no source: nothing to switch` | no |
+| Cycle: first resolve in flight | `v` pressed before the first grid lands | info | `still resolving, try again shortly` | no |
+| Resolve walk exhausted | the full circle tried or skipped, no grid landed (§4.6 `no source` state) | error | `no source found` | no |
 | Play continuation: remap miss | a play-fallback hop landed a sibling grid without the in-progress episode (exact raw label, else 1-based ordinal); play continuation stops, the walk's toasts already ran (03 §6.4/§7, ROD-439) | error | `episode {raw} not found on {provider}` (`{raw}` is provider text, control-stripped) | no |
 | Delete refused: playing | `y` on an armed delete while that show is the live playback (ROD-220); the confirm disarms, nothing is deleted | warn | `can't delete, currently playing` (freeze copy) | no |
 
@@ -1394,7 +1388,9 @@ independent:
 | Aimed (`v` settle window armed) or being probed (mid-walk, auto or manual) | the selection cursor: elevated register; exact glyph/weight settles in design review, §10 |
 
 `fg3` stays reserved for the nothing-known row (every provider unchecked), which
-dims whole; a healthy non-serving token never drops to it.
+dims whole, cursor included: `dim` outranks the elevated register in
+`provider_line`, and a lone bold token in a dead row would overclaim. A healthy
+non-serving token never drops to `fg3`.
 
 - **The bold pin register is replaced by a probing token** (ROD-525). There is no
   longer a persistent per-show preference for the UI to mark: last-used (03 §5.1)
@@ -1403,7 +1399,8 @@ dims whole; a healthy non-serving token never drops to it.
   instead marks the **selection cursor**: the aim while the `v` settle window
   is armed (every press must visibly move it before any walk fires, or the
   burst reads as dead input), then whichever token the in-flight walk hop is
-  currently probing, auto-fallback or manual `v` alike. A walk is exactly the window where `serving`
+  currently probing, auto-fallback or manual `v` alike. A walk is exactly the
+  window where `serving`
   (`▸`) is stale, since the hop hasn't landed yet, so the probing token is the
   only truthful selection signal until it does. It clears the instant the hop
   lands, at which point `▸` on the landed token carries the truth again. This
@@ -1748,8 +1745,9 @@ Notes:
   dedicated Provider/Pinned row (§5.3a) renders below this compact line; this mock
   keeps the two-field baseline for brevity.~~ This is the only form, at every
   width and origin; the provider row rides the top of the episode grid
-  instead of the header (ROD-458). `v provider` in the help line cycles the
-  provider pin; it is live on this in-pane surface, same as the zoom.
+  instead of the header (ROD-458). `v provider` in the help line walks the
+  provider circle (ROD-525); it is live on this in-pane surface, same as the
+  zoom.
 
 ---
 
@@ -1895,18 +1893,14 @@ Notes:
 - **provider** cycles unset → each registry provider name → unset (construction
   order; the first registered provider leads). Unset (`preferred_provider = ""`)
   means "follow the registry's construction leader" and displays as that leader
-  tagged `(default)`, so it stays distinguishable from an explicit pin to the same
-  provider (a pin holds if the leader ever changes; the default follows it), and
-  the wheel keeps a real way back to unset. The preference governs only NEW
-  canonical resolution (bind-time tie-breaks and fallback walk order). Fallbacks
-  for rows with an unknown owner deliberately keep routing to the registry
-  primary: a pre-existing binding never silently migrates provider. **Per-show
-  override** is the `v` key on any detail surface (§5.3a ~~rail~~ / §7.5 keybinds): a
-  separate `provider_pins` DB table keyed on canonical id, layered over this
-  row's global setting only (effective preference = show pin, else global) and
-  never writing back to it. The pin cycles the same construction order as this
-  row (unpinned → each registry provider → unpinned); there is no
-  Settings-surface control for the per-show pin, only the in-grid key.
+  tagged `(default)`, so it stays distinguishable from an explicit choice of the
+  same provider, and the wheel keeps a real way back to unset. This row is the
+  **walk-order head** (03 §5.1, ROD-525): it seeds effective order for shows
+  with no last-used memory, and a landing on it clears that memory. Per-show
+  state is not set here: the `v` key on any detail surface walks the circle
+  live, and the landing writes `provider_last_used` (effective preference =
+  last-used, else this row). There is no Settings-surface control for the
+  per-show memory, only the in-grid key.
 - **landing view** cycles `history · browse · last_watched`, default
   `last_watched` (§8.3).
 - **title language** cycles `romaji · english · native`
@@ -2186,7 +2180,7 @@ Notes:
 | `H` | Switch to History/Watchlist view |
 | `D` | Switch to Discover view |
 | `S` | Switch to Settings view |
-| `v` | Cycle the open show's provider pin (detail surfaces only; §5.3a) |
+| `v` | Walk the open show's provider circle (detail surfaces only; §5.3a) |
 | `r` | Recompute progress for selected show (History list pane only; no-op elsewhere) |
 | `u` | Undo last status mutation (single-level, History list pane only) |
 | `P` | "Plan it": add highlighted browse result to the watchlist as planning (Browse list pane) / set focused entry's status to planning, the 5th manual transition (History list pane) / save the selected card (Discover) |
@@ -2532,10 +2526,9 @@ Note: `q` quits the app; `h`/`Esc` return focus to the list. Browse uses this
 string at all two-pane widths (`w ≥ 60`); `enter play` and `space zoom` are always
 present. The in-pane grid renders at every two-pane width (narrower at
 `60 ≤ w < 100`: `detail_w ≈ 25` at `w = 60` → ≈ 5 columns); `Enter` plays the
-focused episode and `Space` promotes to the full-screen zoom. `v` cycles the open
-show's provider pin (§5.3a); the pin has no word on the provider row, so the bold
-token there is the pinned provider and this hint is the only place the key is
-named. Episodes load on detail entry, not on list hover
+focused episode and `Space` promotes to the full-screen zoom. `v` walks the open
+show's provider circle (§5.3a); at rest the row carries no selection word, so
+this hint is the only place the key is named. Episodes load on detail entry, not on list hover
 (scrolling Browse never fires a fetch; parity with History). At 80 cols the string
 fits comfortably within the ~74-char budget: it is 68 characters.
 
@@ -2576,8 +2569,8 @@ two-pane range.
 
 Bold: `h`, `j`, `k`, `l`, `enter`, `v`, `space`, `esc`.
 
-`space/esc back` reinforces that both keys demote from zoom. `v` cycles the
-provider pin; the zoom is a detail surface like the in-pane grid. `q` quits the
+`space/esc back` reinforces that both keys demote from zoom. `v` walks the
+provider circle; the zoom is a detail surface like the in-pane grid. `q` quits the
 app; it is not shown, keeping the line within budget.
 
 #### History: empty (no records)
@@ -2673,7 +2666,8 @@ metadata.
 
 The **datastore keys shows by the AniList canonical id from day one.** Provider
 bindings, provider absences (`provider_absences`, 7-day TTL), and per-show
-provider pins (`provider_pins`) all hang off that canonical row via FK. Persisted
+last-used memory (`provider_last_used`, ROD-525) all hang off that canonical
+row via FK. Persisted
 metadata columns are nullable and upserted with `COALESCE` so a null re-fetch
 never clobbers a stored value (the DB-safety rule; §5.3a Studios notes the
 per-column application). A background **metadata refresh** re-fetches AniList data
@@ -2702,7 +2696,7 @@ tokens reference §1.2 aliases.
 | **Detail · score line** | AniList `averageScore` | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
 | **Detail · genres** | AniList `genres` | ` · Genre · Genre` appended to the score line | omitted; no row, no `·` separator |
 | **Detail · cover art** | AniList `coverImage` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when the URL is null; the block keeps its reserved cell dimensions |
-| **Detail · metadata line**~~/rail~~ | AniList `episodes` / `format` / `source` / `duration` / `studios` / `rankings`; DB `provider_pins`; DB binding rows + `provider_absences` + live `episodes.for_source` | `detail_meta_fields()` (§5.3a) emits the ordered six-field list, rendered on the one compact `N eps · kind · …` line at every width and origin (Rank last, sheds first) ~~or the `Label  Value` rail (two-column surfaces, all eight)~~; provider and pin are not fields and instead draw `provider_line` ~~, the compact form's dedicated Provider/Pinned row beneath the joined line~~ , a dedicated row atop the episode grid, straight off the session (ROD-458, ROD-484) | Episodes is the floor: `? eps` ~~/ `Episodes  ?` in `[d]`~~ when no count is known, never omitted, so the line is never empty. Format/Source/Duration/Studios/Rank each omit outright when null; no orphan `·`~~, no bare rail row~~. The provider row omits outright when the show has no canonical identity, otherwise always renders (even all-`?`), dimming only when every provider is unchecked. The pin is a bold boost on its own token, so an unpinned show simply has no bold token, and a pin on a ~~retired or unconfirmed~~ provider outside the registry shows nothing (§5.3a, ROD-524: unconfirmed tokens keep the boost). The `nextAiringEpisode` countdown renders on the **chips row** (§4.4) instead: a live signal, not a stored snapshot |
+| **Detail · metadata line**~~/rail~~ | AniList `episodes` / `format` / `source` / `duration` / `studios` / `rankings`; DB binding rows + `provider_absences` + live `episodes.for_source` + the in-flight walk state | `detail_meta_fields()` (§5.3a) emits the ordered six-field list, rendered on the one compact `N eps · kind · …` line at every width and origin (Rank last, sheds first) ~~or the `Label  Value` rail (two-column surfaces, all eight)~~; provider state is not a field and instead draws `provider_line` ~~, the compact form's dedicated Provider/Pinned row beneath the joined line~~ , a dedicated row atop the episode grid, straight off the session (ROD-458, ROD-484, ROD-525) | Episodes is the floor: `? eps` ~~/ `Episodes  ?` in `[d]`~~ when no count is known, never omitted, so the line is never empty. Format/Source/Duration/Studios/Rank each omit outright when null; no orphan `·`~~, no bare rail row~~. The provider row omits outright when the show has no canonical identity, otherwise always renders (even all-`?`), dimming only when every provider is unchecked. The selection cursor (armed aim or in-flight probe) is a bold boost on its own token, on any marker; a show at rest simply has no bold token (§5.3a, ROD-525). The `nextAiringEpisode` countdown renders on the **chips row** (§4.4) instead: a live signal, not a stored snapshot |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
 | **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar, not duplicated in row 1 (the richer row-1 right-meta was never built, §5.4/§11.3) | count degrades to `N / ? eps` on the bar when `total_episodes` is null |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
@@ -3256,7 +3250,7 @@ that history). Logged here so they can be revisited without archaeology.
 | ~~Rail's~~ ~~Pinned field~~ The provider row shows the raw provider name, not `display_name()` (ROD-345; ROD-484 moved the rule from the pin's own segment onto the tokens, which already followed it) | Matches the Settings `provider` row (§5.5), which renders the raw stored preference string. It is the same persisted identifier, just scoped per-show instead of globally, so consistency with that precedent outranks matching the toast-prose convention (`{provider}` = `display_name()` everywhere a sentence names a provider, §4.10). The split is deliberate: config-surface rows echo the stored identifier; user-facing prose speaks the display name. | If a provider's stored name and display name diverge enough to confuse users ~~in the rail~~ on `provider_line`, reconsider as a ~~rail-specific~~ `provider_line`-specific formatting fix, not by changing the Settings row's convention. |
 | Provider field folds availability and serving into one ~~rail~~ row, ASCII markers (`▸ + - ?`) instead of a new pictographic set (ROD-348/356) | A separate serving row plus a separate availability row would put three provider-ish rows next to each other (Pinned already there) for information that is really one axis per provider (what's known, what's active): one row reads as one fact family. The `◆`/`◈` and `◐`/`◎` glyph pairs carried an open dim-legibility question at the time (since resolved in their favour, §11.4); rather than risk a fourth confusable pair, the tri-state (plus "serving") uses plain ASCII shapes and reuses the already-proven `▸` resume glyph for "serving", a genuinely different glyph family. Shape carries the state rather than color because the Phosphor theme (§1.4) is monochrome, so a color-only distinction would be illegible there. | The dim-legibility question resolved in the pairs' favour and the ASCII set still stands on its own reasons (font-independence, zero substitution risk); a future marker set does not get to cite the pairs' legibility as licence to go pictographic here. |
 | Provider field lists providers in fixed registry (construction) order, not the per-walk preference order (ROD-348) | The preference order is a resolve-order hint, recomputed per preference and per walk; using it here would make the same show's ~~rail~~ line read in a different order across sessions as the user's global or per-show preference changes, breaking "scan the same column, same order, every show." ~~The rail is~~ This field is a status display of what's out there, not a queue of what to try next, so it wants a stable reference order. | If the registry grows past 4-5 providers and scanning a long fixed-order row gets noisy, consider grouping bound-first rather than reordering by preference: preference and "what's out there" are still different questions. |
-| Provider and Pinned surface on their own dedicated row, not as segments of the joined `·` meta line (ROD-348/356) | ~~A `rail_only` field never blooms below `DETAIL_TWO_COL_MIN`, which would leave Provider and Pinned invisible on every compact-width detail pane, exactly the width most terminals run at day to day.~~ Folding them into the joined line itself was rejected: routing/session state is a different category of fact from the AniList metadata the joined line otherwise carries, and interleaving muddies both. ~~The fix lives entirely in a bespoke compact-form row drawn beneath the joined line (`draw_provider_line`), outside the generic field-list iteration either renderer uses.~~ The fix lives entirely in `provider_line`, a dedicated row atop the episode grid, outside the generic field-list iteration `meta_line` uses (ROD-458: this row is now unconditional, not a compact-width special case). | If a third field ever needs the same "own row" treatment, generalize `provider_line` into a small family of bespoke rows rather than routing a third concept through it by special case. |
+| Provider ~~and Pinned~~ state surfaces on its own dedicated row, not as segments of the joined `·` meta line (ROD-348/356; ROD-525 retired the Pinned field) | ~~A `rail_only` field never blooms below `DETAIL_TWO_COL_MIN`, which would leave Provider and Pinned invisible on every compact-width detail pane, exactly the width most terminals run at day to day.~~ Folding them into the joined line itself was rejected: routing/session state is a different category of fact from the AniList metadata the joined line otherwise carries, and interleaving muddies both. ~~The fix lives entirely in a bespoke compact-form row drawn beneath the joined line (`draw_provider_line`), outside the generic field-list iteration either renderer uses.~~ The fix lives entirely in `provider_line`, a dedicated row atop the episode grid, outside the generic field-list iteration `meta_line` uses (ROD-458: this row is now unconditional, not a compact-width special case). | If a third field ever needs the same "own row" treatment, generalize `provider_line` into a small family of bespoke rows rather than routing a third concept through it by special case. |
 | The pin's UI representation is retired outright; a probing token marks an in-flight walk hop instead (ROD-348/356 → ROD-484 → ROD-524 → **ROD-525**) | Four rounds on the same problem, each fixing the cost the last one paid: ROD-348/356 gave Pinned its own row with a `pin ` prefix segment; ROD-484 replaced the text with a bold boost on Provider's own token, gated on a confirmed `▸`/`+` marker; ROD-524 ungated that boost once the settle window made pin-on-unconfirmed the ordinary state, and an invisible pin started reading as a snap-back to the serving provider. ROD-525 removes the pin itself (03 §5.1: sticky last-used replaces the two-tier preference), so there is no longer a persistent per-show choice to represent. The bold register now marks whichever token an active walk is currently probing, live-session state with nothing stored (§5.3a); it clears the instant the hop lands. | If a per-show preference concept returns (03 §5.1's deferred language-intent epic), it needs its own static marker decided fresh, not a resurrection of this chain's bold register: that register now means "in-flight," not "chosen." |
 | `X` is History's one destructive key with **no undo path**, so it gets an armed-confirm layer with a separate confirm key (ROD-220) | Every other History key, including the uppercase `P` ("plan it") and the view switches, is additive or navigational: reversible by another keypress or covered by `u`'s single-level undo (§6.1). Hard-delete cascades the DB row and its episode history; there is nothing for `u` to restore. That is a step change in severity, so it gets its own confirmation layer (§4.2, §6.5) instead of the toast-and-undo pattern the rest of History relies on. Splitting execution onto a separate `y`/`Y` key rather than "press `X` twice" specifically defeats key-repeat: a held or auto-repeating `X` keeps delivering `X` (a no-op once armed, §6.5), never `y`, so a repeat storm cannot self-confirm the delete. | If a second no-undo destructive action is ever added, reuse this pattern (armed state plus distinct confirm key) rather than inventing a fresh one. |
 | Bold, not underline, is the keybind-hint treatment everywhere (ROD-220) | Underline was the original spec for hint keys and was retired: it would be a one-off treatment nothing else uses, while bold-as-promotion (§1.3) already carries the identical role in the confirm prompt, the help lines, and the top-bar strip. One treatment, everywhere. | No revisit expected. |
@@ -3382,8 +3376,9 @@ miss, and dead-ends only when the full circle exhausts (03 §5.2; 05 §10.5).
 The route-stamp mechanism and the K-2 forced-preferred law it carried are
 deleted outright, not replaced: both existed to protect a speculative write,
 and last-used's confirmation-write timing removes the failure mode they
-guarded against (03 §5.3). §5.3a's bold pin register is replaced by a probing
-token marking an in-flight walk hop, cleared the instant it lands; §10's
+guarded against (03 §5.3). §5.3a's bold pin register is replaced by the
+selection cursor: the aim while the `v` settle window is armed (every press
+visibly moves it), then the in-flight walk hop, cleared the instant it lands; §10's
 ROD-348/356 → ROD-484 → ROD-524 row stack on the pin collapses into one row
 citing the lineage. Migration seeds `provider_last_used` from `provider_pin`
 rows gated on a matching `provider_binding`, then drops `provider_pin` and

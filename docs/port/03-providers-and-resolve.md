@@ -188,7 +188,9 @@ In its place: the app remembers the provider each show **last successfully
 served from**.
 
 - At most one provider per show, or unset.
-- **Written only at a landing** (a confirmation write, never speculative), and
+- **Written only at a landing** (a confirmation write, never speculative; a
+  landing on the walk-order head is a write-that-clears, deleting any stored
+  row, not a skipped write), and
   only when it differs from the walk-order head. A landing is a successful
   episode fetch or stream resolve on that provider (§6.1, §6.3), auto or manual.
 - Opens start at last-used (§4.1: `ordered(last_used orelse preferred)`) and walk

@@ -545,7 +545,7 @@ const LEDGER: &[BugCheck] = &[
         "K-2",
         "moot since ROD-525: no forced-preferred probe exists to miss; the walk \
          is the only open path and dead-ends only on a full circle",
-        Seeded("tui::episodes::cycle_gates_on_source_and_first_resolve"),
+        Seeded("tui::episodes::play_fail_over_after_cache_landing_walks_never_silent"),
     ),
     b(
         "R-1",

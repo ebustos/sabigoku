@@ -1894,14 +1894,15 @@ impl Store {
                     ),
                 )?;
             }
-            // Same rule as the V3 seed: an imported pin becomes last-used
-            // only when its provider actually served (has a binding).
-            if let Some(pin) = &show.pin
-                && show.bindings.iter().any(|(p, _)| p == pin)
-            {
+            // Same rule as the V3 seed, checked against LANDED rows, not the
+            // source batch: OR IGNORE above can drop a binding, and a pin
+            // must never seed a provider that has no binding on disk.
+            if let Some(pin) = &show.pin {
                 tx.execute(
                     "INSERT OR IGNORE INTO provider_last_used (anilist_id, provider)
-                     VALUES (?1, ?2)",
+                     SELECT ?1, ?2 WHERE EXISTS (
+                        SELECT 1 FROM provider_binding b
+                        WHERE b.anilist_id = ?1 AND b.provider = ?2)",
                     (show.enrichment.anilist_id, pin),
                 )?;
             }

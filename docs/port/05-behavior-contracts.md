@@ -439,7 +439,7 @@ Resume ratios and fully_watched: **02** / store tests.
 | Contract | Cites |
 |---|---|
 | Meta field order and `?` degrade | ROD-260/261 meta tests |
-| Provider caption: serving leads; markers; dim; shed order vs Pinned | ROD-348/356/397 |
+| Provider caption: serving leads; markers; dim; no shed rank (not a field) | ROD-348/356/397; ROD-525 |
 | Browse preview hides stale episode grid from History | ROD-222 |
 | episodeGridVisible in zoom | ROD-222 |
 | detailSyncTarget rules for browse/history | ROD-156 |
