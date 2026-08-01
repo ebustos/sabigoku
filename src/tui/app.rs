@@ -881,6 +881,8 @@ impl App {
             .shown()
             .is_some_and(|e| self.detail.episodes.engaged_for(e.anilist_id));
         if engaged {
+            let fb = self.detail.episodes.flush_pin_edit(&self.store);
+            self.apply_episode_feedback(fb, now);
             self.detail.episodes.reset();
             self.engage_detail(now, tx);
         }
@@ -970,6 +972,11 @@ impl App {
         if self.sync_debounce.fire(now) {
             self.flush_sync(now, tx, false);
         }
+        let fb = {
+            let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
+            self.detail.episodes.maybe_commit_pin(&deps)
+        };
+        self.apply_episode_feedback(fb, now);
         {
             let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
             self.prewarm.tick(&deps);
@@ -1561,18 +1568,23 @@ impl App {
                 .shown()
                 .is_some_and(|e| self.detail.episodes.engaged_for(e.anilist_id));
             if engaged {
+                let fb = self.detail.episodes.flush_pin_edit(&self.store);
+                self.apply_episode_feedback(fb, now);
                 self.detail.episodes.reset();
                 self.engage_detail(now, tx);
             }
         }
     }
 
-    /// Quit (`q` / `:q`): a dirty Settings tab persists first (DESIGN 7.2);
-    /// Ctrl-C stays the emergency exit that skips this.
+    /// Quit (`q` / `:q`): a dirty Settings tab persists first (DESIGN 7.2),
+    /// and a pin edit still inside its settle window commits its write;
+    /// Ctrl-C stays the emergency exit that skips both.
     fn on_quit(&mut self, now: Instant) {
         if self.view == View::Settings {
             self.persist_settings(now);
         }
+        // The toast this could return has no frame left to show in.
+        let _ = self.detail.episodes.flush_pin_edit(&self.store);
         self.quit = true;
     }
 
@@ -2388,7 +2400,7 @@ mod tests {
         })
     }
 
-    use super::super::episodes::teststub;
+    use super::super::episodes::{self, teststub};
 
     fn test_paths(name: &str) -> Paths {
         let dir = std::env::temp_dir().join("sabigoku-app-tests").join(name);
@@ -3720,30 +3732,66 @@ mod tests {
         let t1 = open_first_result(&mut app, &tx, &rx, now);
         assert_eq!(app.detail.episodes.serving(), Some("megaplay"));
 
+        // The press toasts and moves the rail; the write waits for the
+        // settle tick (ROD-524).
         app.tick(ch('v'), t1, &tx);
         let text = rendered(&mut app, 110, 32);
         assert!(text.contains("pinned to megaplay"), "{text}");
+        assert_eq!(app.store.get_provider_pin(1).unwrap(), None);
+        let t2 = t1 + episodes::PIN_SETTLE;
+        app.tick(Event::Tick, t2, &tx);
         assert_eq!(
             app.store.get_provider_pin(1).unwrap().as_deref(),
             Some("megaplay")
         );
 
-        app.tick(ch('v'), t1, &tx);
+        app.tick(ch('v'), t2, &tx);
+        let text = rendered(&mut app, 110, 32);
+        assert!(text.contains("pinned to senshi"), "{text}");
+        let t3 = t2 + episodes::PIN_SETTLE;
+        app.tick(Event::Tick, t3, &tx);
         let text = rendered(&mut app, 110, 32);
         assert!(text.contains("trying senshi…"), "{text}");
-        settle_feed(&mut app, &tx, &rx, t1);
+        settle_feed(&mut app, &tx, &rx, t3);
         assert_eq!(app.detail.episodes.serving(), Some("senshi"));
 
-        app.tick(ch('v'), t1, &tx);
+        app.tick(ch('v'), t3, &tx);
         let text = rendered(&mut app, 110, 32);
         assert!(text.contains("provider pin cleared"), "{text}");
+        let t4 = t3 + episodes::PIN_SETTLE;
+        app.tick(Event::Tick, t4, &tx);
         assert_eq!(app.store.get_provider_pin(1).unwrap(), None);
 
         // v is a detail-surface key; on the list it must stay inert.
-        app.tick(key(KeyCode::Esc), t1, &tx);
+        app.tick(key(KeyCode::Esc), t4, &tx);
         let before = app.store.get_provider_pin(1).unwrap();
-        app.tick(ch('v'), t1, &tx);
+        app.tick(ch('v'), t4, &tx);
         assert_eq!(app.store.get_provider_pin(1).unwrap(), before);
+    }
+
+    /// ROD-524: quitting inside the settle window commits the pin write; the
+    /// flip it would have fired dies with the app.
+    #[test]
+    fn quit_inside_the_pin_window_commits_the_write() {
+        let registry = teststub::registry(vec![
+            teststub::StubProvider::new("megaplay")
+                .with_key("505")
+                .with_episodes(Ok(vec!["1".into()])),
+        ]);
+        let (mut app, tx, rx, now) = harness_full(
+            "pin-quit-e2e",
+            StubCatalog::search_scripted(vec![one_page(1)]),
+            registry,
+        );
+        let t1 = open_first_result(&mut app, &tx, &rx, now);
+        app.tick(ch('v'), t1, &tx);
+        assert_eq!(app.store.get_provider_pin(1).unwrap(), None);
+        app.tick(ch('q'), t1, &tx);
+        assert!(app.quit);
+        assert_eq!(
+            app.store.get_provider_pin(1).unwrap().as_deref(),
+            Some("megaplay")
+        );
     }
 
     /// Pins the USER-VISIBLE copy for the two pin-walk failure rows, which
@@ -3762,9 +3810,11 @@ mod tests {
             registry,
         );
         let t1 = open_first_result(&mut app, &tx, &rx, now);
-        // v pins serving megaplay; v again flips to senshi, whose search
-        // fails and misses.
+        // v pins serving megaplay; v again moves to senshi, whose flip fires
+        // on the settle tick, then its search fails and misses.
         press(&mut app, &tx, t1, &[ch('v'), ch('v')]);
+        let t1 = t1 + episodes::PIN_SETTLE;
+        app.tick(Event::Tick, t1, &tx);
         settle_feed(&mut app, &tx, &rx, t1);
         let text = rendered(&mut app, 110, 32);
         assert!(text.contains("no match on senshi, pin kept"), "{text}");
