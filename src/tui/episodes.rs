@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::domain::{self, Enrichment, Translation};
 use crate::providers::ProviderRegistry;
-use crate::resolve::{self, Exhausted, Hop, ResolveTarget, ResolveWorld, Walk};
+use crate::resolve::{self, Exhausted, Hop, ResolveTarget, ResolveWorld, Walk, WalkOrigin};
 use crate::resolver;
 use crate::store::{ProviderAvailability, Store};
 use crate::tui::clock::{AsyncStart, Debounce};
@@ -132,15 +132,12 @@ pub struct EpisodeSession {
     /// pending_bind). Token-guarded like everything else in flight.
     mint_pending: bool,
     walk: Option<Walk>,
-    /// Name behind a live single-provider walk, for the miss copy.
+    /// Provider of the hop currently in flight; the row's probing token
+    /// (DESIGN 5.3a, ROD-525). Cleared wherever the walk retires.
     walk_provider: Option<String>,
     /// Pre-flip cursor identity `(raw label, 1-based ordinal)`: a flip
     /// landing keeps the cursor on the in-progress episode (05 §10.5).
     remap_from: Option<(String, u32)>,
-    /// Last-used + per-provider availability, refreshed on engage and on
-    /// every bind/absence write (03 §6.1 step 2) so draw never reads the
-    /// store.
-    last_used: Option<String>,
     /// The `v` cycle's aim, in memory only (ROD-524/525): a burst advances
     /// it paying no fetches, the settle starts the manual walk there, the
     /// landing writes last-used. Abandoning the show just drops it.
@@ -168,7 +165,6 @@ impl EpisodeSession {
         self.walk = None;
         self.walk_provider = None;
         self.remap_from = None;
-        self.last_used = None;
         self.cycle_aim = None;
         self.cycle_debounce.disarm();
         self.avail.clear();
@@ -286,6 +282,13 @@ impl EpisodeSession {
     /// One hop per call (03 §6.4). `announce` gates the hop toast: the walk's
     /// opening attempt is not a hop, only a move after a miss/failure is.
     fn advance_walk(&mut self, announce: bool, deps: &EpisodeDeps) -> Vec<Feedback> {
+        // Manual walks announce on the probing token, never per-hop toasts
+        // (05 §10.5); auto walks keep the hop toast.
+        let announce = announce
+            && self
+                .walk
+                .as_ref()
+                .is_some_and(|w| w.origin() == WalkOrigin::Auto);
         let step = {
             let world = deps.world();
             self.walk.as_mut().map(|w| w.advance(&world))
@@ -304,6 +307,7 @@ impl EpisodeSession {
                         provider: provider.clone(),
                     });
                 }
+                self.walk_provider = Some(provider.clone());
                 // A bound hop paints from an unexpired cache like a bound
                 // open; only a fresh tier-A key must go to the network.
                 let running = if bind.is_some() {
@@ -323,6 +327,7 @@ impl EpisodeSession {
                         provider: provider.clone(),
                     });
                 }
+                self.walk_provider = Some(provider.clone());
                 if !self.fire_search(provider.clone(), deps) {
                     fb.extend(self.hop_unreachable(deps));
                 }
@@ -330,6 +335,7 @@ impl EpisodeSession {
             }
             Err(Exhausted::DeadEnd) => {
                 self.walk = None;
+                self.walk_provider = None;
                 self.loading = None;
                 if self.episodes.is_empty() {
                     self.no_source = true;
@@ -511,7 +517,6 @@ impl EpisodeSession {
         let _ = deps
             .store
             .set_last_used(aid, (provider != head).then_some(provider.as_str()));
-        self.last_used = deps.store.get_last_used(aid).ok().flatten();
         // A landing resolves the aim, except one still inside its window: a
         // burst in flight is the user's live press, never the walk's to eat.
         if !self.cycle_debounce.is_armed() {
@@ -545,13 +550,12 @@ impl EpisodeSession {
         self.episodes = episodes;
     }
 
-    /// Last-used + availability snapshot for the meta rail (03 §6.1 step 2).
-    /// Read failures degrade to unchecked; the rail dims, nothing wedges.
-    /// The cycle aim lives beside this, never in it, so a landing mid-window
-    /// cannot clobber the user's cycle.
+    /// Availability snapshot for the meta rail (03 §6.1 step 2). Read
+    /// failures degrade to unchecked; the rail dims, nothing wedges.
+    /// Last-used never surfaces here: it is an internal walk default
+    /// (DESIGN 5.3a), read from the store by the engine alone.
     fn refresh_meta(&mut self, deps: &EpisodeDeps) {
         let Some(aid) = self.for_id else { return };
-        self.last_used = deps.store.get_last_used(aid).ok().flatten();
         self.avail = deps
             .registry
             .iter()
@@ -742,15 +746,6 @@ impl EpisodeSession {
         self.serving.as_deref()
     }
 
-    /// The remembered (last-used) provider for the rail, or, inside a live
-    /// settle window, the cycle aim the user is driving.
-    pub fn remembered(&self) -> Option<&str> {
-        if self.cycle_debounce.is_armed() {
-            return self.cycle_aim.as_deref();
-        }
-        self.last_used.as_deref()
-    }
-
     pub fn avail(&self) -> &[(String, ProviderAvailability)] {
         &self.avail
     }
@@ -766,6 +761,18 @@ impl EpisodeSession {
     /// A fallback walk is armed (03 §6.4); the prewarm walk yields to it.
     pub fn walk_active(&self) -> bool {
         self.walk.is_some()
+    }
+
+    /// The selection cursor for the provider row (DESIGN 5.3a): the aim
+    /// while the `v` window is armed (each press must visibly move it), then
+    /// the provider the in-flight walk hop is probing. None at rest; the
+    /// landing's `▸` takes over.
+    pub fn probing(&self) -> Option<&str> {
+        if self.cycle_debounce.is_armed() {
+            return self.cycle_aim.as_deref();
+        }
+        self.loading.as_ref()?;
+        self.walk_provider.as_deref()
     }
 
     /// A background write changed availability for `anilist_id` (prewarm,
@@ -803,18 +810,31 @@ impl EpisodeSession {
     pub(crate) fn seeded(
         for_id: i64,
         serving: Option<&str>,
-        last_used: Option<&str>,
         avail: Vec<(String, ProviderAvailability)>,
         episodes: Vec<String>,
     ) -> EpisodeSession {
         EpisodeSession {
             for_id: Some(for_id),
             serving: serving.map(str::to_string),
-            last_used: last_used.map(str::to_string),
             avail,
             episodes,
             ..EpisodeSession::default()
         }
+    }
+
+    /// Render-test seed for the mid-walk state: a hop in flight on `provider`.
+    pub(crate) fn with_probing(mut self, provider: &str) -> EpisodeSession {
+        self.walk_provider = Some(provider.to_string());
+        self.loading = Some(AsyncStart::new(Instant::now()));
+        self
+    }
+
+    /// Render-test seed for the armed-window state: the aim on `provider`,
+    /// no walk fired yet.
+    pub(crate) fn with_aim(mut self, provider: &str) -> EpisodeSession {
+        self.cycle_aim = Some(provider.to_string());
+        self.cycle_debounce.arm(Instant::now(), PIN_SETTLE);
+        self
     }
 }
 
@@ -1432,9 +1452,9 @@ mod tests {
             }]
         );
         assert_eq!(
-            rig.session.remembered(),
+            rig.session.probing(),
             Some("senshi"),
-            "rail follows the aim"
+            "the cursor follows the aim inside the window"
         );
         assert_eq!(
             rig.world.store.get_last_used(5).unwrap(),
@@ -1449,15 +1469,19 @@ mod tests {
         );
         rig.world.now += PIN_SETTLE;
         let fb = rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        assert!(
+            fb.is_empty(),
+            "manual hops are silent; the row carries them"
+        );
         assert_eq!(
-            fb,
-            vec![Feedback::Hop {
-                provider: "senshi".into()
-            }]
+            rig.session.probing(),
+            Some("senshi"),
+            "the in-flight hop lights the probing token"
         );
         let fb = rig.world.settle(&mut rig.session, "");
         assert!(fb.is_empty());
         assert_eq!(rig.session.serving(), Some("senshi"));
+        assert_eq!(rig.session.probing(), None, "landing clears the probe");
         assert_eq!(rig.session.cursor(), 1, "walk landing keeps the cursor");
         assert_eq!(rig.world.store.bindings_for(5).unwrap().len(), 2);
         assert_eq!(
@@ -1465,7 +1489,6 @@ mod tests {
             Some("senshi"),
             "the landing is the confirmation write"
         );
-        assert_eq!(rig.session.remembered(), Some("senshi"), "aim resolved");
 
         // v again: wraps past the end of the circle back to megaplay; the
         // landing matches the walk-order head, so the row clears.
@@ -1528,11 +1551,10 @@ mod tests {
 
         rig.world.now += Duration::from_millis(100);
         let fb = rig.session.maybe_commit_cycle(&rig.world.deps(""));
+        assert!(fb.is_empty(), "manual hops are silent");
         assert_eq!(
-            fb,
-            vec![Feedback::Hop {
-                provider: "anibd".into()
-            }],
+            rig.session.probing(),
+            Some("anibd"),
             "one walk, straight to the settled aim"
         );
         let fb = rig.world.settle(&mut rig.session, "");
@@ -1628,12 +1650,7 @@ mod tests {
         rig.session.cycle_provider(&rig.world.deps(""));
         rig.world.now += PIN_SETTLE;
         let fb = rig.session.maybe_commit_cycle(&rig.world.deps(""));
-        assert_eq!(
-            fb,
-            vec![Feedback::Hop {
-                provider: "senshi".into()
-            }]
-        );
+        assert!(fb.is_empty(), "manual hops are silent");
         assert_eq!(rig.session.serving(), Some("senshi"), "landed from cache");
         assert!(rig.session.loading().is_none());
         assert!(
@@ -1798,7 +1815,7 @@ mod tests {
         rig.world.settle(&mut rig.session, "");
         assert_eq!(rig.session.serving(), Some("senshi"));
         assert_eq!(
-            rig.session.remembered(),
+            rig.session.probing(),
             Some("megaplay"),
             "the landing resolves its own walk, never the live press"
         );
@@ -1830,7 +1847,7 @@ mod tests {
         assert_eq!(rig.session.serving(), Some("megaplay"));
 
         rig.session.cycle_provider(&rig.world.deps(""));
-        assert_eq!(rig.session.remembered(), Some("senshi"));
+        assert_eq!(rig.session.probing(), Some("senshi"));
         rig.session.engage(&canonical(6), &rig.world.deps(""));
         rig.world.settle(&mut rig.session, "");
         assert_eq!(rig.session.serving(), Some("megaplay"), "show 6 resolves");
@@ -1882,7 +1899,6 @@ mod tests {
         rig.world.store.add_to_library(&c, 50).unwrap();
         rig.world.store.set_last_used(5, Some("senshi")).unwrap();
         rig.session.engage(&c, &rig.world.deps(""));
-        assert_eq!(rig.session.remembered(), Some("senshi"));
         assert_eq!(
             rig.session.avail(),
             [
@@ -1899,7 +1915,6 @@ mod tests {
             ("megaplay".to_string(), ProviderAvailability::Bound)
         );
         assert_eq!(rig.world.store.get_last_used(5).unwrap(), None);
-        assert_eq!(rig.session.remembered(), None);
     }
 
     #[test]

@@ -841,26 +841,26 @@ fn rank_value(entry: &Enrichment) -> Option<String> {
 }
 
 /// One token on the §5.3a provider row. `marker` carries availability as
-/// shape; `serving`/`pinned` are independent and each drive their own fg boost
-/// in `provider_line`, so a pin-flip miss renders as two elevated tokens.
+/// shape; `serving`/`probing` are independent and each drive their own fg
+/// boost in `provider_line`, so a mid-walk row renders the stale `▸` and the
+/// live probe as two elevated tokens.
 struct ProviderToken {
     marker: char,
     name: String,
     serving: bool,
-    pinned: bool,
+    probing: bool,
 }
 
 /// Provider tokens in fixed registry order (§5.3a): `▸` serving, `+` bound,
 /// `-` fresh negative, `?` unchecked; shape carries the state, not color.
-/// Dim only when nothing is known about any provider. A pin naming a provider
-/// outside the registry lands on no token and renders nowhere (§5.3a).
+/// Dim only when nothing is known about any provider.
 fn provider_value(session: &EpisodeSession) -> Option<(Vec<ProviderToken>, bool)> {
     let avail = session.avail();
     if avail.is_empty() {
         return None;
     }
     let serving = session.serving();
-    let pin = session.remembered();
+    let probing = session.probing();
     let mut informative = false;
     let tokens: Vec<ProviderToken> = avail
         .iter()
@@ -886,7 +886,7 @@ fn provider_value(session: &EpisodeSession) -> Option<(Vec<ProviderToken>, bool)
                 marker,
                 name: name.clone(),
                 serving: is_serving,
-                pinned: pin == Some(name.as_str()),
+                probing: probing == Some(name.as_str()),
             }
         })
         .collect();
@@ -915,14 +915,11 @@ fn meta_line(fields: &[MetaField], palette: &Palette) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The dedicated provider row under the compact line (§5.3a). Never a text
-/// segment: the pin takes `fg` + bold on ANY marker, serving takes `fg`,
-/// everything else stays `fg2`.
-///
-/// Do not re-add a marker gate on the pin lift: PinKept and transient misses
-/// make pin-on-unconfirmed the ordinary state, and a gated pin reads as the
-/// app dropping the selection (§5.3a, ROD-524). The marker carries
-/// availability; bold never claims it.
+/// The dedicated provider row under the compact line (§5.3a, ROD-525).
+/// Never a text segment: the probing token (the in-flight walk hop) takes
+/// `fg` + bold on any marker, serving takes `fg`, everything else stays
+/// `fg2`. Mid-walk `▸` is stale by definition; the probing token is the one
+/// truthful selection signal until the hop lands, so it is never gated.
 fn provider_line(session: &EpisodeSession, palette: &Palette) -> Option<Line<'static>> {
     let (tokens, dim) = provider_value(session)?;
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -932,7 +929,7 @@ fn provider_line(session: &EpisodeSession, palette: &Palette) -> Option<Line<'st
         }
         let style = if dim {
             Style::new().fg(palette.fg3)
-        } else if token.pinned {
+        } else if token.probing {
             Style::new().fg(palette.fg).add_modifier(Modifier::BOLD)
         } else if token.serving {
             Style::new().fg(palette.fg)
@@ -1363,14 +1360,14 @@ mod tests {
         let session = EpisodeSession::seeded(
             1,
             Some("megaplay"),
-            Some("senshi"),
             vec![
                 ("megaplay".into(), Bound),
                 ("senshi".into(), Absent),
                 ("allanime".into(), Unchecked),
             ],
             vec!["1".into()],
-        );
+        )
+        .with_probing("senshi");
         let (tokens, dim) = provider_value(&session).unwrap();
         // Serving outranks bound; absence and unchecked keep their shapes.
         let shapes: Vec<String> = tokens
@@ -1379,16 +1376,15 @@ mod tests {
             .collect();
         assert_eq!(shapes, ["▸megaplay", "-senshi", "?allanime"]);
         assert!(!dim);
-        assert!(tokens[0].serving && !tokens[0].pinned);
+        assert!(tokens[0].serving && !tokens[0].probing);
         assert!(
-            tokens[1].pinned && !tokens[1].serving,
-            "pin rides its own token"
+            tokens[1].probing && !tokens[1].serving,
+            "the probe rides its own token"
         );
 
         // Nothing known anywhere: tokens still emit, row dims.
         let bare = EpisodeSession::seeded(
             1,
-            None,
             None,
             vec![("megaplay".into(), Unchecked)],
             vec!["1".into()],
@@ -1396,7 +1392,7 @@ mod tests {
         let (tokens, dim) = provider_value(&bare).unwrap();
         assert_eq!(tokens[0].marker, '?');
         assert!(dim, "all-unchecked dims the row");
-        assert!(!tokens[0].pinned, "unpinned");
+        assert!(!tokens[0].probing, "no hop in flight");
     }
 
     #[test]
@@ -1429,62 +1425,55 @@ mod tests {
     }
 
     #[test]
-    fn provider_row_encodes_pin_and_serving_on_the_ladder() {
+    fn provider_row_encodes_probe_and_serving_on_the_ladder() {
         use crate::store::ProviderAvailability::Bound;
         let palette = &crate::tui::theme::TERMINAL_GHOST;
-        // Pin/serving divergence: two elevated tokens, no pin text anywhere.
-        let split = EpisodeSession::seeded(
+        // Mid-walk: the stale serving token and the live probe are two
+        // elevated tokens, no text segment anywhere.
+        let midwalk = EpisodeSession::seeded(
             1,
             Some("megaplay"),
-            Some("senshi"),
             vec![("megaplay".into(), Bound), ("senshi".into(), Bound)],
             vec!["1".into()],
-        );
-        let line = provider_line(&split, palette).unwrap();
+        )
+        .with_probing("senshi");
+        let line = provider_line(&midwalk, palette).unwrap();
         assert_eq!(line_text(&line), "▸megaplay +senshi · [v]");
         let serving = token_style(&line, "▸megaplay");
         assert_eq!(serving.fg, Some(palette.fg));
         assert!(!is_bold(serving), "serving lifts fg only");
-        let pinned = token_style(&line, "+senshi");
-        assert_eq!(pinned.fg, Some(palette.fg));
-        assert!(is_bold(pinned), "the pin is the bold token");
+        let probe = token_style(&line, "+senshi");
+        assert_eq!(probe.fg, Some(palette.fg));
+        assert!(is_bold(probe), "the probe is the bold token");
 
-        // Serving and pinned on one token: one boosted span, still bold.
-        let together = EpisodeSession::seeded(
+        // At rest: the serving token lifts, nothing goes bold but the hint,
+        // and last-used renders nothing (an internal default, 5.3a).
+        let rest = EpisodeSession::seeded(
             1,
-            Some("megaplay"),
             Some("megaplay"),
             vec![("megaplay".into(), Bound), ("senshi".into(), Bound)],
             vec!["1".into()],
         );
-        let line = provider_line(&together, palette).unwrap();
-        assert_eq!(line_text(&line), "▸megaplay +senshi · [v]");
-        assert!(is_bold(token_style(&line, "▸megaplay")));
-        assert_eq!(token_style(&line, "+senshi").fg, Some(palette.fg2));
-
-        // Unpinned: the serving token lifts, nothing goes bold but the hint.
-        let unpinned = EpisodeSession::seeded(
-            1,
-            Some("megaplay"),
-            None,
-            vec![("megaplay".into(), Bound)],
-            vec!["1".into()],
-        );
-        let line = provider_line(&unpinned, palette).unwrap();
+        let line = provider_line(&rest, palette).unwrap();
         assert_eq!(
             line_text(&line),
-            "▸megaplay · [v]",
+            "▸megaplay +senshi · [v]",
             "cycle hint always trails"
         );
         assert!(!is_bold(token_style(&line, "▸megaplay")));
+        assert_eq!(token_style(&line, "+senshi").fg, Some(palette.fg2));
+        assert!(
+            !is_bold(token_style(&line, "+senshi")),
+            "last-used is not a render register"
+        );
         assert!(
             is_bold(token_style(&line, "v")),
             "hint bold is its own register"
         );
 
-        // Both registers bold in one row: the §1.3 carve-out, asserted where it
-        // actually happens rather than inferred across two cases.
-        let line = provider_line(&split, palette).unwrap();
+        // Both registers bold in one row: the 1.3 carve-out, asserted where
+        // it actually happens rather than inferred across two cases.
+        let line = provider_line(&midwalk, palette).unwrap();
         assert!(
             is_bold(token_style(&line, "+senshi")) && is_bold(token_style(&line, "v")),
             "state bold and hint bold coexist"
@@ -1498,54 +1487,54 @@ mod tests {
     /// unconfirmed provider (mid-cycle, PinKept, transient miss) takes the
     /// full lift; a gate here made the selection appear to snap back to the
     /// serving provider, which reads as the app overriding the user.
+    /// ROD-525: the probing token is ungated, bold+fg on any marker, because
+    /// mid-walk it is the only truthful selection signal; the dim row stays
+    /// flat (no hop can be in flight with zero knowledge AND no serving grid
+    /// worth walking from, and the row is a placeholder).
     #[test]
-    fn pin_highlight_is_ungated_selection() {
+    fn probing_token_is_ungated_on_any_marker() {
         use crate::store::ProviderAvailability::{Absent, Bound, Unchecked};
         let palette = &crate::tui::theme::TERMINAL_GHOST;
         let unchecked = EpisodeSession::seeded(
             1,
             None,
-            Some("senshi"),
             vec![("megaplay".into(), Bound), ("senshi".into(), Unchecked)],
             vec!["1".into()],
-        );
+        )
+        .with_probing("senshi");
         let line = provider_line(&unchecked, palette).unwrap();
-        let pin = token_style(&line, "?senshi");
-        assert!(is_bold(pin), "the selection is bold on ?");
-        assert_eq!(pin.fg, Some(palette.fg), "and takes the full lift");
+        let probe = token_style(&line, "?senshi");
+        assert!(is_bold(probe), "the probe is bold on ?");
+        assert_eq!(probe.fg, Some(palette.fg), "and takes the full lift");
         assert_eq!(token_style(&line, "+megaplay").fg, Some(palette.fg2));
 
-        // Same on a provider confirmed absent: a kept pin stays the
-        // highlight; the `-` marker carries the availability verdict.
-        let absent = EpisodeSession::seeded(
-            1,
-            None,
-            Some("senshi"),
-            vec![("senshi".into(), Absent)],
-            vec!["1".into()],
-        );
-        let kept = token_style(&provider_line(&absent, palette).unwrap(), "-senshi");
-        assert!(is_bold(kept), "a kept pin on absent stays the highlight");
-        assert_eq!(kept.fg, Some(palette.fg));
+        // Same on a provider confirmed absent: a manual first hop probes
+        // through absence, and its token must light while it does.
+        let absent =
+            EpisodeSession::seeded(1, None, vec![("senshi".into(), Absent)], vec!["1".into()])
+                .with_probing("senshi");
+        let probe = token_style(&provider_line(&absent, palette).unwrap(), "-senshi");
+        assert!(is_bold(probe), "the probe lights on - too");
+        assert_eq!(probe.fg, Some(palette.fg));
 
-        // Nothing known: the row dims whole and the gate leaves it flat.
-        let bare = EpisodeSession::seeded(
+        // Inside the settle window the aim is the cursor (ROD-525): each
+        // press must visibly move it before any walk fires, or the burst
+        // feels dead.
+        let aimed = EpisodeSession::seeded(
             1,
-            None,
             Some("megaplay"),
-            vec![("megaplay".into(), Unchecked)],
+            vec![("megaplay".into(), Bound), ("senshi".into(), Unchecked)],
             vec!["1".into()],
-        );
-        let line = provider_line(&bare, palette).unwrap();
-        let token = token_style(&line, "?megaplay");
-        assert_eq!(token.fg, Some(palette.fg3));
-        assert!(!is_bold(token), "the dim row admits no boost");
+        )
+        .with_aim("senshi");
+        let cursor = token_style(&provider_line(&aimed, palette).unwrap(), "?senshi");
+        assert!(is_bold(cursor), "the armed aim lights before the walk");
+        assert_eq!(cursor.fg, Some(palette.fg));
 
-        // Serving off a still-unchecked entry: the derived `▸` marker wins
-        // over the raw availability, so the token promotes.
+        // Serving off a still-unchecked entry: the derived marker wins over
+        // the raw availability, so the token promotes.
         let racing = EpisodeSession::seeded(
             1,
-            Some("megaplay"),
             Some("megaplay"),
             vec![("megaplay".into(), Unchecked)],
             vec!["1".into()],
@@ -1554,19 +1543,7 @@ mod tests {
         assert_eq!(line_text(&line), "▸megaplay · [v]");
         let token = token_style(&line, "▸megaplay");
         assert_eq!(token.fg, Some(palette.fg), "serving is never the dim row");
-        assert!(is_bold(token), "serving + pinned is one bold token");
-
-        // A pin outside the registry renders nowhere at all.
-        let retired = EpisodeSession::seeded(
-            1,
-            Some("megaplay"),
-            Some("gone"),
-            vec![("megaplay".into(), Bound)],
-            vec!["1".into()],
-        );
-        let line = provider_line(&retired, palette).unwrap();
-        assert_eq!(line_text(&line), "▸megaplay · [v]");
-        assert!(!is_bold(token_style(&line, "▸megaplay")));
+        assert!(!is_bold(token), "no probe in flight, no bold");
     }
 
     #[test]

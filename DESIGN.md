@@ -1391,7 +1391,7 @@ independent:
 |---|---|
 | Non-serving, not being probed | `fg2` |
 | Serving | `fg` |
-| Being probed (mid-walk, auto or manual) | probing token: elevated register; exact glyph/weight settles in design review, §10 |
+| Aimed (`v` settle window armed) or being probed (mid-walk, auto or manual) | the selection cursor: elevated register; exact glyph/weight settles in design review, §10 |
 
 `fg3` stays reserved for the nothing-known row (every provider unchecked), which
 dims whole; a healthy non-serving token never drops to it.
@@ -1400,8 +1400,10 @@ dims whole; a healthy non-serving token never drops to it.
   longer a persistent per-show preference for the UI to mark: last-used (03 §5.1)
   is an internal default the walk starts from, not a user-facing choice, so an
   ordinary open has nothing to render beyond `serving`. The elevated register
-  instead marks whichever token an **in-flight walk hop is currently probing**,
-  auto-fallback or manual `v` alike. A walk is exactly the window where `serving`
+  instead marks the **selection cursor**: the aim while the `v` settle window
+  is armed (every press must visibly move it before any walk fires, or the
+  burst reads as dead input), then whichever token the in-flight walk hop is
+  currently probing, auto-fallback or manual `v` alike. A walk is exactly the window where `serving`
   (`▸`) is stale, since the hop hasn't landed yet, so the probing token is the
   only truthful selection signal until it does. It clears the instant the hop
   lands, at which point `▸` on the landed token carries the truth again. This
