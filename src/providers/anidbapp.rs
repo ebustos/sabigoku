@@ -1,17 +1,12 @@
-//! anidb.app `StreamProvider` (ROD-516). Seam tier C, confidence tier A: the
-//! site exposes no AniList-keyed endpoint, so `canonical_key` cannot answer.
-//! Binding runs through title search, and each candidate carries the AniList
-//! and MAL ids scraped off its detail page, which `resolver::best_id_match`
-//! confirms before any fuzzy title scoring ever runs.
+//! anidb.app `StreamProvider` (ROD-516). Seam tier C, confidence tier A: see
+//! `canonical_key`.
 //!
 //! Chain: /search/suggestions (HTML cards) -> /anime/{slug} (external ids) ->
 //! /api/frontend/anime/{siteId}/episodes -> /api/frontend/episode/{id}/languages
-//! -> embed HTML -> jwplayer HLS master. A default UA gets 403; a browser UA
-//! passes every surface, and no endpoint carries a session gate.
+//! -> embed HTML -> jwplayer HLS master.
 //!
-//! The edge also scores HTTP/1.1 header casing against that UA, which is why
-//! the reqwest `http2` feature is mandatory (see Cargo.toml). Drop it and every
-//! request here answers a challenge page.
+//! A default UA gets 403. The edge also scores HTTP/1.1 header casing against a
+//! browser UA, so the reqwest `http2` feature is mandatory (see Cargo.toml).
 
 use serde::Deserialize;
 
@@ -95,8 +90,7 @@ fn parse_episodes(raw: &[u8]) -> Result<Vec<Episode>, ProviderError> {
             })
         })
         .collect();
-    // Stable: dedup keeps the first of a same-numbered pair, so which row wins
-    // has to be the one the site listed first, not whichever the sort landed.
+    // Stable so dedup keeps the row the site listed first.
     eps.sort_by_key(|e| e.number);
     eps.dedup_by_key(|e| e.number);
     Ok(eps)
@@ -156,11 +150,10 @@ fn parse_card(block: &str) -> Option<Card> {
     })
 }
 
-/// Slug and trailing site id from a card href.
-///
-/// Only the last path segment is kept and the host is a constant, so a forged
-/// href cannot move the probe off our origin. The charset guard is narrower
-/// than that: it rejects a segment that would corrupt the URL we build from it.
+/// Slug and trailing site id from a card href. Only the last path segment is
+/// kept and the host is a constant, so a forged href cannot move the probe off
+/// our origin; the charset guard only rejects a segment that would corrupt the
+/// URL built from it.
 fn split_slug(href: &str) -> Option<(String, String)> {
     if !href.contains("/anime/") {
         return None;
@@ -291,13 +284,10 @@ fn id_after(html: &str, marker: &str) -> Option<i64> {
     rest[..end].parse().ok()
 }
 
-/// Cloudflare interstitial served at 200, where an empty parse would otherwise
-/// pose as "no results" and stamp a 7-day absence.
-///
-/// Two markers that look usable are not. `/cdn-cgi/challenge-platform` ships on
-/// good embed pages, so keying on it would fail every playback. "Just a moment"
-/// is ordinary loading copy anywhere in a body; only the interstitial puts it in
-/// the title, so match it there or a synopsis could take the provider down.
+/// Cloudflare interstitial served at 200; an empty parse would otherwise read
+/// as "no results" and stamp a 7-day absence. Neither obvious marker works
+/// bare: `/cdn-cgi/challenge-platform` ships on good embed pages, and "Just a
+/// moment" is ordinary loading copy, so it counts only in the title.
 fn is_challenge(html: &str) -> bool {
     html.contains("cf_chl_opt")
         || html.contains("__cf_chl")
@@ -306,12 +296,10 @@ fn is_challenge(html: &str) -> bool {
             .any(|t| t.contains("Just a moment"))
 }
 
-/// HLS master out of the jwplayer setup.
-///
-/// The `sources` `file:` value first, then any quoted `.m3u8` as a fallback so
-/// a config rename does not break extraction. Order is the point: the scan
-/// takes the FIRST `.m3u8` on the page, which need not be the real source if
-/// anything else on it (an ad slot, a preview thumbnail) carries one earlier.
+/// HLS master out of the jwplayer setup: the `file:` value first, then any
+/// quoted `.m3u8` so a config rename does not break extraction. Order matters,
+/// the fallback takes the FIRST `.m3u8` and an ad slot or preview thumbnail
+/// could carry one earlier.
 fn extract_hls(html: &str) -> Option<String> {
     let url = config_value(html, "file")
         .filter(|u| u.contains(".m3u8"))
@@ -341,14 +329,10 @@ fn first_quoted_m3u8(html: &str) -> Option<String> {
     Some(html[start..end].to_string())
 }
 
-/// Vet a scraped stream url before it becomes the play url.
-///
-/// Scraped off the page, so it is untrusted twice over: under a quality cap we
-/// fetch it ourselves, and either way it leaves as the play url. `cap_variant`
-/// falls back to the raw value when its own guard refuses, so the SSRF check
-/// has to happen here too, not only inside it. Pure, so it is unit-testable:
-/// the transport path cannot reach it, because the embed fetch that precedes it
-/// is itself guarded.
+/// Vet a scraped stream url before it becomes the play url. `cap_variant` falls
+/// back to the raw value when its own guard refuses, so the SSRF check has to
+/// run here too. Pure because the transport path cannot reach it: the embed
+/// fetch ahead of it is itself guarded.
 fn stream_url_ok(url: &str) -> bool {
     is_absolute_url(url) && clean_arg(url) && guard_fetch_url(url).is_ok()
 }
@@ -433,16 +417,11 @@ impl AniDbApp {
 
     /// Index of the last dubbed episode, or None when the show has no dub.
     ///
-    /// Rests on dub availability being a prefix: dubs lag the sub release, they
-    /// do not perforate it. Both ends dubbed is therefore taken as the whole run
-    /// dubbed, without probing the interior.
-    ///
-    /// A perforated show breaks that both ways. A hole below the boundary
-    /// over-reports, which lands softly: resolve returns a clean miss for the
-    /// phantom episode. A hole ON a probe point drags the boundary down and
-    /// under-reports, which is the quiet one, since real dubbed episodes just
-    /// stop being listed. The alternative is a language call per episode, which
-    /// a 1000-episode show cannot afford.
+    /// Rests on dub availability being a prefix, so both ends dubbed is taken as
+    /// the whole run. A perforated show breaks it both ways: a hole below the
+    /// boundary over-reports (resolve then returns a clean miss), a hole ON a
+    /// probe point under-reports silently. The alternative, a language call per
+    /// episode, is what a 1000-episode show cannot afford.
     fn dub_prefix(&self, eps: &[Episode]) -> Result<Option<usize>, ProviderError> {
         let Some(last) = eps.len().checked_sub(1) else {
             return Ok(None);
@@ -543,9 +522,8 @@ impl StreamProvider for AniDbApp {
         for card in parse_cards(&html).into_iter().take(MAX_PROBE) {
             let (anilist_id, mal_id) = match self.probe_ids(&card.slug) {
                 Ok(ids) => ids,
-                // A block is provider-wide, so stop and let the walk hop. Any
-                // other failure costs this one card its ids, not the search:
-                // it can still bind on title.
+                // A block is provider-wide: stop and let the walk hop. Other
+                // failures cost this card its ids, not the search.
                 Err(e @ ProviderError::Forbidden { .. }) => return Err(e),
                 Err(_) => (None, None),
             };
@@ -563,9 +541,8 @@ impl StreamProvider for AniDbApp {
     }
 
     /// Sub lists every episode: `jpn` rides all of them, and confirming a
-    /// universal would cost a language call per listing. Dub is bisected, and
-    /// an empty result is per-track absence the way allanime already reports
-    /// it.
+    /// universal would cost a language call per listing. Dub is bisected; an
+    /// empty result is per-track absence, as allanime already reports it.
     fn episodes(
         &self,
         provider_id: &str,
@@ -643,9 +620,8 @@ impl StreamProvider for AniDbApp {
             resolution: None,
             referer: Some(REFERER.to_string()),
             user_agent: Some(UA.to_string()),
-            // Segments are plain TS named .xls and served as a spreadsheet
-            // type; mpv must relax its demuxer gate. No decoy prefix, so the
-            // stripping proxy stays out of it.
+            // Plain TS named .xls with a spreadsheet content type: mpv must
+            // relax its demuxer gate. No decoy prefix, so no stripping proxy.
             cloaked_segments: true,
             decloak_segments: false,
             sub_url: None,
@@ -737,20 +713,15 @@ mod tests {
 
     #[test]
     fn split_slug_refuses_a_slug_that_could_escape_the_path() {
-        // The slug is spliced into the detail URL, so anything that could
-        // leave /anime/{slug} on our own origin must be refused outright.
         assert_eq!(split_slug("https://anidb.app/anime/..%2f..%2fetc-1"), None);
         assert_eq!(split_slug("https://anidb.app/anime/a.b-1"), None);
-        // Only the last path segment survives, so traversal in the card href
-        // cannot travel with it into the rebuilt url.
+        // Only the last segment survives, so traversal never rides along.
         assert_eq!(
             split_slug("https://evil.test/anime/../../x-1"),
             Some(("x-1".into(), "1".into()))
         );
-        // No trailing numeric id, or nothing before it.
         assert_eq!(split_slug("https://anidb.app/anime/no-id-here"), None);
         assert_eq!(split_slug("https://anidb.app/anime/-12"), None);
-        // Not a show link at all.
         assert_eq!(split_slug("https://anidb.app/about-1"), None);
     }
 
@@ -828,7 +799,6 @@ mod tests {
         assert!(!stream_url_ok("http://127.0.0.1:8080/x.m3u8"));
         assert!(!stream_url_ok("http://localhost/x.m3u8"));
         assert!(!stream_url_ok("http://10.0.0.5/x.m3u8"));
-        // Non-http, relative, and argv-hostile.
         assert!(!stream_url_ok("file:///etc/passwd"));
         assert!(!stream_url_ok("/relative/master.m3u8"));
         assert!(!stream_url_ok("https://h.test/a b.m3u8"));
@@ -838,8 +808,6 @@ mod tests {
 
     #[test]
     fn extract_hls_prefers_the_player_source_over_an_earlier_m3u8() {
-        // Anything on the page can carry a .m3u8 ahead of the real source; the
-        // configured `file` is the one the player would actually load.
         let html = r#"<img data-preview="https://ads.test/decoy.m3u8">
             <script>var setup = { sources: [{ file: 'https://hls.test/real/master.m3u8' }] };</script>"#;
         assert_eq!(
@@ -850,8 +818,6 @@ mod tests {
 
     #[test]
     fn extract_hls_falls_back_when_the_config_key_moves() {
-        // No `file` key: the scan still finds a stream, which is the point of
-        // keeping the fallback.
         let html = r#"var s = { src: "https://hls.test/only/master.m3u8" };"#;
         assert_eq!(
             extract_hls(html).as_deref(),
@@ -913,8 +879,7 @@ mod tests {
 
     #[test]
     fn parse_episodes_dedupes_repeated_numbers_keeping_the_first_listed() {
-        // Which duplicate survives must be the site's first, not whichever the
-        // sort happened to leave in front, so the id we serve is deterministic.
+        // The surviving id must be deterministic, not sort-order roulette.
         let dupes = br#"{"episodes":[
             {"id":11,"number":2},{"id":12,"number":2},{"id":13,"number":2},
             {"id":21,"number":1},{"id":22,"number":1}
