@@ -115,13 +115,21 @@ fn live_resolve_returns_a_playable_link() {
     assert!(!sl.decloak_segments);
 }
 
+/// A cap has to actually select a variant. `cap_variant` returns None on any
+/// failure and resolve then keeps the master, so "an m3u8 came back" would pass
+/// just as happily on a silent no-op.
 #[test]
 #[ignore = "hits live anidb.app"]
 fn live_resolve_honors_a_quality_cap() {
-    let sl = provider()
+    let capped = provider()
         .resolve(FRIEREN_S1_SITE, "1", Translation::Sub, Quality::P720)
         .expect("resolve");
-    assert!(sl.url.contains(".m3u8"));
+    assert!(capped.url.contains(".m3u8"));
+    assert!(
+        !capped.url.ends_with("master.m3u8"),
+        "cap fell back to the master ladder: {}",
+        capped.url
+    );
 }
 
 /// The offset has to survive resolve too, not just the listing.

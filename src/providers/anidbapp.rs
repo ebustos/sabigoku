@@ -95,7 +95,9 @@ fn parse_episodes(raw: &[u8]) -> Result<Vec<Episode>, ProviderError> {
             })
         })
         .collect();
-    eps.sort_unstable_by_key(|e| e.number);
+    // Stable: dedup keeps the first of a same-numbered pair, so which row wins
+    // has to be the one the site listed first, not whichever the sort landed.
+    eps.sort_by_key(|e| e.number);
     eps.dedup_by_key(|e| e.number);
     Ok(eps)
 }
@@ -156,9 +158,9 @@ fn parse_card(block: &str) -> Option<Card> {
 
 /// Slug and trailing site id from a card href.
 ///
-/// The charset guard is what keeps the rebuilt detail URL on our own origin:
-/// the slug is spliced into a path, so a `/` or `.` here would let a forged
-/// card redirect the probe anywhere.
+/// Only the last path segment is kept and the host is a constant, so a forged
+/// href cannot move the probe off our origin. The charset guard is narrower
+/// than that: it rejects a segment that would corrupt the URL we build from it.
 fn split_slug(href: &str) -> Option<(String, String)> {
     if !href.contains("/anime/") {
         return None;
@@ -292,22 +294,63 @@ fn id_after(html: &str, marker: &str) -> Option<i64> {
 /// Cloudflare interstitial served at 200, where an empty parse would otherwise
 /// pose as "no results" and stamp a 7-day absence.
 ///
-/// Landmine: `/cdn-cgi/challenge-platform` is NOT a marker here. The site's own
-/// embed pages ship that script on a perfectly good response, so keying on it
-/// would fail every playback.
+/// Two markers that look usable are not. `/cdn-cgi/challenge-platform` ships on
+/// good embed pages, so keying on it would fail every playback. "Just a moment"
+/// is ordinary loading copy anywhere in a body; only the interstitial puts it in
+/// the title, so match it there or a synopsis could take the provider down.
 fn is_challenge(html: &str) -> bool {
-    html.contains("cf_chl_opt") || html.contains("__cf_chl") || html.contains("Just a moment")
+    html.contains("cf_chl_opt")
+        || html.contains("__cf_chl")
+        || tag_texts(html, "title")
+            .iter()
+            .any(|t| t.contains("Just a moment"))
 }
 
-/// HLS master out of the jwplayer setup. Anchored on `.m3u8` and widened to
-/// the enclosing quotes rather than keyed on `file:`, so a config rename does
-/// not break extraction.
+/// HLS master out of the jwplayer setup.
+///
+/// The `sources` `file:` value first, then any quoted `.m3u8` as a fallback so
+/// a config rename does not break extraction. Order is the point: the scan
+/// takes the FIRST `.m3u8` on the page, which need not be the real source if
+/// anything else on it (an ad slot, a preview thumbnail) carries one earlier.
 fn extract_hls(html: &str) -> Option<String> {
+    let url = config_value(html, "file")
+        .filter(|u| u.contains(".m3u8"))
+        .or_else(|| first_quoted_m3u8(html))?;
+    url.starts_with("http").then_some(url)
+}
+
+/// Quoted value of `key: "..."` / `key: '...'`.
+fn config_value(html: &str, key: &str) -> Option<String> {
+    let at = html.find(key)?;
+    let rest = html[at + key.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let quote = *rest.as_bytes().first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let inner = &rest[1..];
+    let end = inner.find(quote as char)?;
+    Some(inner[..end].to_string())
+}
+
+/// First `.m3u8` on the page, widened to its enclosing quotes.
+fn first_quoted_m3u8(html: &str) -> Option<String> {
     let at = html.find(".m3u8")?;
     let start = html[..at].rfind(['"', '\''])? + 1;
     let end = at + html[at..].find(['"', '\''])?;
-    let url = &html[start..end];
-    url.starts_with("http").then(|| url.to_string())
+    Some(html[start..end].to_string())
+}
+
+/// Vet a scraped stream url before it becomes the play url.
+///
+/// Scraped off the page, so it is untrusted twice over: under a quality cap we
+/// fetch it ourselves, and either way it leaves as the play url. `cap_variant`
+/// falls back to the raw value when its own guard refuses, so the SSRF check
+/// has to happen here too, not only inside it. Pure, so it is unit-testable:
+/// the transport path cannot reach it, because the embed fetch that precedes it
+/// is itself guarded.
+fn stream_url_ok(url: &str) -> bool {
+    is_absolute_url(url) && clean_arg(url) && guard_fetch_url(url).is_ok()
 }
 
 // -- provider ---------------------------------------------------------------
@@ -391,9 +434,15 @@ impl AniDbApp {
     /// Index of the last dubbed episode, or None when the show has no dub.
     ///
     /// Rests on dub availability being a prefix: dubs lag the sub release, they
-    /// do not perforate it. A perforated show would over-report the run. The
-    /// alternative is a language call per episode, which a 1000-episode show
-    /// cannot afford.
+    /// do not perforate it. Both ends dubbed is therefore taken as the whole run
+    /// dubbed, without probing the interior.
+    ///
+    /// A perforated show breaks that both ways. A hole below the boundary
+    /// over-reports, which lands softly: resolve returns a clean miss for the
+    /// phantom episode. A hole ON a probe point drags the boundary down and
+    /// under-reports, which is the quiet one, since real dubbed episodes just
+    /// stop being listed. The alternative is a language call per episode, which
+    /// a 1000-episode show cannot afford.
     fn dub_prefix(&self, eps: &[Episode]) -> Result<Option<usize>, ProviderError> {
         let Some(last) = eps.len().checked_sub(1) else {
             return Ok(None);
@@ -579,8 +628,7 @@ impl StreamProvider for AniDbApp {
         let html = self.page_get(&embed)?;
         let master =
             extract_hls(&html).ok_or_else(|| ProviderError::Decode("no playable source".into()))?;
-        // Enters mpv argv: absolute http(s) + printable only.
-        if !is_absolute_url(&master) || !clean_arg(&master) {
+        if !stream_url_ok(&master) {
             return Err(ProviderError::Decode("bad stream url".into()));
         }
 
@@ -761,6 +809,63 @@ mod tests {
     }
 
     #[test]
+    fn is_challenge_ignores_loading_copy_outside_the_title() {
+        // "Just a moment" is ordinary body copy. Matching it anywhere would let
+        // a synopsis or an app shell take the whole provider offline.
+        assert!(!is_challenge(
+            r#"<title>Frieren</title><div id="app">Just a moment, loading...</div>"#
+        ));
+        assert!(!is_challenge("<p>Just a moment of silence.</p>"));
+    }
+
+    #[test]
+    fn stream_url_ok_refuses_what_must_never_become_a_play_url() {
+        assert!(stream_url_ok("https://hls.test/stream/master.m3u8"));
+        // Private/loopback: under a quality cap we would fetch this ourselves.
+        assert!(!stream_url_ok(
+            "http://169.254.169.254/latest/meta-data/x.m3u8"
+        ));
+        assert!(!stream_url_ok("http://127.0.0.1:8080/x.m3u8"));
+        assert!(!stream_url_ok("http://localhost/x.m3u8"));
+        assert!(!stream_url_ok("http://10.0.0.5/x.m3u8"));
+        // Non-http, relative, and argv-hostile.
+        assert!(!stream_url_ok("file:///etc/passwd"));
+        assert!(!stream_url_ok("/relative/master.m3u8"));
+        assert!(!stream_url_ok("https://h.test/a b.m3u8"));
+        assert!(!stream_url_ok("https://h.test/x.m3u8\r\nX-Evil: 1"));
+        assert!(!stream_url_ok(""));
+    }
+
+    #[test]
+    fn extract_hls_prefers_the_player_source_over_an_earlier_m3u8() {
+        // Anything on the page can carry a .m3u8 ahead of the real source; the
+        // configured `file` is the one the player would actually load.
+        let html = r#"<img data-preview="https://ads.test/decoy.m3u8">
+            <script>var setup = { sources: [{ file: 'https://hls.test/real/master.m3u8' }] };</script>"#;
+        assert_eq!(
+            extract_hls(html).as_deref(),
+            Some("https://hls.test/real/master.m3u8")
+        );
+    }
+
+    #[test]
+    fn extract_hls_falls_back_when_the_config_key_moves() {
+        // No `file` key: the scan still finds a stream, which is the point of
+        // keeping the fallback.
+        let html = r#"var s = { src: "https://hls.test/only/master.m3u8" };"#;
+        assert_eq!(
+            extract_hls(html).as_deref(),
+            Some("https://hls.test/only/master.m3u8")
+        );
+        // A `file` that is not a stream must not shadow a real one.
+        let html = r#"{"file": "poster.jpg", "src": "https://hls.test/x.m3u8"}"#;
+        assert_eq!(
+            extract_hls(html).as_deref(),
+            Some("https://hls.test/x.m3u8")
+        );
+    }
+
+    #[test]
     fn extract_hls_from_the_jwplayer_setup() {
         let html = r#"var setup = {
             sources: [{ file: 'https://hls.test/stream/abc/master.m3u8', type: 'hls' }],
@@ -807,11 +912,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_episodes_dedupes_repeated_numbers() {
-        let dupes = br#"{"episodes":[{"id":1,"number":1},{"id":2,"number":1}]}"#;
+    fn parse_episodes_dedupes_repeated_numbers_keeping_the_first_listed() {
+        // Which duplicate survives must be the site's first, not whichever the
+        // sort happened to leave in front, so the id we serve is deterministic.
+        let dupes = br#"{"episodes":[
+            {"id":11,"number":2},{"id":12,"number":2},{"id":13,"number":2},
+            {"id":21,"number":1},{"id":22,"number":1}
+        ]}"#;
         let eps = parse_episodes(dupes).unwrap();
-        assert_eq!(eps.len(), 1);
-        assert_eq!(eps[0].id, 1);
+        assert_eq!(eps.len(), 2);
+        assert_eq!(eps[0], Episode { id: 21, number: 1 });
+        assert_eq!(eps[1], Episode { id: 11, number: 2 });
     }
 
     #[test]
