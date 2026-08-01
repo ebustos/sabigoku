@@ -30,9 +30,14 @@ codegen-units = 1
 
 [dependencies]
 # spike_http (ROD-403): HTTPS POST + typed JSON. rustls avoids a system OpenSSL dep.
+# ROD-516: `http2` is not a perf knob, do not drop it. Without it the client is
+# pinned to HTTP/1.1, where it emits lowercase header names; an edge that scores
+# that against our browser UA answers a challenge page instead of content.
+# HTTP/2 mandates lowercase, so the same request passes.
 reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
   "json",
+  "http2",
   "rustls-tls",
 ] }
 serde = { version = "1", features = ["derive"] }
