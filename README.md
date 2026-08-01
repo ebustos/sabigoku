@@ -25,6 +25,7 @@ episodes in `mpv`. Real cover art. AniList sync.
 - [Development](#development)
 - [Stack](#stack)
 - [Why this exists](#why-this-exists)
+- [Contributing](#contributing)
 - [Acknowledgements](#acknowledgements)
 - [License](#license)
 
@@ -231,6 +232,13 @@ continues in the port docs wherever Rust deliberately diverges.
 Most of the code is AI-written under a personal agent setup. Architecture,
 planning, design, and review stay human. The learning is a layer up: read the
 code, question it, own the next move.
+
+## Contributing
+
+Personal project, not a community one. Bug reports are welcome. Feature pull
+requests are not, and get closed unmerged no matter how good they are.
+[`CONTRIBUTING.md`](https://github.com/vantroy/sabigoku/blob/master/CONTRIBUTING.md)
+has the full policy, including what I do take.
 
 ## Acknowledgements
 
