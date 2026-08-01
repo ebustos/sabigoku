@@ -860,7 +860,7 @@ fn provider_value(session: &EpisodeSession) -> Option<(Vec<ProviderToken>, bool)
         return None;
     }
     let serving = session.serving();
-    let pin = session.pin();
+    let pin = session.remembered();
     let mut informative = false;
     let tokens: Vec<ProviderToken> = avail
         .iter()

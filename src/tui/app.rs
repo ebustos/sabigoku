@@ -881,8 +881,6 @@ impl App {
             .shown()
             .is_some_and(|e| self.detail.episodes.engaged_for(e.anilist_id));
         if engaged {
-            let fb = self.detail.episodes.flush_pin_edit(&self.store);
-            self.apply_episode_feedback(fb, now);
             self.detail.episodes.reset();
             self.engage_detail(now, tx);
         }
@@ -974,7 +972,7 @@ impl App {
         }
         let fb = {
             let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
-            self.detail.episodes.maybe_commit_pin(&deps)
+            self.detail.episodes.maybe_commit_cycle(&deps)
         };
         self.apply_episode_feedback(fb, now);
         {
@@ -1145,8 +1143,8 @@ impl App {
         }
     }
 
-    /// `v` cycles the open show's provider pin (DESIGN 6.1); detail surfaces
-    /// only, inert elsewhere.
+    /// `v` walks the open show's provider circle (DESIGN 6.1, ROD-525);
+    /// detail surfaces only, inert elsewhere.
     fn on_pin_cycle(&mut self, now: Instant, tx: &EventTx) {
         let on_detail_surface = self.view == View::Detail
             || (matches!(self.view, View::Browse | View::History) && self.pane == Pane::Detail);
@@ -1155,7 +1153,7 @@ impl App {
         }
         let fb = {
             let deps = episode_deps(&self.store, &self.registry, &self.config, tx, now);
-            self.detail.episodes.cycle_pin(&deps)
+            self.detail.episodes.cycle_provider(&deps)
         };
         self.apply_episode_feedback(fb, now);
     }
@@ -1249,40 +1247,14 @@ impl App {
                     let copy = format!("trying {}…", self.display_name(&provider));
                     self.toasts.push(Kind::Warn, &copy, now);
                 }
-                Feedback::NoMatch { provider } => {
-                    // K-2 step 5: distinct from the pin-kept copy.
-                    let copy = format!("no match on {}", self.display_name(&provider));
-                    self.toasts.push(Kind::Warn, &copy, now);
-                }
-                Feedback::PinKept { provider } => {
-                    let copy = format!("no match on {}, pin kept", self.display_name(&provider));
-                    self.toasts.push(Kind::Warn, &copy, now);
-                }
                 Feedback::DeadEnd => self.toasts.push(Kind::Error, "no source found", now),
-                Feedback::PinUnreachable { provider } => {
-                    let copy = format!("couldn't reach {}", self.display_name(&provider));
-                    self.toasts.push(Kind::Warn, &copy, now);
-                }
-                Feedback::PinSet { provider } => {
-                    let copy = format!("pinned to {}", self.display_name(&provider));
-                    self.toasts.push(Kind::Success, &copy, now);
-                }
-                Feedback::PinCleared => self.toasts.push(Kind::Info, "provider pin cleared", now),
-                Feedback::PinPending => {
+                Feedback::CyclePending => {
                     self.toasts
                         .push(Kind::Info, "still resolving, try again shortly", now)
                 }
-                Feedback::PinNothing => {
+                Feedback::CycleNothing => {
                     self.toasts
-                        .push(Kind::Info, "no source: nothing to pin", now)
-                }
-                Feedback::PinSaveFailed { clearing } => {
-                    let copy = if clearing {
-                        "couldn't clear the provider pin"
-                    } else {
-                        "couldn't save the provider pin"
-                    };
-                    self.toasts.push(Kind::Error, copy, now);
+                        .push(Kind::Info, "no source: nothing to switch", now)
                 }
             }
         }
@@ -1568,23 +1540,19 @@ impl App {
                 .shown()
                 .is_some_and(|e| self.detail.episodes.engaged_for(e.anilist_id));
             if engaged {
-                let fb = self.detail.episodes.flush_pin_edit(&self.store);
-                self.apply_episode_feedback(fb, now);
                 self.detail.episodes.reset();
                 self.engage_detail(now, tx);
             }
         }
     }
 
-    /// Quit (`q` / `:q`): a dirty Settings tab persists first (DESIGN 7.2),
-    /// and a pin edit still inside its settle window commits its write;
-    /// Ctrl-C stays the emergency exit that skips both.
+    /// Quit (`q` / `:q`): a dirty Settings tab persists first (DESIGN 7.2);
+    /// Ctrl-C stays the emergency exit that skips this. A cycle aim still in
+    /// its window dies with the app: nothing landed, nothing to remember.
     fn on_quit(&mut self, now: Instant) {
         if self.view == View::Settings {
             self.persist_settings(now);
         }
-        // The toast this could return has no frame left to show in.
-        let _ = self.detail.episodes.flush_pin_edit(&self.store);
         self.quit = true;
     }
 
@@ -3715,7 +3683,7 @@ mod tests {
     }
 
     #[test]
-    fn v_cycles_the_pin_with_toasts_and_flip() {
+    fn v_walks_the_provider_circle_with_toasts() {
         let registry = teststub::registry(vec![
             teststub::StubProvider::new("megaplay")
                 .with_key("505")
@@ -3732,47 +3700,43 @@ mod tests {
         let t1 = open_first_result(&mut app, &tx, &rx, now);
         assert_eq!(app.detail.episodes.serving(), Some("megaplay"));
 
-        // The press toasts and moves the rail; the write waits for the
-        // settle tick (ROD-524).
+        // The press aims the next provider and toasts; nothing writes until
+        // a landing (ROD-525).
         app.tick(ch('v'), t1, &tx);
         let text = rendered(&mut app, 110, 32);
-        assert!(text.contains("pinned to megaplay"), "{text}");
-        assert_eq!(app.store.get_provider_pin(1).unwrap(), None);
+        assert!(text.contains("trying senshi…"), "{text}");
+        assert_eq!(app.store.get_last_used(1).unwrap(), None);
         let t2 = t1 + episodes::PIN_SETTLE;
         app.tick(Event::Tick, t2, &tx);
+        settle_feed(&mut app, &tx, &rx, t2);
+        assert_eq!(app.detail.episodes.serving(), Some("senshi"));
         assert_eq!(
-            app.store.get_provider_pin(1).unwrap().as_deref(),
-            Some("megaplay")
+            app.store.get_last_used(1).unwrap().as_deref(),
+            Some("senshi"),
+            "the landing writes the memory"
         );
 
+        // v again wraps to the head; landing there clears the memory.
         app.tick(ch('v'), t2, &tx);
-        let text = rendered(&mut app, 110, 32);
-        assert!(text.contains("pinned to senshi"), "{text}");
         let t3 = t2 + episodes::PIN_SETTLE;
         app.tick(Event::Tick, t3, &tx);
-        let text = rendered(&mut app, 110, 32);
-        assert!(text.contains("trying senshi…"), "{text}");
         settle_feed(&mut app, &tx, &rx, t3);
-        assert_eq!(app.detail.episodes.serving(), Some("senshi"));
-
-        app.tick(ch('v'), t3, &tx);
-        let text = rendered(&mut app, 110, 32);
-        assert!(text.contains("provider pin cleared"), "{text}");
-        let t4 = t3 + episodes::PIN_SETTLE;
-        app.tick(Event::Tick, t4, &tx);
-        assert_eq!(app.store.get_provider_pin(1).unwrap(), None);
+        assert_eq!(app.detail.episodes.serving(), Some("megaplay"));
+        assert_eq!(app.store.get_last_used(1).unwrap(), None);
 
         // v is a detail-surface key; on the list it must stay inert.
-        app.tick(key(KeyCode::Esc), t4, &tx);
-        let before = app.store.get_provider_pin(1).unwrap();
-        app.tick(ch('v'), t4, &tx);
-        assert_eq!(app.store.get_provider_pin(1).unwrap(), before);
+        app.tick(key(KeyCode::Esc), t3, &tx);
+        app.tick(ch('v'), t3, &tx);
+        let t4 = t3 + episodes::PIN_SETTLE;
+        app.tick(Event::Tick, t4, &tx);
+        assert_eq!(app.store.get_last_used(1).unwrap(), None);
+        assert_eq!(app.detail.episodes.serving(), Some("megaplay"));
     }
 
-    /// ROD-524: quitting inside the settle window commits the pin write; the
-    /// flip it would have fired dies with the app.
+    /// ROD-525: quitting inside the settle window drops the aim; nothing
+    /// landed, so nothing is remembered.
     #[test]
-    fn quit_inside_the_pin_window_commits_the_write() {
+    fn quit_inside_the_cycle_window_writes_nothing() {
         let registry = teststub::registry(vec![
             teststub::StubProvider::new("megaplay")
                 .with_key("505")
@@ -3785,19 +3749,15 @@ mod tests {
         );
         let t1 = open_first_result(&mut app, &tx, &rx, now);
         app.tick(ch('v'), t1, &tx);
-        assert_eq!(app.store.get_provider_pin(1).unwrap(), None);
         app.tick(ch('q'), t1, &tx);
         assert!(app.quit);
-        assert_eq!(
-            app.store.get_provider_pin(1).unwrap().as_deref(),
-            Some("megaplay")
-        );
+        assert_eq!(app.store.get_last_used(1).unwrap(), None);
     }
 
-    /// Pins the USER-VISIBLE copy for the two pin-walk failure rows, which
-    /// are distinct events (DESIGN 4.10): ran-and-missed vs could-not-run.
+    /// ROD-525 e2e: `v` onto a provider that cannot answer walks on around
+    /// the circle instead of stopping, and lands back on a working sibling.
     #[test]
-    fn pin_flip_miss_toasts_the_pin_kept_copy() {
+    fn v_onto_a_dead_provider_walks_on() {
         let registry = teststub::registry(vec![
             teststub::StubProvider::new("megaplay")
                 .with_key("505")
@@ -3805,34 +3765,22 @@ mod tests {
             teststub::StubProvider::new("senshi"),
         ]);
         let (mut app, tx, rx, now) = harness_full(
-            "pinkept-e2e",
+            "walk-on-e2e",
             StubCatalog::search_scripted(vec![one_page(1)]),
             registry,
         );
         let t1 = open_first_result(&mut app, &tx, &rx, now);
-        // v pins serving megaplay; v again moves to senshi, whose flip fires
-        // on the settle tick, then its search fails and misses.
-        press(&mut app, &tx, t1, &[ch('v'), ch('v')]);
-        let t1 = t1 + episodes::PIN_SETTLE;
-        app.tick(Event::Tick, t1, &tx);
-        settle_feed(&mut app, &tx, &rx, t1);
-        let text = rendered(&mut app, 110, 32);
-        assert!(text.contains("no match on senshi, pin kept"), "{text}");
+        assert_eq!(app.detail.episodes.serving(), Some("megaplay"));
+        app.tick(ch('v'), t1, &tx);
+        let t2 = t1 + episodes::PIN_SETTLE;
+        app.tick(Event::Tick, t2, &tx);
+        settle_feed(&mut app, &tx, &rx, t2);
         assert_eq!(
-            app.store.get_provider_pin(1).unwrap().as_deref(),
-            Some("senshi"),
-            "the miss keeps the pin"
+            app.detail.episodes.serving(),
+            Some("megaplay"),
+            "the circle lands back on the sibling that answers"
         );
-
-        // The could-not-run sibling maps to its own distinct copy.
-        app.apply_episode_feedback(
-            vec![Feedback::PinUnreachable {
-                provider: "senshi".into(),
-            }],
-            t1,
-        );
-        let text = rendered(&mut app, 110, 32);
-        assert!(text.contains("couldn't reach senshi"), "{text}");
+        assert_eq!(app.store.get_last_used(1).unwrap(), None);
     }
 
     // ── play (chunk 6) ──────────────────────────────────────────────────
@@ -5076,22 +5024,9 @@ mod tests {
                 },
                 "couldn't load episodes",
             ),
-            (
-                Feedback::NoMatch {
-                    provider: "senshi".into(),
-                },
-                "no match on senshi",
-            ),
-            (Feedback::PinPending, "still resolving, try again shortly"),
-            (Feedback::PinNothing, "no source: nothing to pin"),
-            (
-                Feedback::PinSaveFailed { clearing: false },
-                "couldn't save the provider pin",
-            ),
-            (
-                Feedback::PinSaveFailed { clearing: true },
-                "couldn't clear the provider pin",
-            ),
+            (Feedback::CyclePending, "still resolving, try again shortly"),
+            (Feedback::CycleNothing, "no source: nothing to switch"),
+            (Feedback::DeadEnd, "no source found"),
         ];
         for (feedback, copy) in cases {
             app.apply_episode_feedback(vec![feedback], now);
