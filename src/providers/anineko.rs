@@ -13,6 +13,10 @@
 //! 252: `proxy::decloak` scans for the sync triple rather than trusting the PNG
 //! length, so the gap costs nothing. Do not "optimize" that into a fixed-offset
 //! skip.
+//!
+//! Nothing in the chain gates on Referer or User-Agent. Both are sent anyway so
+//! a host that turns gating on does not take the provider down with it; the two
+//! headers are deliberate, not vestigial.
 
 use serde::Deserialize;
 
@@ -97,7 +101,12 @@ fn meta_episodes(meta: &str) -> Option<u32> {
     let (_, rest) = meta.split_once('\u{2022}')?;
     let rest = rest.trim_start();
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    if digits.is_empty() || !rest[digits.len()..].trim_start().starts_with("Episode") {
+    // Case-insensitive: this provider has no id and no year, so the count is
+    // the scorer's ONLY corroborating signal. A byte-exact match would drop it
+    // site-wide, silently, on "28 episodes" alone, and every bind would then
+    // rest on title text, which is the state that let a lookalike through.
+    let suffix = rest[digits.len()..].trim_start().to_ascii_lowercase();
+    if digits.is_empty() || !suffix.starts_with("episode") {
         return None;
     }
     digits.parse().ok().filter(|&n| n > 0)
@@ -155,14 +164,6 @@ fn parse_episode_numbers(html: &str, slug: &str) -> Vec<u32> {
     nums.dedup();
     nums.truncate(MAX_EPISODE_HINT as usize);
     nums
-}
-
-/// Cloudflare interstitial served at 200. An empty parse would otherwise read
-/// as "no episodes" and stamp absence. Only the `cf_chl` markers count:
-/// `/cdn-cgi/challenge-platform` ships on good pages, so matching it bare would
-/// take the provider offline whenever the site is merely behind Cloudflare.
-fn is_challenge(html: &str) -> bool {
-    html.contains("cf_chl_opt") || html.contains("__cf_chl")
 }
 
 /// One playable embed off the episode page.
@@ -261,6 +262,13 @@ fn subtitle_from_embed_url(embed_url: &str) -> Option<String> {
 /// choice of address, not ours (03 §6.7).
 fn master_ok(url: &str) -> bool {
     is_absolute_url(url) && clean_arg(url) && guard_fetch_url(url).is_ok()
+}
+
+/// The vetted master off an embed page. `None` means hop to the next server: a
+/// refused master must never be laundered into `StreamLink.url`, where the cap
+/// fetch declines and the refusal resurfaces at play time as a hard error.
+fn embed_master(embed: &str) -> Option<&str> {
+    parse_embed_src(embed).filter(|m| master_ok(m))
 }
 
 /// Extension test against the path only: a `?`/`#` tail must not decide which
@@ -414,15 +422,16 @@ impl StreamProvider for Anineko {
         let html = self.page_get(&url, REFERER)?;
         let text = String::from_utf8_lossy(&html);
         let nums = parse_episode_numbers(&text, provider_id);
-        // An empty listing is an AUTHORITATIVE not-stocked verdict that
-        // persists and suppresses later lookups (03 §4.3), so it may only be
-        // returned off a page we can positively identify as this show's. A
-        // challenge page, an app shell, or any markup drift lands here at 200
-        // with nothing parsed, and must read as "learned nothing" instead.
-        if nums.is_empty()
-            && (is_challenge(&text) || !text.contains(&format!("watch/{provider_id}")))
-        {
-            return Err(ProviderError::Decode("not a show page".into()));
+        // This provider never mints absence. Ok(vec![]) is an AUTHORITATIVE
+        // not-stocked verdict that persists and re-stamps on every empty
+        // (03 §4.3), and no page shape here earns it: a dead slug 404s, and
+        // every way to reach a parsed-nothing 200 (challenge, app shell, markup
+        // drift) is a lie. A "stocked show, zero episodes" page has never been
+        // observed on this site, so a branch returning absence could only be
+        // guarded by a fixture we invented rather than captured. Erring costs
+        // repeat lookups; a false absence poisons the show for good.
+        if nums.is_empty() {
+            return Err(ProviderError::Decode("no episodes on page".into()));
         }
         Ok(nums.into_iter().map(|n| n.to_string()).collect())
     }
@@ -470,23 +479,9 @@ impl StreamProvider for Anineko {
                 Ok(body) => String::from_utf8_lossy(&body).into_owned(),
                 Err(_) => continue,
             };
-            let Some(master) = parse_embed_src(&embed) else {
+            let Some(master) = embed_master(&embed) else {
                 continue;
             };
-            // Vet here so a refused master hops to the next server. Without it
-            // the cap fetch declines, the fallback launders the same URL into
-            // StreamLink.url, and the refusal resurfaces at play time as a hard
-            // error instead of a recoverable miss.
-            //
-            // No offline test reaches this line: every mock listener is on
-            // loopback, so a private embed is refused above before a master is
-            // ever parsed. `master_ok` and the `cap_variant` guard are both
-            // pinned; this application of them is not. Do not read that as dead
-            // code, a live embed host clears the guard above and then chooses
-            // this URL freely.
-            if !master_ok(master) {
-                continue;
-            }
 
             let url = self
                 .cap_variant(master, &embed_referer, quality)
@@ -752,6 +747,25 @@ mod tests {
         assert_eq!(parse_embed_src(r#"const src = """#), None);
         assert_eq!(parse_embed_src("const src = notaquote"), None);
         assert_eq!(parse_embed_src("<html>no player</html>"), None);
+    }
+
+    #[test]
+    fn embed_master_refuses_a_master_aimed_at_a_private_host() {
+        // The vetting is folded into the extraction so it is reachable offline:
+        // as a bare `if` in the resolve loop no test could observe it, because
+        // every mock listener is on loopback and the embed guard fires first.
+        let good = r#"const src = "https://vivi.test/public/stream/x/master.m3u8";"#;
+        assert_eq!(
+            embed_master(good),
+            Some("https://vivi.test/public/stream/x/master.m3u8")
+        );
+        for bad in [
+            r#"const src = "http://127.0.0.1:9/master.m3u8";"#,
+            r#"const src = "http://169.254.169.254/latest/meta-data/";"#,
+            r#"const src = "/relative/master.m3u8";"#,
+        ] {
+            assert_eq!(embed_master(bad), None, "{bad} must not become a play url");
+        }
     }
 
     #[test]
@@ -1064,30 +1078,21 @@ mod tests {
     }
 
     #[test]
-    fn transport_episodes_refuses_absence_from_a_page_it_cannot_identify() {
-        // 200 with nothing parsed is the dangerous branch: an app shell, or a
-        // challenge served at 200, must read as "learned nothing", never as an
-        // authoritative empty listing.
+    fn transport_episodes_never_stamps_absence_from_a_parsed_nothing_page() {
+        // Every 200 that parses to nothing is a lie (app shell, challenge,
+        // markup drift), and Ok(vec![]) here would persist as a permanent
+        // not-stocked verdict. This provider has no path that mints absence.
         for body in [
             &b"<html><div id=\"app\"></div></html>"[..],
             b"<html>window._cf_chl_opt={cvId:'3'}</html>",
+            br#"<html><link rel="canonical" href="https://anineko.to/watch/show-a"></html>"#,
         ] {
             let p = against(response_with_body("200 OK", body));
             let got = p.episodes("show-a", Translation::Sub, None);
             assert!(
                 matches!(got, Err(ProviderError::Decode(_))),
-                "unidentifiable page must not stamp absence, got {got:?}"
+                "a parsed-nothing page must not stamp absence, got {got:?}"
             );
         }
-    }
-
-    #[test]
-    fn transport_episodes_allows_absence_from_a_real_show_page() {
-        // The identity check must not block a GENUINE empty listing: a stocked
-        // show with no episodes yet is a true absence and has to stay one.
-        let page = br#"<html><link rel="canonical" href="https://anineko.to/watch/show-a"><p>no episodes yet</p></html>"#;
-        let p = against(response_with_body("200 OK", page));
-        let eps = p.episodes("show-a", Translation::Sub, None).unwrap();
-        assert!(eps.is_empty());
     }
 }
