@@ -1394,18 +1394,18 @@ as two elevated tokens:
 `fg3` stays reserved for the nothing-known row (every provider unchecked), which
 dims whole; a healthy non-serving token never drops to it.
 
-- **The pin boost is gated on a confirmed marker** (`▸` or `+`). A pin on a still
-  `?` or a confirmed `-` provider gets no lift: an unchecked provider must never
-  visually outrank a bound one. The gate reads the token's derived marker, not the
-  raw availability, so a provider that is serving while its availability still
-  reads unchecked is `▸` and promotes correctly.
-- **An ungated pin is invisible, and that is the accepted regression.** The signal
-  now exists only as a boosted token, so a pin renders nowhere whenever its target
-  is not a confirmed `▸`/`+`: a provider retired from the registry, but equally one
-  still unprobed or confirmed absent, which is the ordinary state of a freshly
-  pinned show before its first successful resolve. The old `· pin {name}` form
-  showed the name in all of those cases. The pin still drives resolution the whole
-  time it is invisible; §7.5's `v provider` hint is where the key is named.
+- **The pin boost is ungated** (ROD-524, reversing the ROD-484 gate). The boosted
+  token is the user's selection and renders on any marker: `?` mid-probe or
+  mid-cycle, `-` after a kept miss. ROD-484 gated the boost on a confirmed `▸`/`+`
+  so `?` could never outrank `+`, and accepted an invisible pin as the cost; the
+  ROD-524 settle window made that cost the common case (PinKept and transient
+  misses park the pin on unconfirmed providers), and an invisible selection reads
+  as the app snapping back to the serving provider. Availability lives in the
+  marker alone; bold never claims it. The token's marker stays derived, not raw,
+  so a provider serving off a still-unchecked entry is `▸` and promotes correctly.
+- **A pin naming a provider outside the registry still renders nowhere**: there is
+  no token to boost. The pin drives resolution while unrendered; §7.5's
+  `v provider` hint is where the key is named.
 - **Keybind-hint bold and state bold are different registers** and may coexist in
   one row: the `[v]` hint is bold per §7.5 while a pinned token is bold per this
   section, which is the carve-out to §1.3's "use it once per visual unit". Bold
@@ -3377,6 +3377,14 @@ test forbidding (§5.1, §5.2, §6.4, §6.5, §7.5, §5.5, §8.3, §9.4), the §
 landing default (`last_watched` ships as default, History is the floor under all
 three, §7.1/§5.5/§9.6 with it), and §9.8, which no longer presents the runtime as
 two candidate shapes.
+
+**2026-08-01 (ROD-524):** `v` cycles the pin inside a 300ms settle window: each
+press moves the pin in memory and re-arms, the store write and at most one flip
+fire when the burst stops, and a settle needing no walk supersedes a flip still
+in flight. The §5.3a pin boost lost its confirmed-marker gate: the bold token is
+the selection wherever it sits, because the window makes pin-on-unconfirmed the
+ordinary state and a gated (invisible) selection read as snapping back to the
+serving provider.
 
 **2026-07-31 (ROD-511):** Added §1.4a: the `transparent_background` config
 toggle maps the `bg` tier to `Color::Reset` (terminal default) so the
