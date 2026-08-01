@@ -38,6 +38,11 @@ jobs:
       # can drive the real binary against a local fixture; off in every shipped
       # build. No --ignored / --include-ignored here, ever: _live tests hit the network.
       - run: cargo test --features test-seams
+      # --all-targets so an example's #[cfg(test)] module is COMPILED. Neither
+      # step above builds one: examples/provider_health.rs shipped an
+      # uncompilable test module through a green CI run, which reads as coverage
+      # while pinning nothing.
+      - run: cargo test --all-targets --features test-seams
       # Assert each live target runs zero tests (all #[ignore]d). Semantic, not a
       # grep of #[ignore]: a commented-out attribute, #[tokio::test], or a rename
       # all fool text counting, but a test that actually runs cannot hide here.

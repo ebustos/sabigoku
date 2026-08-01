@@ -2,8 +2,12 @@
 //! end to end and report where each one breaks. `--provider` also reaches the
 //! shelf (`retired_registry`), which is how a retirement gets re-checked.
 //!
-//! Hits the live sites. Not a test, not in CI: the output is the deliverable
-//! and a provider dying must never redden master.
+//! Hits the live sites. The probe itself is not a test and never runs in CI:
+//! the output is the deliverable and a provider dying must never redden master.
+//! CI does compile and run the pure unit tests below, via `--all-targets`;
+//! `main` is not the entry point under a test harness, so nothing here reaches
+//! the network. Keep it that way: a live `#[test]` in this module would put
+//! every provider site on the critical path of every push.
 //!
 //! Run:  cargo run --example provider_health
 //!       cargo run --example provider_health -- --provider senshi --dub
@@ -46,6 +50,12 @@ struct Fixture {
     title_english: &'static str,
     /// `count_hint` for listing-less providers (03 §4.3).
     episodes: u32,
+    /// Verbatim AniList `status`. Not decoration: `total_is_authoritative`
+    /// reads None as authoritative, which hard-rejects any candidate whose
+    /// count differs by more than 3. A still-airing show is spared that in the
+    /// app, so leaving this unset makes the probe stricter than production.
+    status: &'static str,
+    year: u32,
 }
 
 /// Three eras, all universally stocked. Plural on purpose: with one fixture, a
@@ -62,6 +72,8 @@ const FIXTURES: &[Fixture] = &[
         // it here and the probe reports a match the app does not make.
         title_english: "Frieren: Beyond Journey\u{2019}s End",
         episodes: 28,
+        status: "FINISHED",
+        year: 2023,
     },
     Fixture {
         anilist_id: 1,
@@ -69,13 +81,19 @@ const FIXTURES: &[Fixture] = &[
         title: "Cowboy Bebop",
         title_english: "Cowboy Bebop",
         episodes: 26,
+        status: "FINISHED",
+        year: 1998,
     },
     Fixture {
         anilist_id: 21,
         mal_id: 21,
         title: "One Piece",
         title_english: "ONE PIECE",
+        // RELEASING, so the episode veto is spared: the count drifts every week
+        // and a catalog listing 1136 against our 1100 is healthy, not a miss.
         episodes: 1100,
+        status: "RELEASING",
+        year: 1999,
     },
 ];
 
@@ -87,6 +105,8 @@ impl Fixture {
             title_romaji: self.title.to_string(),
             title_english: Some(self.title_english.to_string()),
             total_episodes: Some(self.episodes),
+            status: Some(self.status.to_string()),
+            year: Some(self.year),
             ..Enrichment::default()
         }
     }
@@ -140,6 +160,10 @@ struct Probe {
     verdict: Verdict,
     stages: Vec<String>,
     detail: Option<String>,
+    /// Bound by the fuzzy scorer rather than an id. Carried to the summary so a
+    /// provider whose every bind rests on title text cannot report a bare OK:
+    /// an exact title alone clears the score floor with zero corroboration.
+    fuzzy: bool,
 }
 
 impl Probe {
@@ -148,7 +172,13 @@ impl Probe {
             verdict,
             stages,
             detail,
+            fuzzy: false,
         }
+    }
+
+    fn with_fuzzy(mut self, fuzzy: bool) -> Probe {
+        self.fuzzy = fuzzy;
+        self
     }
 }
 
@@ -261,12 +291,13 @@ fn probe(provider: &dyn StreamProvider, fx: &Fixture, tt: Translation, http: &Ht
     let show = fx.enrichment();
 
     let at = Instant::now();
-    // How it bound rides the stage label; the verdict no longer forks on it,
-    // because the scorers already refuse what an id check was standing in for.
-    let id = match provider.canonical_key(&show) {
+    // The verdict no longer forks on how it bound, because the scorers already
+    // refuse what an id check was standing in for. It still rides to the
+    // summary, so a provider that only ever fuzzy-binds says so.
+    let (id, fuzzy) = match provider.canonical_key(&show) {
         Some(key) => {
             stages.push(format!("bind:canonical({}) {}", safe(&key), secs(at)));
-            key
+            (key, false)
         }
         None => {
             if !provider.supports_search() {
@@ -317,7 +348,7 @@ fn probe(provider: &dyn StreamProvider, fx: &Fixture, tt: Translation, http: &Ht
                             safe(&hit.provider_id),
                             secs(at)
                         ));
-                        hit.provider_id.clone()
+                        (hit.provider_id.clone(), !keyed)
                     }
                 },
             }
@@ -371,7 +402,7 @@ fn probe(provider: &dyn StreamProvider, fx: &Fixture, tt: Translation, http: &Ht
         }
         Ok(note) => {
             stages.push(format!("reach:{note} {}", secs(at)));
-            Probe::graded(Verdict::Ok, stages, None)
+            Probe::graded(Verdict::Ok, stages, None).with_fuzzy(fuzzy)
         }
     }
 }
@@ -385,7 +416,10 @@ fn grade(probes: Vec<Probe>) -> (Verdict, Option<String>) {
         return (
             Verdict::Down,
             Some(format!(
-                "every fixture absent ({} of {}); the catalog answers nothing, not a delisting",
+                // Says "nothing bindable" rather than "answers nothing": a
+                // catalog that returns plenty of hits the scorers all refuse
+                // reaches this same sweep, and it did answer.
+                "every fixture unbindable ({} of {}); nothing in the catalog matched, not a delisting",
                 probes.len(),
                 FIXTURES.len()
             )),
@@ -395,6 +429,14 @@ fn grade(probes: Vec<Probe>) -> (Verdict, Option<String>) {
         .into_iter()
         .min_by_key(|p| p.verdict)
         .expect("FIXTURES is never empty");
+    if best.verdict == Verdict::Ok && best.fuzzy {
+        return (
+            best.verdict,
+            Some(
+                "bound by title match, not by id: the stream is only as right as the scorer".into(),
+            ),
+        );
+    }
     (best.verdict, best.detail)
 }
 
@@ -542,17 +584,31 @@ mod tests {
             hit("wrong-show", None, None),
             hit("right-show", Some(fx.anilist_id), None),
         ];
-        let (picked, keyed) = pick_hit(&hits, fx);
+        let (picked, keyed) = pick_hit(&hits, fx).expect("id match binds");
         assert_eq!(picked.provider_id, "right-show");
         assert!(keyed);
     }
 
     #[test]
-    fn pick_hit_flags_the_top_hit_fallback_as_unverified() {
+    fn pick_hit_refuses_an_unrelated_hit_instead_of_taking_the_top_result() {
+        // The old fallback bound hits[0] blindly, which is how a catalog that
+        // answers every query with something unrelated graded OK. The scorers
+        // refuse it, and a refusal is a real answer: the app would hop.
         let hits = vec![hit("whatever-was-first", None, None)];
-        let (picked, keyed) = pick_hit(&hits, &FIXTURES[0]);
-        assert_eq!(picked.provider_id, "whatever-was-first");
-        assert!(!keyed);
+        assert!(pick_hit(&hits, &FIXTURES[0]).is_none());
+    }
+
+    #[test]
+    fn pick_hit_binds_a_title_match_with_no_ids_at_all() {
+        // anineko carries neither id, so an id-only check could never bind it
+        // however healthy it was. The fuzzy scorer is what makes it gradeable.
+        let fx = &FIXTURES[1];
+        let mut h = hit(fx.title, None, None);
+        h.title = fx.title.to_string();
+        h.total_episodes = Some(fx.episodes);
+        let (picked, keyed) = pick_hit(std::slice::from_ref(&h), fx).expect("title match binds");
+        assert_eq!(picked.provider_id, fx.title);
+        assert!(!keyed, "no ids were present, so this cannot be id-keyed");
     }
 
     #[test]
