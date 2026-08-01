@@ -1,11 +1,13 @@
 //! provider_health (ROD-521): grade every provider in `default_registry()`
-//! end to end and report where each one breaks.
+//! end to end and report where each one breaks. `--provider` also reaches the
+//! shelf (`retired_registry`), which is how a retirement gets re-checked.
 //!
 //! Hits the live sites. Not a test, not in CI: the output is the deliverable
 //! and a provider dying must never redden master.
 //!
 //! Run:  cargo run --example provider_health
 //!       cargo run --example provider_health -- --provider senshi --dub
+//!       cargo run --example provider_health -- --provider allanime
 //!       SABIGOKU_DEBUG=1 cargo run --example provider_health
 //!
 //! Exit: 0 all healthy, 1 something degraded, 2 something down.
@@ -25,7 +27,7 @@ use sabigoku::domain::{Enrichment, Quality, StreamLink, Translation, strip_contr
 use sabigoku::fetchguard::guard_fetch_url;
 use sabigoku::providers::http::{Accept, HttpClient, Method, Request};
 use sabigoku::providers::{
-    ProviderError, SearchHit, SearchOptions, StreamProvider, default_registry,
+    ProviderError, SearchHit, SearchOptions, StreamProvider, default_registry, retired_registry,
 };
 
 /// mpv's own UA (player.rs): a reach that passes here would pass in playback.
@@ -394,12 +396,17 @@ fn parse_args() -> Result<Args, String> {
 fn run() -> Result<Verdict, String> {
     let args = parse_args()?;
     let registry = default_registry().map_err(|e| format!("registry: {e}"))?;
+    let shelf = retired_registry().map_err(|e| format!("registry: {e}"))?;
     let http = HttpClient::new().map_err(|e| format!("http client: {e}"))?;
 
+    // A bare run grades the live set only. Shelved providers answer to an
+    // explicit --provider so a full run never spends minutes on a site we
+    // already stopped shipping.
     let providers: Vec<&dyn StreamProvider> = match &args.provider {
         Some(name) => vec![
             registry
                 .by_name(name)
+                .or_else(|| shelf.by_name(name))
                 .ok_or_else(|| format!("unknown provider {name:?}"))?,
         ],
         None => registry.iter().collect(),
