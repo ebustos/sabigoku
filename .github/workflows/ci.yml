@@ -38,10 +38,13 @@ jobs:
       # can drive the real binary against a local fixture; off in every shipped
       # build. No --ignored / --include-ignored here, ever: _live tests hit the network.
       - run: cargo test --features test-seams
-      # --all-targets so an example's #[cfg(test)] module is COMPILED. Neither
-      # step above builds one: examples/provider_health.rs shipped an
-      # uncompilable test module through a green CI run, which reads as coverage
-      # while pinning nothing.
+      # Builds an example's #[cfg(test)] module, which neither step above does:
+      # examples/provider_health.rs shipped an uncompilable test module through
+      # a green run, which reads as coverage while pinning nothing.
+      # --all-targets rather than --examples for symmetry with the clippy line
+      # and to pick up benches later; it re-runs the suite above, so this is not
+      # the redundant half. Keep BOTH lines: --all-targets skips doctests, which
+      # only the plain `cargo test` above runs.
       - run: cargo test --all-targets --features test-seams
       # Assert each live target runs zero tests (all #[ignore]d). Semantic, not a
       # grep of #[ignore]: a commented-out attribute, #[tokio::test], or a rename

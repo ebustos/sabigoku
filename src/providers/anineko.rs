@@ -86,25 +86,16 @@ fn slug_from_url(url: &str) -> Option<&str> {
     Some(slug)
 }
 
-/// Episode count out of a `"TV • 28 Episodes"` meta string. The type token is
-/// deliberately dropped: `SearchHit` has no format field, and adding one to the
-/// shared seam would buy nothing the count does not already give (a movie's
-/// lone episode already contradicts a series total in the scorer).
-///
-/// The `Episodes` suffix is REQUIRED, because the same slot also carries a bare
-/// year: the site lists One Piece as `"TV • 1999"`. Reading that as 1999
-/// episodes invents a ~900 episode gap against the real total and the scorer
-/// then rejects the right show. A meta with no count ("TV") and a year-shaped
-/// one both yield None, never 0, which the scorer reads as "unknown" rather
-/// than "zero episodes".
+/// Episode count out of `"TV • 28 Episodes"`. The suffix is required: the same
+/// slot carries a bare year (`"TV • 1999"` for One Piece), and reading that as
+/// a count makes the scorer reject the right show. Unparseable yields None,
+/// never 0.
 fn meta_episodes(meta: &str) -> Option<u32> {
     let (_, rest) = meta.split_once('\u{2022}')?;
     let rest = rest.trim_start();
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    // Case-insensitive: this provider has no id and no year, so the count is
-    // the scorer's ONLY corroborating signal. A byte-exact match would drop it
-    // site-wide, silently, on "28 episodes" alone, and every bind would then
-    // rest on title text, which is the state that let a lookalike through.
+    // Case-insensitive: the count is the scorer's only corroborating signal
+    // here, and a byte-exact match would drop it site-wide on "28 episodes".
     let suffix = rest[digits.len()..].trim_start().to_ascii_lowercase();
     if digits.is_empty() || !suffix.starts_with("episode") {
         return None;
@@ -133,16 +124,11 @@ fn parse_search(raw: &[u8]) -> Result<Vec<SearchHit>, ProviderError> {
         .collect())
 }
 
-/// Episode numbers from `watch/{slug}/ep-{n}` hrefs on the show page, sorted,
-/// deduplicated, and clamped like every other episode-minting path.
+/// Sorted, deduplicated, clamped episode numbers.
 ///
-/// The needle carries no quote and no leading slash on purpose. Anchoring on
-/// `"/watch/` would make a single-quoted attribute, a relative href, or an
-/// absolute one scan as zero episodes, and zero episodes is an AUTHORITATIVE
-/// not-stocked verdict that persists (03 §4.3). Markup drift must not be able
-/// to mint absence. `/ep-` plus the digits is what disambiguates: a sibling
-/// slug (`{slug}-2`) cannot match, because the next byte after the slug has to
-/// be the `/` of `/ep-`.
+/// No quote and no leading slash in the needle: anchoring on `"/watch/` makes a
+/// single-quoted or relative href scan as zero episodes. `/ep-` is what keeps a
+/// sibling slug out.
 fn parse_episode_numbers(html: &str, slug: &str) -> Vec<u32> {
     let needle = format!("watch/{slug}/ep-");
     let mut nums = Vec::new();
@@ -187,9 +173,8 @@ fn parse_servers(html: &str) -> Vec<Server> {
         };
         let end = start + end_rel;
         let url = &html[start..end];
-        // No closing tag means the markup is not what this parser assumes.
-        // Falling back to end-of-document would classify the last server
-        // against the whole page, so a stray "dub" in a footer flips its track.
+        // End-of-document fallback would classify the last server against the
+        // whole page, so a stray "dub" in a footer flips its track.
         let Some(tail_rel) = html[end..].find("</button>") else {
             break;
         };
@@ -257,16 +242,14 @@ fn subtitle_from_embed_url(embed_url: &str) -> Option<String> {
         .find(|v| is_absolute_url(v) && has_subtitle_extension(v))
 }
 
-/// What may become a play URL or a URL we fetch ourselves under a quality cap.
-/// The master is scraped off a third-party embed page, so it is the site's
-/// choice of address, not ours (03 §6.7).
+/// What may become a play URL, or one we fetch under a quality cap. The master
+/// is scraped off a third-party embed page: the site's choice, not ours (03 §6.7).
 fn master_ok(url: &str) -> bool {
     is_absolute_url(url) && clean_arg(url) && guard_fetch_url(url).is_ok()
 }
 
-/// The vetted master off an embed page. `None` means hop to the next server: a
-/// refused master must never be laundered into `StreamLink.url`, where the cap
-/// fetch declines and the refusal resurfaces at play time as a hard error.
+/// Vetted master off an embed page. `None` means hop: a refused master must not
+/// reach `StreamLink.url`, where the refusal resurfaces at play time.
 fn embed_master(embed: &str) -> Option<&str> {
     parse_embed_src(embed).filter(|m| master_ok(m))
 }
@@ -335,13 +318,9 @@ impl Anineko {
         })
     }
 
-    /// Fetch the adaptive master and return the variant matching the quality
-    /// cap, or None so resolve falls back to the master ladder.
-    ///
-    /// The master is scraped off a third-party embed page, so WE fetch a URL
-    /// the site chose: it needs the guard in its own right (03 §6.7 names the
-    /// master playlist as a guarded surface). The caller guards it too; this is
-    /// the one that stops the request leaving the process.
+    /// Variant matching the quality cap, or None to fall back to the master
+    /// ladder. The guard is the one that stops the request leaving the process;
+    /// the caller vets the same URL before it can become a play URL.
     fn cap_variant(&self, master_url: &str, referer: &str, quality: Quality) -> Option<String> {
         guard_fetch_url(master_url).ok()?;
         let body = self.page_get(master_url, referer).ok()?;
@@ -422,14 +401,10 @@ impl StreamProvider for Anineko {
         let html = self.page_get(&url, REFERER)?;
         let text = String::from_utf8_lossy(&html);
         let nums = parse_episode_numbers(&text, provider_id);
-        // This provider never mints absence. Ok(vec![]) is an AUTHORITATIVE
-        // not-stocked verdict that persists and re-stamps on every empty
-        // (03 §4.3), and no page shape here earns it: a dead slug 404s, and
-        // every way to reach a parsed-nothing 200 (challenge, app shell, markup
-        // drift) is a lie. A "stocked show, zero episodes" page has never been
-        // observed on this site, so a branch returning absence could only be
-        // guarded by a fixture we invented rather than captured. Erring costs
-        // repeat lookups; a false absence poisons the show for good.
+        // Never mints absence. `canonical_key` is always None, so this is only
+        // reached with a scorer-accepted slug or one a prior listing minted;
+        // neither parses to zero legitimately, and a delisting 404s. Ok(vec![])
+        // here would stamp a 7-day not-stocked TTL off a lie (03 §4.3).
         if nums.is_empty() {
             return Err(ProviderError::Decode("no episodes on page".into()));
         }
@@ -465,8 +440,8 @@ impl StreamProvider for Anineko {
             return Err(ProviderError::Decode("no stream for track".into()));
         }
 
-        // Vet BEFORE taking the budget: a few malformed leading entries must not
-        // spend the allowance and strand the working hosts behind them.
+        // Vet before taking the budget, or malformed leading entries spend the
+        // allowance and strand the working hosts behind them.
         for server in servers
             .iter()
             .filter(|s| {
